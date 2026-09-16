@@ -1,0 +1,47 @@
+# ---------- 环境变量与密钥 ----------
+# .env 存放真实 API Key（DEEPSEEK/OPENAI/DASHSCOPE/TAVILY/LANGSMITH/邮箱授权码），严禁入库
+.env
+.env.local
+*.env
+
+# ---------- 本地配置（由 config.yaml.template 复制而来，含本地凭据，不入库） ----------
+config.yaml
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- IDE ----------
+.idea/
+.vscode/
+*.iml
+
+# ---------- 前端代码（独立仓库维护，本仓库不含前端） ----------
+static/
+
+# ---------- 运行时数据与产物 ----------
+data/
+cache/
+database/
+log/
+tmp/
+huggingface_cache/
+*.db
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# ---------- 模型文件与缓存（大文件/下载缓存不入库：ONNX 从 Kaggle 导出后手动放置） ----------
+model/*.onnx
+model/hfl/
