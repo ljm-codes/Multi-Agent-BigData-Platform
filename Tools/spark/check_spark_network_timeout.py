@@ -1,5 +1,6 @@
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, StageAbnormalInfo
 from Tools.log_settings import LogSetting
@@ -8,7 +9,7 @@ from Tools.share_check_tool import get_stage_summary, request_get, proxy
 logger = LogSetting.create(__name__)
 
 
-def network_timeout_check(app_id: str):
+def network_timeout_check(app_id: str, n_jobs: int = 10):
     app_jobs = request_get(f"{proxy}/proxy/{app_id}/api/v1/applications/{app_id}/jobs")
     if not app_jobs:
         return None
@@ -25,7 +26,7 @@ def network_timeout_check(app_id: str):
         r'Remote transport closed|Remote connection closed)',
         re.IGNORECASE
     )
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
         futures = {
             executor.submit(get_stage_summary, stage_id, app_id): stage_id
             for stage_id in stage_ids
@@ -34,11 +35,7 @@ def network_timeout_check(app_id: str):
             try:
                 stage_id = futures[future]
                 latest_infos, failed_infos = future.result()
-                # 失败判定与指标判定要看不同的 attempt, 所以分两路:
-                #   失败 -> 看「曾失败过的那次」。stage 会重试, 重试成功后最新 attempt
-                #           是 COMPLETE, 只看最新的话这次失败就完全丢了(实测 stage 1 的
-                #           attempt 0 抛了 FetchFailedException 却 5 个 checker 全 None)。
-                #   指标 -> 看最新那次。失败 attempt 的指标是残缺的, 拿来算占比没意义。
+
                 if failed_infos:
                     failure_reason = failed_infos.get("failureReason", "")
                     if network_pattern.search(failure_reason):
@@ -74,4 +71,5 @@ def network_timeout_check(app_id: str):
         type="error",
         describe="存在网络超时问题",
         data=network_error_json_list,
+        check_time=datetime.now(timezone.utc),
     )

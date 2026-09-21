@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from typing import Tuple, Optional
 
 from SPO.check_result import CheckResult
@@ -59,6 +60,7 @@ def check_disk():
         return CheckResult(
             type="error",
             describe="出现磁盘空间不足",
+            check_time=datetime.now(timezone.utc),
             data=error_data,
         )
     return None

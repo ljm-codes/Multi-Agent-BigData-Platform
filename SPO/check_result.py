@@ -1,4 +1,5 @@
-from typing import TypedDict, List, Optional, Dict, Any, NotRequired
+from datetime import datetime
+from typing import TypedDict, List, Optional, Dict, Any, NotRequired, Literal
 
 from pydantic import BaseModel, Field
 
@@ -91,9 +92,8 @@ class FlinkTaskManagerOOMInfo(TypedDict):
     """
     Flink TaskManager 内存水位信息, 只给出水位与日志入口, 是否真的 OOM 交由 Agent 判断
     字段说明:
-        log_path: 日志文件清单的 URL。GET 返回 JSON, 列出 taskmanager.log、taskmanager.err、
-                  prelaunch.* 等; 取具体文件内容再拼 /logs/{文件名}。
-                  OOM 的直接证据通常在 taskmanager.err
+        log_path: 日志文件清单的 URL。GET 返回 JSON, 列出 taskmanager.log、taskmanager.err等;
+                  取具体文件内容再拼 /logs/{文件名}。(OOM 的直接证据通常在 taskmanager.err)
         path:     TaskManager 的 REST 详情入口, 含 metrics / hardware / memoryConfiguration /
                   allocatedSlots
     注: 两者都基于该应用的 Flink REST 基址(经 YARN 代理)拼出, 用 TaskManager 的 container id
@@ -179,7 +179,28 @@ class FlinkWatermarksAbnormalInfo(TypedDict):
 class CheckResult(BaseModel):
     type: str = Field(default="", description="检查类型")
     describe: str = Field(description="错误描述")
+    check_time: datetime = Field(description="检查时间")
     data: Optional[Dict[str, Any] | List[Dict[str, Any]]] = Field(default=None, description="相关数据")
+
+
+class CheckOutcome(BaseModel):
+    """
+    调度层对一次 checker 调用的记账
+
+    存在的唯一理由: checker 返回的 None 同时代表"没异常"和"没测到", 而这两者必须分开。
+    所以由调度层做翻译:
+        checker 返回 None         -> clean
+        checker 返回 CheckResult  -> found
+        抛异常 / 超时             -> invalid
+    """
+    label: str = Field(description="检查项名称(即 check_type)")
+    app_id: str = Field(default="", description="集群级检查为空串")
+    app_type: Optional[str] = Field(default="", description="应用类型")
+    status: Literal["clean", "found", "invalid"] = Field(description="没异常 / 有异常 / 测量无效")
+    result: Optional[CheckResult] = Field(default=None, description="只有 found 时有值")
+    error: str = Field(default="", description="只有 invalid 时有值: 异常类型 + 消息")
+    error_time: Optional[datetime] = Field(default=None, description="只有 invalid 时有值: 异常时间")
+    cost_ms: int = Field(default=0, description="本次调用耗时(毫秒)")
 
 
 class CheckResultQueue(BaseModel):

@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
@@ -91,6 +91,7 @@ def check_spark_job_timeout(app_id: str):
             return CheckResult(
                 type="warning",
                 describe=f"应用{app_id} 中job {job_id} 超时 {max_job_timeout} 秒",
+                check_time=datetime.now(timezone.utc),
                 data={
                     "app_id": app_id,
                     "job_id": job_id,

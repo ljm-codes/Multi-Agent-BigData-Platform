@@ -8,7 +8,7 @@ if not postgres_config:
     raise ValueError("不允许未设定 PostgreSQL 数据库配置")
 
 _POSTGRESQL_URL = (
-    f"postgresql+psycopg2://{postgres_config.get('user')}:{postgres_config.get('password')}"
+    f"postgresql+psycopg://{postgres_config.get('user')}:{postgres_config.get('password')}"
     f"@{postgres_config.get('host')}:{postgres_config.get('port')}/{postgres_config.get('db')}"
 )
 

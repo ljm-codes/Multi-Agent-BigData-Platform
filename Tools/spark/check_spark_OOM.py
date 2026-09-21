@@ -53,6 +53,10 @@ NODE_MEM_LOOKBACK_SECONDS = float(_oom_conf.get('node_mem_lookback_seconds', 90)
 NODE_MEM_MAX_SAMPLES = int(_oom_conf.get('node_mem_max_samples', 240))
 _NODE_MEM_TTL = 3600  # 1 小时过期
 
+# 执行内存峰值低于执行池的这个比例, 就当**没采到**(不是"用得太少")。
+# 取 1% 的实测依据(短任务应用的采样是 0.015%, 真采到的 spill 是 0.94~1.00)见 README。
+P2_SAMPLING_BLIND_RATIO = float(_oom_conf.get('p2_sampling_blind_ratio', 0.01))
+
 
 def _node_mem_sample_once() -> None:
     """
@@ -164,32 +168,19 @@ def _remove_time_epoch(executor_info: dict, fallback: float) -> float:
     return fallback
 
 
-# 内存超限杀的判据 —— **必须同时覆盖两种真实措辞**, 它们不是同一个字符串:
+# 内存超限杀:
 #
-#   ① YARN 原文 (Hadoop 3.4.1 ContainersMonitorImpl.formatErrorMessage):
-#        "Container [pid=..,containerID=..] is running 1234B beyond the 'PHYSICAL' memory limit."
-#      注意是 "beyond **the 'PHYSICAL'** memory **limit**" —— 有 the、有引号、单数。
+# YARN: "Container [pid=..,containerID=..] is running 1234B beyond the 'PHYSICAL' memory limit."
 #
-#   ② Spark 改写后的 (spark-yarn_2.12-3.1.3.jar 里 "Container killed by YARN for
-#      exceeding physical memory limits.")。**Spark 会替换掉 YARN 的原文** ——
-#      checker 走 `/allexecutors` 拿到的 removeReason 是**这一条**, 不是 ①。
+# Spark: "Container killed by YARN for exceeding physical memory limits."
 #
-# 2026-09-15 实测踩到的坑: 这里原先是 `beyond physical memory limits` —— 照着记忆里的
-# 措辞写的, 结果 **① 和 ② 一个都不匹配**, error 档永远报不出来。当时用"构造文本"做的
-# 单元验证是**循环论证**(文本照着正则造, 当然能过)。
-# 真正把 error 档验通(oom_limit 注入 -> 容器被 YARN 按物理内存超限杀)之后才暴露出来。
-# 教训: 判据里的字面量必须来自**抓到的真实样本**, 不能来自记忆。
-#
-# 分三档的其余部分不变: 有内存专有文本 -> error; 有明确的外部 kill 标记 -> 排除;
+# 分三档: 有内存专有文本 -> error; 有明确的外部 kill 标记 -> 排除;
 # 只有 137、别的都没有 -> 降级 warning(保留召回, 但不再断言是内存问题)。
-# 137 = 128+9(SIGKILL), 143 = 128+15(SIGTERM) —— YARN 杀容器是先 SIGTERM、
-# 宽限期过了才 SIGKILL, 所以 内存超限杀也可能落在 143 上 (实测到一个 143 的
-# 外部杀: "Container exited with a non-zero exit code 143 ... Killed by external signal")。
-# 因此不能拿退出码当前置门槛, 真正的判据是诊断文本里的内存专有字样, 退出码只用于降级。
+# 137 = 128+9(SIGKILL), 143 = 128+15(SIGTERM) —— YARN 杀容器是先 SIGTERM、宽限期过了才 SIGKILL
 CONTAINER_KILLED = re.compile(r"Container exited with a non-zero exit code (?:137|143)\b")
-MEMORY_LIMIT = re.compile(r"beyond the '(?:PHYSICAL|VIRTUAL)' memory limit"     # YARN 原文
-                          r"|exceeding (?:physical|virtual) memory limits"      # Spark 改写
-                          r"|beyond (?:physical|virtual) memory limits",        # 旧版本兜底
+MEMORY_LIMIT = re.compile(r"beyond the '(?:PHYSICAL|VIRTUAL)' memory limit"  # YARN 原文
+                          r"|exceeding (?:physical|virtual) memory limits"  # Spark 改写
+                          r"|beyond (?:physical|virtual) memory limits",  # 旧版本兜底
                           re.IGNORECASE)
 NOT_OOM = re.compile(r"Killed by external signal|Container killed on request|"
                      r"Executor killed by driver", re.IGNORECASE)
@@ -215,8 +206,39 @@ def classify_removed_executor(remove_reason: str):
     return None
 
 
+def _latest_job_stage_spills(app_id: str, n_jobs: int = 10):
+    """
+    取 jobs[0]（最后跑的那个 job，/jobs 是新的在前）各 stage 的溢写字节数
+
+    :return: list[(stage_id, disk_bytes_spilled)]
+             **返回 None 表示「作业列表没取到」= 测量无效**。调用方必须把它和
+             "没有溢写" 分开处理 —— 这也是本文件一直在防的那类毛病（把测量失败
+             静默当成"没有数据"）。
+    """
+    app_jobs = request_get(f"{proxy}/proxy/{app_id}/api/v1/applications/{app_id}/jobs")
+    if not app_jobs:
+        return None
+    spills = []
+    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+        futures = {
+            executor.submit(get_latest_stage_info, stage_id, app_id): stage_id
+            for stage_id in app_jobs[0].get("stageIds", [])
+        }
+        for future in as_completed(futures):
+            stage_id = futures[future]
+            try:
+                stage_infos = future.result()
+                if not stage_infos:
+                    continue
+                spills.append((stage_id, stage_infos.get("diskBytesSpilled", 0)))
+            except Exception as e:
+                print(f"检查阶段 {stage_id} 内存情况失败: {e}")
+                continue
+    return spills
+
+
 # 检查运行时的OOM情况
-def check_OOM(app_id: str):
+def check_OOM(app_id: str, n_jobs: int = 10):
     uri = f"{proxy}/proxy/{app_id}/api/v1/applications/{app_id}/allexecutors"
     # 内核 OOM
     ensure_node_mem_sampler()
@@ -225,6 +247,7 @@ def check_OOM(app_id: str):
     killed_executors = []  # removeReason 里有内存超限文本 —— 报 error
     uncertain_executors = []  # 只有 137、死因不明 —— 报 warning
     suspected_kernel_oom = []  # 被信号杀 + 无内存文本, 但节点当时内存被打满 —— 报 warning
+    sampling_blind = []  # 跑过任务、执行内存峰值却读到 0 —— 水位"测不到", 见函数末尾
     if not all_executors_info:
         return None
     for executor_info in all_executors_info:
@@ -236,7 +259,7 @@ def check_OOM(app_id: str):
                 executor_id=executor_info.get("id", ""),
                 host=executor_info.get("hostPort", ""),
                 stdout_log=logs.get("stdout", ""),
-                stderr_log=logs.get("stderr", "")
+                stderr_log=logs.get("stderr", ""),
             )
             # 判定顺序即置信度顺序: 内存文本 > 外部 kill 标记 > 仅凭退出码。
             verdict = classify_removed_executor(remove_reason)
@@ -252,70 +275,102 @@ def check_OOM(app_id: str):
                 ts = _remove_time_epoch(executor_info, time.time())
                 peak, sample = node_mem_peak_near(host, ts)
                 if peak is not None and peak >= NODE_MEM_SUSPECT_RATIO:
-                    suspected_kernel_oom.append(
-                        {"metrics": metrics, "host": host, "peak": peak, "sample": sample})
+                    suspected_kernel_oom.append({
+                        "metrics": metrics,
+                        "host": host,
+                        "peak": peak,
+                        "sample": sample
+                    })
         else:
             max_memory = executor_info.get("maxMemory", 0)
             peak_memory = executor_info.get("peakMemoryMetrics", {})
             heap_execution_memory = peak_memory.get("OnHeapExecutionMemory", 0)
             memory_usage_ratio = heap_execution_memory / max_memory if max_memory else 0.0
             if memory_usage_ratio >= 0.9:
-                app_jobs = request_get(f"{proxy}/proxy/{app_id}/api/v1/applications/{app_id}/jobs")
-                if not app_jobs:
+                stage_spills = _latest_job_stage_spills(app_id, n_jobs)
+                if stage_spills is None:
                     return None
-                app_run_job = app_jobs[0]
-                stage_ids = app_run_job.get("stageIds", [])
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = {
-                        executor.submit(get_latest_stage_info, stage_id, app_id): stage_id
-                        for stage_id in stage_ids
-                    }
-                    for future in as_completed(futures):
-                        try:
-                            stage_id = futures[future]
-                            stage_infos = future.result()
-                            if not stage_infos:
-                                continue
-                            disk_spilled = stage_infos.get("diskBytesSpilled", 0)
-                            if disk_spilled > 0:
-                                return CheckResult(
-                                    type="warning",
-                                    describe=f"即将出现OOM，请立马检查阶段 {stage_id}，已经写入磁盘 {disk_spilled / 1024 / 1024:.2f} MB数据",
-                                    data=None
-                                )
-                        except Exception as e:
-                            # logger.error(f"检查阶段 {stage_id} 内存情况失败: {e}")
-                            print(f"检查阶段 {stage_id} 内存情况失败: {e}")
-                            continue
+                for stage_id, disk_spilled in stage_spills:
+                    if disk_spilled > 0:
+                        return CheckResult(
+                            type="warning",
+                            describe=f"即将出现OOM，请立马检查阶段 {stage_id}",
+                            data={"stage_id": stage_id, "disk_bytes_spilled": disk_spilled},
+                            check_time=datetime.datetime.now(datetime.timezone.utc)
+                        )
+            elif memory_usage_ratio < P2_SAMPLING_BLIND_RATIO and executor_info.get("totalTasks", 0) > 0:
+                # 跑过任务, 执行内存峰值却小到可以忽略 —— 水位没采到, 只是登记, 见函数末尾
+                sampling_blind.append((executor_info, memory_usage_ratio))
 
     if killed_executors:
         return CheckResult(
             type="error",
             describe=f"应用{app_id}存在因内存不足被杀的 Executor",
-            data=killed_executors
+            data=killed_executors,
+            check_time=datetime.datetime.now(datetime.timezone.utc)
         )
     if suspected_kernel_oom:
         # 节点内存高 ≠ 一定是内核杀的 —— 抢占、缩容
         # 也可能同时发生。证据强度是"节点侧实测 + 死亡时刻吻合", 够报"疑似"不够断言。
         worst = max(suspected_kernel_oom, key=lambda x: x["peak"])
-        s = worst["sample"] or {}
         return CheckResult(
             type="warning",
-            describe=(f"应用{app_id}有 {len(suspected_kernel_oom)} 个 Executor **疑似被内核 OOM 杀掉**: "
+            describe=(f"应用{app_id}有 Executor **疑似被内核 OOM 杀掉**: "
                       f"它们的 removeReason 里没有任何内存文本(内核杀的不留文本), 但所在节点 "
-                      f"{worst['host']} 在死亡前实测内存利用率 {worst['peak']:.1f}%"
-                      f"(物理 {s.get('phys_mb')}MB, 容器 {s.get('containers')} 个)。"
+                      f"{worst['host']} 在死亡前实测内存利用率超过阈值。"
                       f"注意 YARN 的容器内存账此时可能是正常的 —— 内存被吃在容器账外。"
                       f"建议核查该节点内存占用，或调小 executor 数量/内存"),
-            data=[x["metrics"] for x in suspected_kernel_oom]
+            data=[{"metrics": x["metrics"], "host": x["host"],
+                   "peak_utilization": x["peak"], "node_sample": x["sample"]}
+                  for x in suspected_kernel_oom],
+            check_time=datetime.datetime.now(datetime.timezone.utc)
         )
     if uncertain_executors:
         # 曾经这里一律报 error。有 137 但没有任何内存证据时报 error 会把
         # 节点故障/抢占/手工 kill 全算成 OOM, 所以降级成 warning 并说清依据。
         return CheckResult(
             type="warning",
-            describe=f"应用{app_id}有 {len(uncertain_executors)} 个 Executor 被 SIGKILL"
+            describe=f"应用{app_id}有 Executor 被 SIGKILL"
                      f"(退出码 137), 但 removeReason 里没有内存超限文本, 无法断定是内存问题",
-            data=uncertain_executors
+            data=uncertain_executors,
+            check_time=datetime.datetime.now(datetime.timezone.utc)
         )
+
+    # 水位没采到、但阶段确实溢写过 —— 不静默 return None。
+    # 门槛用不受采样影响的硬证据(溢写), 否则短任务作业会全部命中(见 tests/spark/README.md):
+    # 默认只打日志, 有溢写证据才进告警队列。
+    if sampling_blind:
+        stage_spills = _latest_job_stage_spills(app_id, n_jobs)
+        spilled = [(sid, b) for sid, b in (stage_spills or []) if b > 0]
+        blind_desc = ", ".join(
+            f"{e.get('id')}(采样 {(e.get('peakMemoryMetrics') or {}).get('OnHeapExecutionMemory', 0) / 1024:.0f}KB"
+            f" = 执行池的 {r * 100:.3f}%)" for e, r in sampling_blind)
+        if spilled:
+            stage_id, disk_spilled = max(spilled, key=lambda x: x[1])
+            return CheckResult(
+                type="warning",
+                describe=f"应用{app_id}的阶段 {stage_id} 有磁盘溢写(溢写说明执行内存被占满过), 但有 Executor 的"
+                         f"执行内存峰值采样小到可以忽略 —— 心跳采样没覆盖到执行内存尖峰, "
+                         f"这些 Executor 的水位测不到, 无法据此判定。"
+                         f"建议核查阶段 {stage_id} 的 task 级 peakExecutionMemory",
+                data=[{"executor_id": e.get("id", ""),
+                       "host": e.get("hostPort", ""),
+                       "total_tasks": e.get("totalTasks", 0),
+                       "on_heap_execution_memory": (e.get("peakMemoryMetrics") or {}).get("OnHeapExecutionMemory", 0),
+                       "usage_ratio": round(r, 6),
+                       "stage_id": stage_id,
+                       "disk_bytes_spilled": disk_spilled} for e, r in sampling_blind],
+                check_time=datetime.datetime.now(datetime.timezone.utc)
+            )
+        if stage_spills is None:
+            # "取不到"不能说成"没有" —— 否则测量失败又被静默成了没有数据
+            logger.warning(
+                f"应用{app_id}有 {len(sampling_blind)} 个 Executor 跑过任务、但执行内存峰值采样小到可以忽略"
+                f"({blind_desc}) —— 水位测不到; 阶段信息也没取到(本次测量无效), P2 无法判定, 不报警"
+            )
+        else:
+            logger.warning(
+                f"应用{app_id}有 {len(sampling_blind)} 个 Executor 跑过任务、但执行内存峰值采样小到可以忽略"
+                f"({blind_desc}) —— 水位测不到; 同时没有阶段溢写, 本次 P2 无法判定, 不报警"
+            )
     return None

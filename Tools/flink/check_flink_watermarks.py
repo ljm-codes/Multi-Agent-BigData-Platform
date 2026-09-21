@@ -1,6 +1,7 @@
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Optional
 
 from SPO.check_result import CheckResult, FlinkWatermarkInfo, FlinkWatermarksAbnormalInfo
@@ -199,7 +200,7 @@ def check_watermarks_by_vertices(base: str, job_id: str, vertices_id: str, app_i
     return None
 
 
-def check_watermarks(app_id: str):
+def check_watermarks(app_id: str, n_jobs: int = 10):
     """
     检查应用的水位线异常
     """
@@ -218,7 +219,7 @@ def check_watermarks(app_id: str):
         vertices_ids = [vertices_info.get("id", "") for vertices_info in vertices_infos if vertices_info.get("id", "")]
         if not vertices_ids:
             continue
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
             futures = {
                 executor.submit(check_watermarks_by_vertices, base, job_id, vertices_id, app_id): vertices_id
                 for vertices_id in vertices_ids
@@ -246,14 +247,16 @@ def check_watermarks(app_id: str):
     return CheckResult(
         type="watermarks_abnormal",
         describe="水位线异常",
+        check_time=datetime.now(timezone.utc),
         data=watermarks_error_list
     )
 
 
-def check_flink_abnormal_situation():
+def check_flink_abnormal_situation(n_jobs: int = 10):
     """
     检查运行中 Flink 应用的水位线情况
     """
+    # test 用， 生产请忽略
     running_apps = get_all_running_apps()
     if not running_apps:
         return None
@@ -264,7 +267,7 @@ def check_flink_abnormal_situation():
         if not is_flink_app(running_app):
             continue
         logger.info(f"正在检测ID为 {app_id} 的应用水位线情况")
-        error_result = check_watermarks(app_id)
+        error_result = check_watermarks(app_id, n_jobs)
         if error_result:
             return error_result
     return None

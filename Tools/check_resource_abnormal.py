@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import datetime, timezone
 
 from SPO.check_result import CapacitySchedulerLeafQueuePartInfo, UsersSchedulerLeafQueuePartInfo, CheckResult
 
@@ -80,11 +81,11 @@ def check_dynamic_containers(metrics: dict):
     available_mb = cluster.get("availableMB", 0)
     current_ts = time.time()
     if reserved_mb > 0 and containers_pending > 0:
-        errors.append(CheckResult(
-            type="error",
-            describe=f"资源碎片阻塞：预留内存 {reserved_mb}MB 且存在 {containers_pending} 个待分配容器",
-            data={"reservedMB": reserved_mb, "containersPending": containers_pending}
-        ))
+        errors.append({
+            "describe": f"资源碎片阻塞：预留内存 {reserved_mb}MB 且存在 {containers_pending} 个待分配容器",
+            "reservedMB": reserved_mb,
+            "containersPending": containers_pending,
+        })
         # 碎片已触发告警，无需再走持续时间判断，但保留缓存更新
         _update_cache(current_ts, containers_pending, reserved_mb)
         return errors
@@ -109,11 +110,12 @@ def check_dynamic_containers(metrics: dict):
         return errors
 
     if duration >= PENDING_PERSIST_SECONDS and available_mb < SINGLE_CONTAINER_MIN_MB:
-        errors.append(CheckResult(
-            type="error",
-            describe=f"真实资源阻塞：containersPending={containers_pending} 持续 {duration:.1f} 秒，可用内存仅 {available_mb}MB",
-            data={"containersPending": containers_pending, "duration": duration, "availableMB": available_mb}
-        ))
+        errors.append({
+            "describe": f"真实资源阻塞：containersPending={containers_pending} 持续 {duration:.1f} 秒，可用内存仅 {available_mb}MB",
+            "containersPending": containers_pending,
+            "duration": duration,
+            "availableMB": available_mb,
+        })
         # 报警后重置缓存，防止重复报警
         _reset_cache()
     else:
@@ -145,26 +147,29 @@ def check_resource_insufficient():
             user_desc = ""
             if queue_info.users and queue_info.users[0].num_pending_applications > 0:
                 user_desc = f"，用户{queue_info.users[0].username}已用尽弹性资源上限"
-            queue_error_list.append(CheckResult(
-                type="error",
-                describe=f"队列{queue_info.queue_name}已用尽弹性资源上限{user_desc}",
-                data=queue_info.model_dump()
-            ))
+            queue_error_list.append({
+                "describe": f"队列{queue_info.queue_name}已用尽弹性资源上限{user_desc}",
+                "data": queue_info.model_dump()
+            })
         if queue_info.num_active_applications >= queue_info.max_active_applications:
             user_desc = ""
             if queue_info.users and queue_info.users[0].num_pending_applications > 0:
                 user_desc = f"，用户{queue_info.users[0].username}已用尽弹性资源上限"
-            queue_error_list.append(CheckResult(
-                type="error",
-                describe=f"队列{queue_info.queue_name}队列达到应用并发上限，新应用无法启动{user_desc}",
-                data=queue_info.model_dump()
-            ))
+            queue_error_list.append({
+                "describe": f"队列{queue_info.queue_name}队列达到应用并发上限，新应用无法启动{user_desc}",
+                "data": queue_info.model_dump()
+            })
     metrics_resp = rm.cluster_metrics()
     if metrics_resp and metrics_resp.data:
         metrics_errors = check_dynamic_containers(metrics_resp.data)
         queue_error_list.extend(metrics_errors)
 
-    return queue_error_list
+    return CheckResult(
+        type="error",
+        describe="资源不足",
+        check_time=datetime.now(timezone.utc),
+        data=queue_error_list
+    )
 
 
 if __name__ == '__main__':

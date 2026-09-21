@@ -348,13 +348,108 @@ def t8_memory_limit_texts():
           c("Container exited with a non-zero exit code 137") == "uncertain")
 
 
+# ---------------- 9. check_spark_OOM P2 的「测不到」出口 ----------------
+def _fake_allexecutors(on_heap_exec: int, total_tasks: int, max_memory: int = 434031820):
+    """造一个 /allexecutors 响应: 只有一个 active executor(只带判定用到的字段)"""
+    return [{
+        "id": "1", "hostPort": "node2:44705", "isActive": True,
+        "totalTasks": total_tasks, "maxMemory": max_memory,
+        "peakMemoryMetrics": {"OnHeapExecutionMemory": on_heap_exec},
+    }]
+
+
+def t9_p2_sampling_blind():
+    """
+    P2 的「测不到」: executor 跑过任务、执行内存峰值却读到 0 时, 不能静默 return None
+
+    门槛用**不受心跳采样影响**的硬证据 —— 阶段溢写。四种组合都要验:
+      采样为 0 + 有溢写   -> 报 warning, 且措辞是"判定无效"而不是"即将出现OOM"
+      采样为 0 + 没有溢写 -> 不报(只打日志, 不进告警队列)
+      采样有值但没过 0.9  -> 不报 —— 这是"真的没超", 不是"没测到"
+      刚起来的空闲 executor -> 不报(没跑过任务就不该算"测不到")
+    另外要防住: 原来的 P2 正例(水位 >= 0.9 且 有溢写)不能被这次重构改坏。
+    """
+    print("\n[9] check_spark_OOM —— P2「测不到」要可见(也不能把原判据改坏)")
+    import Tools.spark.check_spark_OOM as oom
+
+    oom.ensure_node_mem_sampler = lambda: None
+    spill_yes = lambda sid, app_id: {"diskBytesSpilled": 320 * 1024 * 1024}   # noqa: E731
+    spill_no = lambda sid, app_id: {"diskBytesSpilled": 0}                    # noqa: E731
+
+    def with_executor(on_heap_exec, total_tasks):
+        oom.request_get = lambda uri, params=None, timeout=10: (
+            [{"jobId": 1, "stageIds": [3]}] if uri.endswith("/jobs")
+            else _fake_allexecutors(on_heap_exec, total_tasks))
+
+    # 1) 采样为 0 + 有溢写 -> 报, 而且是"判定无效"的措辞
+    with_executor(0, 1134)
+    oom.get_latest_stage_info = spill_yes
+    r = oom.check_OOM("application_fake")
+    check("采样为 0 + 有溢写 -> 报 warning",
+          r is not None and r.type == "warning",
+          f"实际 type={getattr(r, 'type', None)!r}")
+    check("措辞是「测不到/判定无效」, 不能假装「即将出现OOM」",
+          r is not None and "测不到" in (r.describe or "")
+          and "即将出现OOM" not in (r.describe or ""),
+          f"describe={(getattr(r, 'describe', '') or '')[:90]!r}")
+    check("data 里带上了是哪个 executor / 哪个阶段",
+          r is not None and isinstance(r.data, list) and r.data
+          and r.data[0].get("stage_id") == 3 and r.data[0].get("executor_id") == "1",
+          f"data={r.data if r else None}")
+
+    # 2) 采样为 0 + 没有溢写 -> 只打日志, 不进队列(否则几乎每个健康应用都报)
+    oom.get_latest_stage_info = spill_no
+    r = oom.check_OOM("application_fake")
+    check("采样为 0 + 没有溢写 -> 不报(只打日志)", r is None,
+          f"实际 {(getattr(r, 'describe', None))!r}")
+
+    # 2b) executor 拿得到、但作业列表取不到 -> 也不能报, 而且日志里必须说"测量无效",
+    #     不能印成"没有阶段溢写"(那就是把测量失败静默成没有数据)
+    oom.request_get = lambda uri, params=None, timeout=10: (
+        None if uri.endswith("/jobs") else _fake_allexecutors(0, 1134))
+    r = oom.check_OOM("application_fake")
+    check("作业列表取不到 -> 不报(测不到 != 没超)", r is None,
+          f"实际 {(getattr(r, 'describe', None))!r}")
+
+    # 3) 采样是几百 KB 级的噪声(短任务作业的实测值) -> 仍然算"没采到"
+    #    门槛不能用"精确等于 0"就是这一条逼出来的: 现实中读到的是 64KB 这种非零小数,
+    #    卡等于 0 的话这个判断几乎永不触发(见 P2_SAMPLING_BLIND_RATIO 的实测依据)。
+    with_executor(65536, 1134)          # 实测值: 64KB / 434MB = 0.015%
+    oom.get_latest_stage_info = spill_yes
+    r = oom.check_OOM("application_fake")
+    check("采样 64KB(池子的 0.015%) + 有溢写 -> 仍算「测不到」, 要报",
+          r is not None and r.type == "warning" and "测不到" in (r.describe or ""),
+          f"实际 {(getattr(r, 'describe', None))!r}")
+
+    # 3b) 采样确实是"量出来了"(远超 1% 门槛)但没过 0.9 -> 这是"真的没超"
+    with_executor(100 * 1024 * 1024, 1134)      # 100/434 = 0.23
+    r = oom.check_OOM("application_fake")
+    check("采样 100MB(池子的 23%) -> 不报(这是「真的没超」, 不是「没测到」)", r is None,
+          f"实际 {(getattr(r, 'describe', None))!r}")
+
+    # 4) 刚起来、还没跑过任务的 executor -> 不该算"测不到"
+    with_executor(0, 0)
+    r = oom.check_OOM("application_fake")
+    check("空闲 executor(没跑过任务) -> 不报", r is None,
+          f"实际 {(getattr(r, 'describe', None))!r}")
+
+    # 5) 原判据回归: 水位 >= 0.9 且有溢写 -> 仍报「即将出现OOM」
+    with_executor(400 * 1024 * 1024, 1134)      # 400/434 = 0.92
+    oom.get_latest_stage_info = spill_yes
+    r = oom.check_OOM("application_fake")
+    check("水位 0.92 + 有溢写 -> 仍报「即将出现OOM」(原判据没被改坏)",
+          r is not None and "即将出现OOM" in (r.describe or ""),
+          f"describe={(getattr(r, 'describe', '') or '')[:80]!r}")
+
+
 if __name__ == "__main__":
     print("=" * 72)
     print("修复验证")
     print("=" * 72)
     for fn in (t1_disk_dedup, t2_job_timeout_none, t3_job_timeout_describe,
                t4_resource_guard, t5_file_handle, t6_skew_severity_not_preempted,
-               t7_kernel_oom_by_node_memory, t8_memory_limit_texts):
+               t7_kernel_oom_by_node_memory, t8_memory_limit_texts,
+               t9_p2_sampling_blind):
         try:
             fn()
         except Exception as e:

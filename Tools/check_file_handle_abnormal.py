@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult
 from Tools.log_settings import LogSetting
@@ -78,6 +79,7 @@ def check_file_handle():
         return CheckResult(
             type="error",
             describe="文件句柄耗尽",
+            check_time=datetime.now(timezone.utc),
             data={
                 "file_ratio": file_ratio,
                 "times": times,

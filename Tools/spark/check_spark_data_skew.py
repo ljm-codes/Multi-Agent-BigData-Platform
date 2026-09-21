@@ -1,5 +1,6 @@
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import List
 
 import numpy as np
@@ -41,12 +42,12 @@ def check_abnormal_situation():
             return check_spark_data_skew(app_id)
 
 
-def check_stage_summary(stage_ids: List[int], app_id: str):
+def check_stage_summary(stage_ids: List[int], app_id: str, n_jobs: int = 10):
     """
     扫 stages, 报 最严重 的倾斜
     """
     worst = None  # (skew_ratio, jvm_gc_time_skew_ratio, stage_id, stage_metrics)
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
         futures = {
             executor.submit(get_latest_stage_info, stage_id, app_id): stage_id
             for stage_id in stage_ids
@@ -127,20 +128,26 @@ def check_stage_summary(stage_ids: List[int], app_id: str):
     severity = "error" if skew_ratio > skew_error_ratio else "warning"
     logger.info(f"最严重的 stage 是 {stage_id}(倾斜比 {skew_ratio:.2f}) -> {severity}"
                 f"(error 线 {skew_error_ratio})")
+    # 比值是每轮都在动的测量值, 写进 describe 会让入队层每轮多出一条 dedup_key,
+    # 所以留在 data(验证: tests/verify_main_check_tool.py 的 [7])
+    skew_data = {**stage_metrics, "skew_ratio": skew_ratio,
+                 "jvm_gc_time_skew_ratio": jvm_gc_time_skew_ratio}
     if severity == "error":
         return CheckResult(
             type="error",
-            describe=f"出现数据倾斜, 阶段 {stage_id} 数据倾斜比为 {skew_ratio:.2f}, JVM GC 时间比为 {jvm_gc_time_skew_ratio:.2f}",
-            data=stage_metrics
+            describe=f"出现数据倾斜, 阶段 {stage_id}",
+            data=skew_data,
+            check_time=datetime.now(timezone.utc)
         )
     return CheckResult(
         type="warning",
-        describe=f"疑似出现倾斜。阶段 {stage_id} 数据倾斜比为 {skew_ratio:.2f}, JVM GC 时间比为 {jvm_gc_time_skew_ratio:.2f}",
-        data=stage_metrics
+        describe=f"疑似出现倾斜, 阶段 {stage_id}",
+        data=skew_data,
+        check_time=datetime.now(timezone.utc)
     )
 
 
-def check_spark_data_skew(app_id: str):
+def check_spark_data_skew(app_id: str, n_jobs: int = 10):
     """
     检查 Spark 应用的数据倾斜情况
     """
@@ -150,7 +157,7 @@ def check_spark_data_skew(app_id: str):
     app_run_job = app_jobs[0]
     stage_ids = app_run_job.get("stageIds", [])
     # 获取对应的 taskSummary 信息
-    result = check_stage_summary(stage_ids, app_id)
+    result = check_stage_summary(stage_ids, app_id, n_jobs)
     if result:
         return result
 

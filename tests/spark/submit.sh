@@ -169,10 +169,19 @@ case "$FAULT" in
   # --kill-hosts 只留一台: 三台全杀光的话 reduce 任务会连人带数据一起死, 报的是
   # ExecutorLostFailure(会被重试), 而不是我们要的 FetchFailedException —— 详见 fault_netfail。
   #
-  # partitions 从 6 抬到 120: 目标是让 reduce 阶段**持续足够久**, 久到杀进程那一下
-  # (一次 ssh 往返, ~1 秒)一定落在它中间。实测 24 个 reduce 任务时整个阶段只有 0.99 秒,
-  # 杀进程差一点才撞上 —— 窗口太窄。120 个任务、每个要串行拉 120 个 block
-  # (maxReqsInFlight=1), 阶段时长能到几十秒。
+  # partitions 决定**取数窗口**有多宽 —— 注入成败全在这里。
+  #
+  # 窗口 = [杀进程落地, reduce 取数结束]。杀进程那一下是一条**冷 ssh**(从 AM 容器里
+  # subprocess 起 ssh, 没有连接复用), 2026-09-16 实测**约 3 秒**才真的把 JVM 杀掉
+  # (app ..._0012: 31.4 发起 -> 容器 34.435 才死), 不是早期注释里估的 1 秒。
+  # 而 partitions=120 时 reduce 阶段只有 **3.0 秒**(31.554 -> 34.549) —— 杀进程落地
+  # 只比阶段结束早 **114 毫秒**, 一个 FAILED attempt 都没出来。
+  #
+  # 阶段时长 ≈ ⌈reduce任务数 / 并发槽⌉ × 每任务串行拉的块数 × 单块耗时:
+  #   120 任务 / 4 槽 = 30 波, 每任务拉 120 块 -> 30 × 120 × ~0.15ms ≈ 3 秒 ✓与实测相符
+  # partitions 同时决定 map 产物块数和 reduce 任务数, 所以它是二次方杠杆:
+  #   480 任务 / 4 槽 = 120 波, 每任务拉 480 块 -> 约 16 秒(预估), 给 3 秒的杀进程留出余量。
+  # 只动这一个变量(不要同时抬 --records 或降 --executor-cores), 否则分不清是哪个在起作用。
   netfail)     CONF=(--executor-memory 1g --executor-cores 2 --num-executors 2
                      --conf spark.yarn.max.executor.failures=1000
                      --conf spark.reducer.maxReqsInFlight=1
@@ -181,7 +190,7 @@ case "$FAULT" in
                # 原先写死 node3 —— 容量改成 2048 后 AM 独占一台、两个 executor 落到另外
                # 两台, node3 恰好成了只剩驱动的那台, 杀了个寂寞、注入静默失效, 而表现和
                # "checker 漏检"一模一样(app ..._0010 实测)。落点会随容量/调度变, 不能写死。
-               ARGS=(--records 1000000 --partitions 120 --kill-hosts auto) ;;
+               ARGS=(--records 1000000 --partitions 480 --kill-hosts auto) ;;
   # 拉取串行化: 同时只允许 1 个在途请求, 单次最多 1MB
   fetchwait)   CONF=(--executor-memory 1g --executor-cores 2 --num-executors 2
                      --conf spark.reducer.maxReqsInFlight=1

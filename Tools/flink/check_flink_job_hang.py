@@ -15,6 +15,7 @@ duration 是子任务的存活时长(now - start-time), RUNNING 状态下必然�
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, FlinkJobHangInfo
 from Tools.log_settings import LogSetting
@@ -183,7 +184,7 @@ def check_vertex_hang(base: str, job_id: str, vertex_info: dict, app_id: str) ->
     return hang_error_list
 
 
-def check_flink_job_hang(app_id: str):
+def check_flink_job_hang(app_id: str, n_jobs: int = 10):
     """
     检查 Flink 应用的工作是否挂起
     """
@@ -199,7 +200,7 @@ def check_flink_job_hang(app_id: str):
         vertices_infos = job_info.get("vertices", [])
         if not vertices_infos:
             continue
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
             futures = {
                 executor.submit(check_vertex_hang, base, job_id, vertex_info, app_id): vertex_info
                 for vertex_info in vertices_infos
@@ -217,14 +218,16 @@ def check_flink_job_hang(app_id: str):
     return CheckResult(
         type="warning",
         describe="存在疑似挂起的子任务",
+        check_time=datetime.now(timezone.utc),
         data=hang_error_list
     )
 
 
-def check_flink_abnormal_situation():
+def check_flink_abnormal_situation(n_jobs: int = 10):
     """
     检查运行中 Flink 应用的挂起情况
     """
+    # test 用，生产请忽略
     running_apps = get_all_running_apps()
     if not running_apps:
         return None
@@ -235,7 +238,7 @@ def check_flink_abnormal_situation():
         if not is_flink_app(running_app):
             continue
         logger.info(f"正在检测ID为 {app_id} 的应用挂起情况")
-        error_result = check_flink_job_hang(app_id)
+        error_result = check_flink_job_hang(app_id, n_jobs)
         if error_result:
             return error_result
     return None

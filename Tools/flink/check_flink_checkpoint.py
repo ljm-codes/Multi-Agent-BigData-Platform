@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, FlinkCheckpointAbnormalInfo
 from Tools.share_check_tool import (get_all_running_apps, get_flink_rest_base,
@@ -20,7 +21,7 @@ def get_job_checkpoint_info(base: str, job_id: str):
     return job_info
 
 
-def check_checkpoint(app_id: str):
+def check_checkpoint(app_id: str, n_jobs: int = 10):
     """
     检查flink应用的checkpoint的异常情况
     """
@@ -29,7 +30,7 @@ def check_checkpoint(app_id: str):
     if not jobs_list:
         return None
     checkpoint_abnormal_list = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
         futures = {
             executor.submit(get_job_checkpoint_info, base, job_id): job_id
             for job_id in jobs_list
@@ -83,11 +84,12 @@ def check_checkpoint(app_id: str):
     return CheckResult(
         type="checkpoint_abnormal",
         describe="检查点异常",
+        check_time=datetime.now(timezone.utc),
         data=checkpoint_abnormal_list,
     )
 
 
-def check_flink_abnormal_situation():
+def check_flink_abnormal_situation(n_jobs: int = 10):
     """
     检查运行中 Flink 应用的检查点情况
     """
@@ -101,7 +103,7 @@ def check_flink_abnormal_situation():
         if not is_flink_app(running_app):
             continue
         logger.info(f"正在检测ID为 {app_id} 的应用检查点情况")
-        error_result = check_checkpoint(app_id)
+        error_result = check_checkpoint(app_id, n_jobs)
         if error_result:
             return error_result
     return None

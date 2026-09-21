@@ -1,5 +1,6 @@
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, FlinkTaskManagerOOMInfo
 from Tools.log_settings import LogSetting
@@ -90,7 +91,7 @@ def check_taskmanager_oom(base: str, taskmanager_info: dict, job_ids: set, app_i
     )]
 
 
-def check_flink_oom(app_id: str):
+def check_flink_oom(app_id: str, n_jobs: int = 10):
     """
     检查 Flink 应用所在 TaskManager 的内存水位
     """
@@ -102,7 +103,7 @@ def check_flink_oom(app_id: str):
     if not taskmanagers_info:
         return None
     memory_error_list = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
         futures = {
             executor.submit(check_taskmanager_oom, base, taskmanager_info, set(jobs_list), app_id): taskmanager_info
             for taskmanager_info in taskmanagers_info
@@ -120,11 +121,12 @@ def check_flink_oom(app_id: str):
     return CheckResult(
         type="warning",
         describe="TaskManager 堆内存水位过高, 存在 OOM 风险, 请检查对应日志确认",
+        check_time=datetime.now(timezone.utc),
         data=memory_error_list
     )
 
 
-def check_flink_abnormal_situation():
+def check_flink_abnormal_situation(n_jobs: int = 10):
     """
     检查运行中 Flink 应用的内存水位情况
     """
@@ -138,7 +140,7 @@ def check_flink_abnormal_situation():
         if not is_flink_app(running_app):
             continue
         logger.info(f"正在检测ID为 {app_id} 的应用内存水位情况")
-        error_result = check_flink_oom(app_id)
+        error_result = check_flink_oom(app_id, n_jobs)
         if error_result:
             return error_result
     return None

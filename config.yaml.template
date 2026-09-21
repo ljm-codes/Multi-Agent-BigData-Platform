@@ -120,6 +120,10 @@ hadoop:
       node_mem_lookback_seconds: 90     # 判定时从 executor 死亡时刻往前回看多久
       node_mem_max_samples: 240         # 每节点保留的样本数(5s × 240 ≈ 20 分钟)
 
+      # P2 的执行内存水位是按心跳采样的(默认 10s), 短任务作业读到的只是噪声 ——
+      # 低于执行池这个比例就当"没采到", 而不是"用得太少"。依据见 tests/spark/README.md
+      p2_sampling_blind_ratio: 0.01
+
 # ---------------- ⑤ 数据存储与告警 ----------------
 databases:
   mysql:                     # 商城业务数据（用户/商品/订单，当前以测试桩数据运行）

@@ -7,6 +7,7 @@
 """
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, StageAbnormalInfo
 from Tools.log_settings import LogSetting
@@ -39,7 +40,7 @@ def check_task_error(rule, rule_desc: str, task_dict: dict, stage_id: int, attem
     return error_json_list
 
 
-def check_other(app_id: str):
+def check_other(app_id: str, n_jobs: int = 10):
     jobs_json = request_get(f"{proxy}/proxy/{app_id}/api/v1/applications/{app_id}/jobs")
     if not jobs_json:
         return None
@@ -47,7 +48,7 @@ def check_other(app_id: str):
     if not stage_ids:
         return None
     other_error_json_list = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
         futures = {
             executor.submit(get_stage_summary, stage_id, app_id): stage_id
             for stage_id in stage_ids
@@ -130,5 +131,6 @@ def check_other(app_id: str):
     return CheckResult(
         type="error",
         describe="检测出出现了其他异常情况",
+        check_time=datetime.now(timezone.utc),
         data=other_error_json_list
     )

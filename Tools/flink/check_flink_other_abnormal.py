@@ -7,6 +7,7 @@
 """
 import re
 import time
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, FlinkOtherAbnormalInfo
 from Tools.share_check_tool import (get_all_running_apps, get_flink_rest_base,
@@ -142,6 +143,7 @@ def check_flink_other_abnormal(app_id: str):
     return CheckResult(
         type="error",
         describe="检测出出现了其他异常情况",
+        check_time=datetime.now(timezone.utc),
         data=other_error_list
     )
 

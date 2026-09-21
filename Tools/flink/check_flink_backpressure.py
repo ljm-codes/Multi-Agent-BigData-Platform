@@ -1,6 +1,7 @@
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, FlinkBackpressureInfo
 from Tools.log_settings import LogSetting
@@ -98,7 +99,7 @@ def check_job_exception_network(base: str, job_id: str, app_id: str) -> list:
     return network_error_list
 
 
-def check_flink_backpressure(app_id: str):
+def check_flink_backpressure(app_id: str, n_jobs: int = 10):
     """
     检查 Flink 应用的背压与网络异常情况
     """
@@ -116,7 +117,7 @@ def check_flink_backpressure(app_id: str):
         vertices_infos = job_info.get("vertices", [])
         if not vertices_infos:
             continue
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
             futures = {
                 executor.submit(check_vertex_backpressure, base, job_id, vertex_info, app_id): vertex_info
                 for vertex_info in vertices_infos
@@ -134,14 +135,16 @@ def check_flink_backpressure(app_id: str):
     return CheckResult(
         type="error",
         describe="存在背压或网络异常",
+        check_time=datetime.now(timezone.utc),
         data=backpressure_error_list
     )
 
 
-def check_flink_abnormal_situation():
+def check_flink_abnormal_situation(n_jobs: int = 10):
     """
     检查运行中 Flink 应用的背压与网络情况
     """
+    # tests 用 生产环境请忽略
     running_apps = get_all_running_apps()
     if not running_apps:
         return None
@@ -152,7 +155,7 @@ def check_flink_abnormal_situation():
         if not is_flink_app(running_app):
             continue
         logger.info(f"正在检测ID为 {app_id} 的应用背压与网络情况")
-        error_result = check_flink_backpressure(app_id)
+        error_result = check_flink_backpressure(app_id, n_jobs)
         if error_result:
             return error_result
     return None

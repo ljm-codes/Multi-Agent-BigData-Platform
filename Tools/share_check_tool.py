@@ -14,7 +14,7 @@ try:
 
     _yarn_config = ((_app_config or {}).get("hadoop") or {}).get("yarn") or {}
     _redis_config = _app_config.get("redis") or {}
-except Exception as _e:      # 缺文件 / yaml 格式错 / 必填项缺失, 一律回退
+except Exception as _e:  # 缺文件 / yaml 格式错 / 必填项缺失, 一律回退
     logger.error(f"读取 config.yaml 的 hadoop.yarn 失败, 使用内置默认值: {type(_e).__name__}: {_e}")
     _yarn_config = {}
     _redis_config = {}
@@ -40,10 +40,10 @@ def _with_scheme(value, default: str) -> str:
     return value if "://" in value else "http://" + value
 
 
-poll_interval = yarn_conf('poll_interval', 15)      # 时间间隔，单位秒
+poll_interval = yarn_conf('poll_interval', 15)  # 时间间隔，单位秒
 manager = _with_scheme(yarn_conf('manager', ''), "http://node1:8088")
 proxy = _with_scheme(yarn_conf('proxy', ''), "http://node1:8089")
-max_job_timeout = yarn_conf('max_job_timeout', 30 * 60)   # 最大运行时间，单位秒
+max_job_timeout = yarn_conf('max_job_timeout', 30 * 60)  # 最大运行时间，单位秒
 if not manager:
     raise ValueError("YARN 配置中缺少 manager 项，请现在主目录的 config.yaml 中配置 hadoop yarn 配置")
 
@@ -77,12 +77,15 @@ def get_all_running_apps() -> List[Dict]:
 def is_flink_app(app: Dict) -> bool:
     """
     判断 YARN 应用是否为 Flink 应用
-
-    注意 YARN 报的 applicationType 是 "Apache Flink"(实测), 不是 "FLINK";
-    Spark 侧才是 "SPARK"。原先直接判 == "FLINK" 会静默跳过所有 Flink 应用,
-    导致 Flink 检查全线失效且不报错。这里做大小写无关的包含判断, 兼容两种写法。
     """
     return "flink" in app.get("applicationType", "").lower()
+
+
+def is_spark_app(app: Dict) -> bool:
+    """
+    判断 YARN 应用是否为 Spark 应用
+    """
+    return "spark" in app.get("applicationType", "").lower()
 
 
 def request_get(uri: str, params: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Any:

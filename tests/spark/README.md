@@ -286,7 +286,7 @@ hdfs dfs -put -f /tmp/spark-libs.zip ~/spark-libs.zip
 | `stuck`       | `check_spark_job_timeout`        | ✅ 检出 `warning`（**修复 `state`→`status` 后才可能触发**，见「已知问题」第 1 条）                                                                                                                                                                                                                                                                                                            |
 | `shrink`      | `check_spark_OOM`（误报验证）          | ✅ 未误报（该次 executor 没被回收；误报风险由 `netfail` 实测到，见第 3 条）                                                                                                                                                                                                                                                                                                                     |
 | `spill`       | `check_spark_OOM` P2             | ✅ **检出 `warning`（2026-09-14，P2 首次成立）**：`即将出现OOM，请立马检查阶段 0，已经写入磁盘 319.52 MB数据`。**最终配置是 1600 万条 + 默认 10s 心跳**（没有改被测环境）：条件一实测 `69.0M / 72.3M = 1.00`（2/3 台采到满池）、条件二 `335,039,401` 字节。踩过的两个坑（算子不被追踪、executor 级峰值按心跳采样）见下方专节                                                                                                                                                |
-| `netfail`     | `check_spark_network_timeout` P1 | ✅ 检出 `error`，**FAILED 分支命中**（2026-09-14：修好杀进程助手和注入时序后 2/2 可复现，且自愈完成后再跑一次仍能检出，见「已知问题」第 5 条）。此前两轮都只走 P2 分支。**⚠️ 2026-09-15 容量改动后注入失效、未复现 —— 见「已知问题」第 7 条**（checker 本身没动，不是检出能力退化）                                                                                                                                                                                        |
+| `netfail`     | `check_spark_network_timeout` P1 | ✅ 检出 `error`，**FAILED 分支命中**。2026-09-14 验通（2/2）；**容量改小后曾失效，2026-09-16 重新验通 2/2** —— `--partitions` 120→480 把取数窗口从 3.0s 拉宽到 14.2s，根因与实测数据见「已知问题」第 7 条。两轮均报 `FetchFailedException: The relative remote executor(Id: 2) ... is dead`；自愈完成后再跑一次仍能检出 |
 
 **仍未验证的分支**：**没有了 —— 2026-09-15 全部验通**（最后一项是 `check_spark_OOM` 的
 `error` 档，见上表的 `oom_limit` 行）。留一条**复现路径的注意事项**：
@@ -395,9 +395,35 @@ sorted_df.foreachPartition(...)  # action 只拿到 id
 - 十几秒的 stage 也只有 ~1 个采样点，常常撞在池子没满的瞬间（实测读到 0.587）；
 - 要稳定读到接近 1.0，得是**几十秒以上、真的把执行池占满**的作业（16M 那轮 34.4 秒 / 3.4 个点 / 2 台到 1.00）。
 
-这就是「让检测不了变得可见」的实证依据：`check_spark_OOM` 应该在
-「executor 跑过任务、但执行内存峰值全 0」时打日志或降级，而不是静默 `return None`
-让人以为集群健康。**"没报 P2"里混着「真的没超」和「没采到」两种，从 REST 上分不开。**
+#### 让「检测不了」变得可见（2026-09-16 已实现）
+
+**"没报 P2"里混着「真的没超」和「没采到」两种，从 REST 上分不开** —— 上面那三行就是它的实证。
+`check_spark_OOM` 原来在「executor 跑过任务、但执行内存峰值读到 0」时**静默 `return None`**，
+让人以为集群健康。现在这个盲区有了出口，口径是 2026-09-16 定的：
+
+| 情形 | 处理 |
+|---|---|
+| 水位没采到 + **有阶段溢写** | 报 `warning`、**进告警队列**；措辞是"判定无效/测不到", **不能**假称"即将 OOM" |
+| 水位没采到 + 没有阶段溢写 | 只 `logger.warning`，不进队列 |
+| 水位采到了（哪怕没过 0.9 线） | 不报 —— 那是"真的没超" |
+
+**为什么门槛是"有溢写"**：溢写意味着那个任务从执行池里要不到更多内存，是**不受采样影响**的硬证据，
+而它本来就只在条件一成立时才取。**为什么不能无条件报**：这个盲区是**短任务作业的常态** ——
+实测（app `..._0001`）一个跑过 1134 个任务的 executor 读数是 `64KB / 434MB = 0.015%`，
+无条件报等于几乎每个健康应用都进队列，结果是没人看（告警疲劳）。
+
+**"没采到"的门槛取 `p2_sampling_blind_ratio`（默认 0.01）而不是"精确等于 0"**：
+短任务作业的读数普遍是几百 KB 级的非零小数，卡在 0 上这个判断几乎永不触发。取 1% 是因为
+实测两端差得很远、**中间是空的**：
+
+| 情形 | 实测采样 / 执行池 | 比值 |
+|---|---|---|
+| 短任务应用（1134 个任务） | 64KB / 434MB | **0.015%** ← 没采到 |
+| 真被采到的 `spill` 作业 | 68.0MB / 72.3MB | **0.94 ~ 1.00** |
+
+**实测（2026-09-16）**：`normal` 基线 → 2 个 executor 命中盲区，打出日志、返回 `None`、**零误报**；
+`spill` → P2 仍报「即将出现OOM，请立马检查阶段 0，已经写入磁盘 319.89 MB数据」（抽函数重构没改坏原判据）。
+离线回归在 `tests/verify_fixes.py` 第 9 条（38/38）。
 
 （想换判据的话先想清楚：task 级 `peakExecutionMemory` 是**按 stage 求和**的，不是峰值，
 和 `maxMemory` 不是一回事，不能直接套 0.9。）
@@ -545,33 +571,60 @@ sorted_df.foreachPartition(...)  # action 只拿到 id
    线上很难稳定复现，所以测试里用「轻微倾斜的秒回、严重倾斜的 sleep 0.4 秒」来
    确定性地构造那个顺序（先复现失败、再修）。
 
-7. **`netfail` 的注入在容量改动后失效 —— 未复现，待查（2026-09-15）**。
-   **先强调：`check_spark_network_timeout` 的代码这轮一行没动**，它 2026-09-14 是验通过的
-   （2/2 可复现）。退化的是**注入能不能构造出故障**，不是检出能力。
+7. **`netfail` 的注入在容量改动后失效** —— **2026-09-16 已修，2/2 复现**。
+   先分清两件事：`check_spark_network_timeout` 的代码**一行没动**（它 2026-09-14 就验通了），
+   退化的只是**注入能不能构造出故障**，不是检出能力。
 
-   **症状**：整批回归 10 个故障里 9 个干净，只有 `netfail` 5 个 checker 全 `None`。
-   原始证据：`stage 2 = SKIPPED`（map 产物被认为可用）、`stage 3`（reduce，120 任务）
-   `COMPLETE` 跑完，job `SUCCEEDED` —— **没有任何 FAILED 的 stage attempt**。
+   **症状**：容量 8192→2048 后整批回归 10 个故障里 9 个干净，只有 `netfail` 5 个 checker
+   全 `None` —— `stage 2 = SKIPPED`（map 产物被认为可用）、`stage 3`（reduce，120 任务）
+   `COMPLETE`，job `SUCCEEDED`，**没有任何 FAILED 的 stage attempt**。
 
-   **已修的一半（真 bug）**：注入写死了 `--kill-hosts node3`，而容量从 8192 改成 2048 后
-   AM(1024) 独占一台、两个 executor(2048) 落到另外两台，**node3 恰好成了只剩驱动的那台**
-   —— 杀了个寂寞。修法是 `executor_hosts(sc)` 现场问 Spark `getExecutorMemoryStatus()`
-   挑一台真的有 executor 的机器，`submit.sh` 改成 `--kill-hosts auto`。
-   重跑确认这次**真杀到了**（`kill node1 -> rc=0 pids=102578 102589`，
-   `allexecutors` 里 executor 2 变 `inactive`）。
+   **两个独立原因，第二个才是根因**：
 
-   **但依然没复现**。剩下的假设（按优先级）：
-    1. **杀进程落地太晚** —— ssh 往返实际耗时可能比预期长，等 `kill -9` 生效时 reduce
-       阶段已经跑完。**最省事的验证**：把 fetch 窗口再拉宽（提高 `--partitions`，或降
-       `--executor-cores`/并发），看是否就复现了。
-    2. **取数走了新拉起的 executor** —— 同主机 node1 上随即起了 id=3，需要看 **task 级
-       fetch 指标**才能定（`/stages/{id}/{attempt}/taskSummary` 里那几个 shuffle 字段）。
-    3. ~~map 产物被重算而非重取~~ —— `stage 2 = SKIPPED` 这条证据目前不支持它。
+   | 原因 | 表现 | 修法 |
+   |---|---|---|
+   | ① 杀错机器 | 注入写死 `--kill-hosts node3`，而容量改小后 AM(1024) 独占一台、两个 executor(2048) 落到另外两台 —— node3 只剩驱动，杀了个寂寞 | `executor_hosts(sc)` 现场问 Spark `getExecutorMemoryStatus()`，改成 `--kill-hosts auto` |
+   | ② **杀进程比取数窗口还慢** | 见下表 | `--partitions` 120 → 480 |
 
-   **排查时的注意**：`--stages` 端点不返回 `submissionTime`/`completionTime`，
-   时间线要用别的办法拿（stage attempt 端点或 Spark event log）。
-   单轮实验约 5~10 分钟，可以省掉 checker 的 420 秒等待，直接盯驱动日志里有没有 FAILED stage。
+   **② 的实测数据**（app `application_1789477743773_0012`，UTC）：
 
-   **判据上要小心**：这个故障的失败长得和"checker 漏检"**一模一样** —— 今天已经被
-   写死主机名那次骗过一轮。**下次先确认注入有没有生效**（executor 是否真的变 inactive、
-   有没有出现 FAILED 的 attempt），再谈 checker 报没报。
+   | 量 | 实测 | 怎么拿到的 |
+   |---|---|---|
+   | 杀进程发起 → 容器真的死 | **≈3.0 秒** | 31.4 发起（第一次 count 刚返回）→ 容器 34.435 才死（NM 诊断文本里的 `[21:49:34.435]`） |
+   | `partitions=120` 时 reduce 阶段 | **3.0 秒** | stage 3 attempt 0：31.554 → 34.549 |
+   | 两者之差 | **114 毫秒** | 杀进程落地只比阶段结束早 114ms → 一个失败都构造不出来 |
+
+   那条 ssh 是**冷连接**（从 AM 容器里 `subprocess` 起 ssh，没有连接复用），3 秒是它的固有
+   开销、不是抖动。而 reduce 阶段时长 ≈ `⌈reduce任务数 ÷ 并发槽⌉ × 每任务串行拉的块数 ×
+   单块耗时`，其中「每任务串行拉的块数」就是 **map 产物块数** —— 而 `--partitions` 同时决定
+   map 产物块数和 reduce 任务数，所以它是**二次方杠杆**（`maxReqsInFlight=1` 保证串行）。
+
+   **修法**：只动 `--partitions`（120 → 480），窗口 3.0s → **14.2s**，3 秒的杀进程稳落在里面。
+
+   **验证（2026-09-16，2/2）**：
+
+   | 轮次 | reduce 窗口（job0 的 stage 1，标定用） | 失败证据 |
+   |---|---|---|
+   | `..._0001` | 14.2s | stage 3 attempt 0 **FAILED**（5 个任务失败），`FetchFailedException: The relative remote executor(Id: 2), which maintains the block data to fetch is dead` |
+   | `..._0002` | 12.7s | stage 3 attempt 0 **FAILED**（5 个任务失败），随后 stage 2 重算 + attempt 1 COMPLETE 自愈 |
+
+   两轮都是 `网络超时` 报 `error`、另外 4 个 checker 全 `None`（零误报）；**自愈完成后再跑一次
+   仍能检出**（走 `get_stage_summary` 的 failed 侧，见第 5 条）。抓包在
+   `tmp/netfail-20260916-live/`（`round2/` 是第二轮）。
+
+   **排查经验（别再走弯路）**：
+   - **`/stages` 端点其实返回 `submissionTime`/`completionTime`** —— 本文件早先写着"不返回"，
+     那是**错的**，时间线不用去翻 event log。**job 级时间也在 `/jobs` 里**。
+   - **杀没杀到、杀晚了没有，看两个字段就够**：`/allexecutors` 里该 executor 的
+     `removeTime` + `removeReason`（里面嵌着 NM 记录的容器死亡时刻 `[HH:MM:SS.mmm]`）。
+   - 这个故障"注入没生效"和"checker 漏检"**长得一模一样** —— 已经被写死主机名那次骗过一轮。
+     **先确认注入生效**（executor 是否真的 `isActive=false`、有没有 FAILED 的 attempt），
+     再谈 checker 报没报。
+   - 单轮实验约 5~10 分钟。跑 checker 用 `--wait-failed-stage`，失败证据一出现就返回，
+     不用干等满 `--wait`。
+   - **注入"净度"评估（2026-09-16，结论：不修）**：netfail 借用了 fetchwait 的限流参数
+     （`maxReqsInFlight=1` + `maxSizeInFlight=1m`），串行化取数才撑出那个 14 秒窗口 ——
+     副作用是把 `shuffleFetchWaitTime / executorRunTime` 抬到了 0.3 线附近（实测失败 attempt
+     是 0.309 / 0.333），理论上可能顺带触发 fetchwait 的 P2 分支。**实测没有发生**：
+     指标判定只看**最新 attempt**，而自愈之后最新那次是 **0.124**；两轮返回的 `data` 里
+     都只有那 1 条 `FetchFailedException`。拆掉串行化等于拆掉窗口本身，所以维持现状。
