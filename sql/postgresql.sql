@@ -22,7 +22,7 @@ create table log.checker_log
     check_type     varchar(200)                                       not null,
     error_type     varchar(200)                                       null,                   -- error / warning
     check_describe text                                               null     default '',
-    check_data     json                                                        default '{}',
+    check_data     jsonb                                                        default '{}',
 
     repeat_count   integer                                            not null default 1,
     -- 时间
@@ -45,8 +45,8 @@ create table app_leases
 (
     app_id       varchar(255) primary key,
     session_id   varchar(255) not null, -- 每次抢锁生成的唯一 ID / 也是 Agent 会话ID
-    acquired_at  timestamptz default now(),
-    heartbeat_at timestamptz default now()
+    acquired_at  timestamptz default now(),  -- 获取锁的时间
+    heartbeat_at timestamptz default now()  -- 最后一次心跳的时间
 );
 
 

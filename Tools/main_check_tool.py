@@ -32,7 +32,6 @@ len(redis) -> 放入Redis中的应用错误数量
 在yaml中按数据量(不分类型)设置 低告警 中告警 高告警
 """
 import hashlib
-import json
 import time
 from datetime import datetime, timezone, timedelta
 from typing import List
@@ -68,7 +67,7 @@ except ValueError:
 
 # Lua
 _DEDUPLICATE_AND_INSERT = """
--- KEYS[1] = zset key
+-- KEYS[1] = zadd key
 -- KEYS[2] = 自增序号 key
 -- ARGV    = 成员列表
 local added = 0
@@ -221,7 +220,7 @@ def release_notice_to_redis():
     # 由于在 postgreSQL 中的数据存在 一个应用 多个错误的情况，那么此时采用 分组查询+id 排序，确保每个应用只发送一次通知
     try:
         stmt = (select(
-            CheckLog.id, CheckLog.app_id
+            CheckLog.app_id
         ).where(
             CheckLog.status == "PENDING"
         ).distinct(CheckLog.app_id).order_by(CheckLog.app_id, CheckLog.check_time.asc()))
@@ -233,13 +232,10 @@ def release_notice_to_redis():
                 return None
 
             for result in results:
-                unique_id = result[0]
+                # unique_id = result[0]
                 app_id = result[1]
                 # 发送通知到 redis
-                error_app_infos.append(json.dumps({
-                    "id": unique_id,
-                    "app_id": app_id,
-                }))
+                error_app_infos.append(str(app_id))
 
         # 减少反复操作 redis，提高效率
         add_error_app_infos(error_app_infos)
@@ -267,7 +263,7 @@ def get_db_earliest_time():
         return None
 
 
-_MAIL_DAILY_LIMIT = 3  # 邮件一天最多 3 封：它是手机 App/IM 的下位替代，少发无妨
+_MAIL_DAILY_LIMIT = 3  # 邮件一天最多 3 封
 _last_level = 0  # 上一轮的档位，0=没到阈值 1/2/3=低/中/高；用来判断"这轮是不是刚涨上来"
 
 

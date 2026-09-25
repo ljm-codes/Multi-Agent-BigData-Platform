@@ -1,5 +1,5 @@
 """
-验证 Tools/scheduler.py + Tools/checker_registry.py（离线，不需要集群）
+验证 Tools/scheduler.py + Tools/registry.py（离线，不需要集群）
 
 覆盖:
   1. 注册表里每条登记都能解析（模块能 import、函数存在）
@@ -62,7 +62,7 @@ def _load_entries(rel_path: str) -> list:
 
 def t1_registry_resolvable():
     print("\n[1] 注册表里的登记都能解析")
-    from Tools.checker_registry import CLUSTER_CHECKERS, SPARK_CHECKERS, FLINK_CHECKERS
+    from Tools.registry import CLUSTER_CHECKERS, SPARK_CHECKERS, FLINK_CHECKERS
 
     for group, entries in (("集群级", CLUSTER_CHECKERS), ("Spark", SPARK_CHECKERS),
                            ("Flink", FLINK_CHECKERS)):
@@ -77,7 +77,7 @@ def t1_registry_resolvable():
 def t2_registry_matches_harness():
     """注册表要和两份验证脚本的清单对得上 —— 漏登记 = 那条检查从来不跑"""
     print("\n[2] 注册表和验证脚本的清单不重不漏")
-    from Tools.checker_registry import SPARK_CHECKERS, FLINK_CHECKERS
+    from Tools.registry import SPARK_CHECKERS, FLINK_CHECKERS
 
     for name, rel, registry in (("Spark", "tests/check_spark_live.py", SPARK_CHECKERS),
                                 ("Flink", "tests/check_flink_live.py", FLINK_CHECKERS)):

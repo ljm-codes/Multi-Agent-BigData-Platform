@@ -2,10 +2,13 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    String, Boolean, TEXT, JSON, TIMESTAMP,
-    CheckConstraint, text, BIGINT, INTEGER
+    String, Boolean, TEXT, TIMESTAMP,
+    CheckConstraint, text, BIGINT, INTEGER, Table, MetaData, Column
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+metadata = MetaData()
 
 
 class Base(DeclarativeBase):
@@ -46,8 +49,8 @@ class CheckLog(Base):
         server_default=text("''"),
     )
     check_data: Mapped[Optional[dict]] = mapped_column(
-        JSON,
-        server_default=text("'{}'::json"),
+        JSONB,
+        server_default=text("'{}'::jsonb"),
     )
     repeat_count: Mapped[int] = mapped_column(
         INTEGER,
@@ -83,3 +86,12 @@ class AppLease(Base):
         TIMESTAMP(timezone=True),
         server_default=text("now()"),
     )
+
+
+app_lease = Table(
+    "app_lease", metadata,
+    Column("app_id", String, primary_key=True),
+    Column("session_id", String, nullable=False),
+    Column("acquired_at", TIMESTAMP(timezone=True), nullable=False),
+    Column("heartbeat_at", TIMESTAMP(timezone=True), nullable=False),
+)

@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from SPO.check_result import CheckOutcome
-from Tools.checker_registry import CLUSTER_CHECKERS, checkers_for
+from Tools.registry import checkers_for, ALL_CHECKERS
 from Tools.log_settings import LogSetting
 from Tools.share_check_tool import get_all_running_apps
 
@@ -105,7 +105,7 @@ def run_cycle(apps: Optional[List[dict]] = None) -> List[CheckOutcome]:
                  不给就现场取一次正在运行的
     """
     # 集群检查的类型恒为 ""
-    outcomes = [_call(label, mod, fn, app_type="") for label, mod, fn in CLUSTER_CHECKERS]
+    outcomes = [_call(label, mod, fn, app_type="") for label, mod, fn in ALL_CHECKERS["CLUSTER"]]
 
     if apps is None:
         apps = get_all_running_apps()
