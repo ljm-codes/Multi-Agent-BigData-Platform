@@ -42,7 +42,7 @@ from SPO.check_result import CheckOutcome
 from SPO.postgresql_model import CheckLog
 from Tools import LogSetting
 from Tools.db import SessionLocal
-from Tools.email_sender import send_error_email
+from Tools.alarm_sender import send_error_email
 from Tools.scheduler import run_cycle
 from Tools.share_check_tool import redis_con
 from load_config.config import config

@@ -2,6 +2,8 @@ create database MultiAgentBigDataPlatform;
 
 create schema log;
 
+create schema code;
+
 
 create table log.checker_log
 (
@@ -47,6 +49,11 @@ create table app_leases
     session_id   varchar(255) not null, -- 每次抢锁生成的唯一 ID / 也是 Agent 会话ID
     acquired_at  timestamptz default now(),  -- 获取锁的时间
     heartbeat_at timestamptz default now()  -- 最后一次心跳的时间
+);
+
+create table code.ast(
+    id             bigserial primary key,
+    language varchar(20) not null
 );
 
 

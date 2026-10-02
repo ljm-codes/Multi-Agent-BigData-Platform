@@ -73,6 +73,8 @@ def _connect(host: str, timeout: int) -> Tuple[Optional[paramiko.SSHClient], str
             timeout=timeout, banner_timeout=timeout, auth_timeout=timeout,
             look_for_keys=not SSH_PASSWORD, allow_agent=not SSH_PASSWORD,
         )
+        # 创造 心跳
+        client.get_transport().set_keepalive(timeout)
         return client, "", ""
     except paramiko.AuthenticationException as e:
         return None, ERR_AUTH, f"认证失败: {e}"

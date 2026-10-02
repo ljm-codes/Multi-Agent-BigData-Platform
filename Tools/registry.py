@@ -20,6 +20,7 @@ from langchain_core.tools import BaseTool
 from Tools.share_check_tool import is_flink_app, is_spark_app
 
 _TOOL_REGISTRY: dict[str, list[BaseTool | Callable[[Callable | Runnable], BaseTool]]] = {}
+_TOOL_SEQUENCE: dict[str: dict[int, list[str]]] = {}  # Agent_name -> 级别 -> 工具名
 
 ALL_CHECKERS: dict[str, List[Tuple[str, str, str]]] = {
     "CLUSTER": [
@@ -60,15 +61,31 @@ def checkers_for(app: dict):
     return None, ""
 
 
-def register_tool(agent_name: str):
+def register_tool(agent_name: str, priority: int = -1):
+    """
+    agent_name: 需要用该工具的 Agent 名称
+    priority: 工具优先级 -> 越接近 1 越优先 -> 不支持 优先级为 0
+            -> 若你不设置时 将会采用默认的 -1 ，该值会将优先级降为最低
+            -> 当你设置了 0 时 ，将会退化为 默认的 -1
+    当然 工具 并不局限于 唯一的优先级
+    """
+
     def register(func):
         _TOOL_REGISTRY.setdefault(agent_name, []).append(func)
+        func_name = func.name if hasattr(func, 'name') else func.__name__
+        level = priority if priority > 0 else -1
+        _TOOL_SEQUENCE.setdefault(agent_name, {}).setdefault(level, []).append(func_name)
         return func
 
     return register
 
 
 def register_checker(check_name: str, check_group: Literal["SPARK", "FLINK", "CLUSTER"]):
+    """
+    自定义 检测脚本 注册器 -> 当原本的检测脚本不够全面时，你可以通过这个来添加到 注册表中
+    check_name -> 检测的内容 或者 主题
+    check_group -> 该检测的是属于 SPARK/FLINK/CLUSTER 维度
+    """
     def register(func):
         ALL_CHECKERS.setdefault(check_group, []).append((check_name, func.__module__, func.__name__))
         return func
@@ -78,7 +95,15 @@ def register_checker(check_name: str, check_group: Literal["SPARK", "FLINK", "CL
 
 def get_tools(agent_name: str):
     if agent_name not in _TOOL_REGISTRY:
-        # 空注册表和「这个 Agent 就是没有工具」长得一样，必须喊出来
+        # 判断是否出现 空注册表 「这个 Agent 就是没有工具」
         raise KeyError(f"没有为 {agent_name!r} 注册任何工具 —— 通常是忘了 import "
                        f"对应的工具模块（如 Tools.operations_agent_tools）")
     return _TOOL_REGISTRY[agent_name].copy()
+
+
+def get_priority_tools(agent_name: str):
+    if agent_name not in _TOOL_SEQUENCE:
+        raise KeyError(f"没有为 {agent_name!r} 注册任何工具 —— 通常是忘了 import "
+                       f"对应的工具模块（如 Tools.operations_agent_tools）")
+
+    return _TOOL_SEQUENCE[agent_name].copy()

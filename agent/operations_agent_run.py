@@ -10,13 +10,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, and_
 from sqlalchemy.dialects.postgresql import insert
 
 from SPO.agent_state_model import OperationsAndReconcileInputState, OperationsAndReconcileContext, \
     OperationsAndReconcileCheckInfo
 from SPO.postgresql_model import app_lease, CheckLog
 from Tools import LogSetting
+from Tools.alarm_sender import send_warning_msg
 from Tools.db import SessionLocal
 from Tools.share_check_tool import redis_con
 from agent._operations_agent import operations_agent
@@ -87,8 +88,11 @@ def worker_handle(aid: str, sid: str):
                 CheckLog.check_type, CheckLog.error_type,
                 CheckLog.check_describe, CheckLog.repeat_count
             ).where(
-                CheckLog.app_id == aid and CheckLog.status == "PENDING"
-                and not CheckLog.is_solved
+                and_(
+                    CheckLog.app_id == aid,
+                    CheckLog.status == "PENDING",
+                    not CheckLog.is_solved
+                )
             ).order_by(CheckLog.check_time, CheckLog.repeat_count.desc(), CheckLog.id)
             result = session.execute(stmt)
             rows = result.fetchall()
@@ -107,8 +111,11 @@ def worker_handle(aid: str, sid: str):
                 })
 
             stmt = select(CheckLog.app_type).where(
-                CheckLog.app_id == aid and CheckLog.status == "PENDING"
-                and not CheckLog.is_solved
+                and_(
+                    CheckLog.app_id == aid,
+                    CheckLog.status == "PENDING",
+                    not CheckLog.is_solved
+                )
             ).group_by(CheckLog.app_type)
             result = session.execute(stmt).first()
             if result:
@@ -116,7 +123,7 @@ def worker_handle(aid: str, sid: str):
 
         app_type = app_type or "CLUSTER"
         error_list = []
-        is_cluster = False
+        is_cluster = True if app_type == "CLUSTER" else False
         for error_info in app_error_info:
             if error_info["checker_error"]:
                 # 出现了检查者本身错误，跳过
@@ -130,19 +137,13 @@ def worker_handle(aid: str, sid: str):
                 repeat_count=error_info["repeat_count"],
             ))
 
-        if app_type == "CLUSTER":
-            is_cluster = True
         # 调用运维Agent
-        operations_agent.invoke(
-            OperationsAndReconcileInputState(
-                error_list=error_list,
-                is_cluster=is_cluster,
-                app_id=aid,
-                app_type=app_type,
-            ),
-            config={'configurable': {'thread_id': sid}},
-            context=OperationsAndReconcileContext(app_id=aid)
-        )
+        result = operations_agent.invoke(
+            OperationsAndReconcileInputState(error_list=error_list, is_cluster=is_cluster, app_id=aid,
+                                             app_type=app_type, ), config={'configurable': {'thread_id': sid}},
+            context=OperationsAndReconcileContext(app_id=aid, session_id=sid))
+        if result.get("type", "") == "error":
+            send_warning_msg(app_id=aid, description=f"程序运行出错了：{result.get('out_msg'), ''}")
 
     except Exception as e:
         logger.error(f"在尝试解决应用 {aid} 中的错误信息时出错 {type(e).__name__}: {e}")

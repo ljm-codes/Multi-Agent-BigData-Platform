@@ -2,7 +2,7 @@
 这个测试的出现是由于为了解决 langchain-deepseek 的 ChatDeepSeek 类 的 _get_request_payload 方法
 中并不支持 reasoning_content 返回参数，导致 大模型无法进行推理
 """
-# from langchain.agents import create_agent
+from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from langchain_deepseek import ChatDeepSeek
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage, SystemMessage
@@ -43,7 +43,7 @@ if not getattr(ChatDeepSeek, "_reasoning_content_patched", False):
             if target is not None and target.get("role") == "assistant":
                 target["reasoning_content"] = reasoning
 
-        print(f"patched payload: {payload}")
+        # print(f"patched payload: {payload}")
         return payload
 
 
@@ -66,10 +66,18 @@ class Output(BaseModel):
 
 model_config = config.get("model")
 
-ds_model = init_chat_model(
-    model=model_config.get("name"),
-    **model_config.get("params")
-)
+print(model_config.get("params"))
+
+# 禁用 思考模式
+params = model_config.get("params").copy()
+
+params["extra_body"] = {
+    "thinking": {
+        "type": "disabled"
+    }
+}
+
+print(params)
 
 
 @tool
@@ -84,10 +92,15 @@ def get_weather(city: str) -> str:
     return f"{city}的天气是晴朗的"
 
 
-# test_agent = create_agent(
-#     model=ds_model,
-#     tools=[get_weather]
-# )
+ds_model = init_chat_model(
+    model=model_config.get("name"),
+    **params
+)  # .bind_tools([Output, get_weather], tool_choice="any")
+
+test_agent = create_agent(
+    model=ds_model,
+    tools=[get_weather]
+)
 
 if __name__ == '__main__':
     """
@@ -105,11 +118,11 @@ if __name__ == '__main__':
         user_input = input("请输入：")
         if user_input == "exit":
             break
-        # response = test_agent.invoke(
-        #     {"messages": [HumanMessage(content=user_input)]},
-        #     config={"configurable": {"thread_id": "123"}},
-        # )
-        # print(response)
+        response = test_agent.invoke(
+            {"messages": [HumanMessage(content=user_input)]},
+            config={"configurable": {"thread_id": "123"}},
+        )
+        print(response)
         """
         测试结果：ds 思考模式下，不支持 with_structured_output 即 tool_choice 为 'Any' 的情况
             只允许通过 系统提示词 + "json_object" 来实现结构化输出的格式
@@ -117,19 +130,18 @@ if __name__ == '__main__':
         
         结论：
             若使用思考模式：则放弃 结构化 或 在 系统提示词 中指定的 JSON 格式，并在 invoke 中指定 response_format={"type": "json_object"} 来实现结构化输出的格式
-            
-            将会在 运维 Agent 放弃 结构化，采用 思考模式
         """
-        history.append(HumanMessage(content=user_input))
-        # 尝试非工具 非agent 直接用 init_chat_model 调用
-        response = ds_model.invoke(
-            history,
-            config={"configurable": {"thread_id": "123"}},
-            # response_format={"type": "json_object"}
-        )
-        # history.append(AIMessage(content=response.out_msg))
-        print(f"类型：{type(response)}")  # 原始调用 直接输出 AIMessage 类
-        print(response)
+        # history.append(HumanMessage(content=user_input))
+        # # 尝试非工具 非agent 直接用 init_chat_model 调用
+        # response = ds_model.invoke(
+        #     history,
+        #     config={"configurable": {"thread_id": "123"}},
+        #     # response_format={"type": "json_object"}
+        # )
+        # history.append(response)
+        # print(f"类型：{type(response)}")  # 原始调用 直接输出 AIMessage 类
+        # print(response)
         # print(f"{Output.model_validate_json(response.content)}")
 
-    print(history)
+    # print(history)
+    # print(test_agent.get_state({"configurable": {"thread_id": "123"}}).values)

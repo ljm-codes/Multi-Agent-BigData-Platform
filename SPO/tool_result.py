@@ -12,25 +12,17 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-# 熔断键：网关按后端熔断，不按工具 —— RM 挂了 3 个 yarn 工具应该一起跳
-BACKEND_RM = "rm"
-BACKEND_PROXY = "proxy"
-BACKEND_NM = "nm"
-BACKEND_SSH = "ssh"
-BACKEND_HDFS = "hdfs"
-BACKEND_REDIS = "redis"
-BACKEND_DB = "db"
-
-# 失败分类：网关按类别决定重试 / 熔断 / 直通人工
+# 失败分类
 ERR_TIMEOUT = "timeout"          # 可重试
-ERR_REFUSED = "refused"          # 服务没起 —— 熔断
-ERR_AUTH = "auth"                # 凭据不对 —— 直通人工
-ERR_PERMISSION = "permission"    # 连上了但没权限 —— 直通人工
+ERR_REFUSED = "refused"          # 服务没起
+ERR_AUTH = "auth"                # 凭据不对
+ERR_PERMISSION = "permission"    # 连上了但没权限
 ERR_PARSE = "parse"              # 拿到了但解析不了（多半是代理回落的 HTML）
 ERR_UNSUPPORTED = "unsupported"  # 本环境这条路不成立
 ERR_UNKNOWN = "unknown"
 
-# 只有这几个类别值得自动重试；写操作另由网关按幂等性拦
+# 只有这几个类别值得重试
+#   -> 来自 参数 网络问题 等基本错误，并非来自业务逻辑 代码 本身的错误 因此允许大模型整改后重试
 RETRYABLE = {ERR_TIMEOUT, ERR_UNKNOWN}
 
 
@@ -45,25 +37,24 @@ class ToolResult(BaseModel):
     status: Literal["ok", "empty", "not_found", "error"] = Field(description="四态之一")
     data: Optional[Any] = Field(default=None, description="只有 ok 时有值")
     error_kind: str = Field(default="", description="只有 error 时有值，见 ERR_*")
-    message: str = Field(default="", description="人读的原因；error/not_found 时必填")
-    backend: str = Field(default="", description="本次实际用的是哪个后端 —— 熔断键")
+    message: str = Field(default="", description="错误原因；error/not_found 时必填")
     retryable: bool = Field(default=False, description="网关可否自动重试")
     truncated: bool = Field(default=False, description="返回体被截断了，不是全部")
-    cost_ms: int = Field(default=0, description="本次耗时(毫秒)")
+    cost_ms: int = Field(default=0, description="本次耗时(毫秒) 非必需字段")
 
 
-def ok(data: Any, *, backend: str = "", cost_ms: int = 0, truncated: bool = False) -> ToolResult:
-    return ToolResult(status="ok", data=data, backend=backend, cost_ms=cost_ms, truncated=truncated)
+def ok(data: Any, *, cost_ms: int = 0, truncated: bool = False) -> ToolResult:
+    return ToolResult(status="ok", data=data, cost_ms=cost_ms, truncated=truncated)
 
 
-def empty(message: str, *, backend: str = "", cost_ms: int = 0) -> ToolResult:
-    return ToolResult(status="empty", message=message, backend=backend, cost_ms=cost_ms)
+def empty(message: str, *, cost_ms: int = 0) -> ToolResult:
+    return ToolResult(status="empty", message=message, cost_ms=cost_ms)
 
 
-def not_found(message: str, *, backend: str = "", cost_ms: int = 0) -> ToolResult:
-    return ToolResult(status="not_found", message=message, backend=backend, cost_ms=cost_ms)
+def not_found(message: str, *, cost_ms: int = 0) -> ToolResult:
+    return ToolResult(status="not_found", message=message, cost_ms=cost_ms)
 
 
-def fail(kind: str, message: str, *, backend: str = "", cost_ms: int = 0) -> ToolResult:
+def fail(kind: str, message: str, *, cost_ms: int = 0) -> ToolResult:
     return ToolResult(status="error", error_kind=kind, message=message,
-                      backend=backend, retryable=kind in RETRYABLE, cost_ms=cost_ms)
+                      retryable=kind in RETRYABLE, cost_ms=cost_ms)
