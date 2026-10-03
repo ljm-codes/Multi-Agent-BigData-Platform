@@ -72,7 +72,10 @@ def send_error_email(
 #     return "邮件发送成功" if send_error_email(subject, content) else "邮件发送失败"
 
 
-def send_warning_msg(app_id: str, description: str, error_id: Optional[list[int]] = None):
+def send_warning_msg(
+        app_id: str, description: str,
+        error_id: Optional[list[int]] = None,
+):
     """
     不向 Agent 进行提供该工具， 采用手动 告警
     向人员发送警告消息

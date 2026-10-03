@@ -110,7 +110,7 @@ HandoverMsgModel：
   "data": "工具返回的实际数据",
   "error_kind": "当 status 为 error 时，会描写这个错误的类型",
   "message": "错误原因；error/not_found 时会填",
-  "retryable": "是否可值得重试，一般为 超时，未知 时为 true，重试有上限：最大为1次",
+  "retryable": "是否可值得重试，一般为 超时，未知 时为 true，重试有上限：最大为1次(若超过系统将会拦截)",
   "truncated": "返回体是否被截断了",
   "cost_ms": "本次耗时(毫秒) 非必需字段"
 }

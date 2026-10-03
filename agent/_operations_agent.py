@@ -27,6 +27,7 @@ from Tools.registry import get_tools, get_priority_tools
 from load_config.config import config
 from middleware.compose import run_before_model, chain_model_call_wrappers, ComposedModelResult, run_after_model, \
     chain_tool_call_wrappers
+from middleware.fail_tool_middleware import ToolFailMarkMiddleware, fail_situation
 
 model_config = config.get("model")
 
@@ -35,7 +36,7 @@ model = init_chat_model(
     **model_config.get("params")
 )
 
-operations_middleware = []
+operations_middleware = [ToolFailMarkMiddleware()]
 model_chain = chain_model_call_wrappers(operations_middleware)
 
 operations_tools = get_tools(OM_AGENT)
@@ -444,7 +445,6 @@ def tool_gateway(state: OperationsAndReconcileMainState, runtime: Runtime) -> Co
     #       - langgraph._internal._runnable.py 中的 RunnableCallable 类 中的 ainvoke 方法
     #           -> 通过查阅 ToolNode 发现实际只会走 ret = await self.afunc(*args, **kwargs)
     #       - langgraph.prebuilt.tool_node.py 中的 ToolNode 类 中的 _afunc 与 _combine_tool_outputs
-    # TODO: 未能实现最大重试次数
     remaining = state.get("remaining_tool_calls") or []
     temp_ids = state.get("temp_ai_ids") or []
 
@@ -500,17 +500,32 @@ def tool_gateway(state: OperationsAndReconcileMainState, runtime: Runtime) -> Co
         _tool_progress_savepoint[sid] = next_cat
     calls_this_round = [tc for tc in remaining if tc["_category"] == next_cat]
     rest = [tc for tc in remaining if tc["_category"] != next_cat]
+    # 编写拒绝调用的工具消息
+    refuse_tool_calls = []
+    clean_calls = []
+    for tc in calls_this_round:
+        # 当存在失败记录时，拒绝调用
+        if fail_situation.get(tc.get("id"), 0) >= 1:
+            refuse_tool_calls.append(
+                ToolMessage(
+                    content=f"工具{tc.get('name', '')}调用已经超过最大重试次数，已被拒绝",
+                    name=tc.get("name", ""),
+                    tool_chall_id=tc.get("id", ""),
+                    id=f"rejected-{str(uuid.uuid4())}"
+                )
+            )
+            continue
+        for k, v in tc.items():
+            if k.startswith("_"):
+                continue
+            clean_calls.append({k: v})
 
-    clean_calls = [
-        {k: v for k, v in tc.items() if not k.startswith("_")}
-        for tc in calls_this_round
-    ]
     temp_ai = AIMessage(content="", tools=clean_calls, id=f"temp-{str(uuid.uuid4())}")
 
     return Command(
         goto="tool",
         update={
-            "messages": [temp_ai],
+            "messages": [temp_ai] + refuse_tool_calls,
             "remaining_tool_calls": rest,
             "temp_ai_ids": temp_ids + [temp_ai.id]
         }

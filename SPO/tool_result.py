@@ -38,7 +38,7 @@ class ToolResult(BaseModel):
     data: Optional[Any] = Field(default=None, description="只有 ok 时有值")
     error_kind: str = Field(default="", description="只有 error 时有值，见 ERR_*")
     message: str = Field(default="", description="错误原因；error/not_found 时必填")
-    retryable: bool = Field(default=False, description="网关可否自动重试")
+    retryable: bool = Field(default=False, description="可否能重试")
     truncated: bool = Field(default=False, description="返回体被截断了，不是全部")
     cost_ms: int = Field(default=0, description="本次耗时(毫秒) 非必需字段")
 
