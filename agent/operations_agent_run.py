@@ -6,6 +6,7 @@
 然后，会从postgresql中获取该应用的全部错误信息（按check_time升序），对Agent进行串行invoke
 当Agent处理完成一个应用的ID后，“占用信息” 会自动释放
 """
+import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from uuid import uuid4
@@ -71,7 +72,7 @@ def try_lock(aid: str, sid: str):
             return False
 
 
-def worker_handle(aid: str, sid: str):
+async def worker_handle(aid: str, sid: str):
     """
     运维Agent 处理函数 -> 也是图的调用方
     :param aid: 需要处理的应用ID
@@ -91,7 +92,7 @@ def worker_handle(aid: str, sid: str):
                 and_(
                     CheckLog.app_id == aid,
                     CheckLog.status == "PENDING",
-                    not CheckLog.is_solved
+                    CheckLog.is_solved.is_(False)
                 )
             ).order_by(CheckLog.check_time, CheckLog.repeat_count.desc(), CheckLog.id)
             result = session.execute(stmt)
@@ -114,7 +115,7 @@ def worker_handle(aid: str, sid: str):
                 and_(
                     CheckLog.app_id == aid,
                     CheckLog.status == "PENDING",
-                    not CheckLog.is_solved
+                    CheckLog.is_solved.is_(False)
                 )
             ).group_by(CheckLog.app_type)
             result = session.execute(stmt).first()
@@ -138,7 +139,7 @@ def worker_handle(aid: str, sid: str):
             ))
 
         # 调用运维Agent
-        result = operations_agent.invoke(
+        result = await operations_agent.ainvoke(
             OperationsAndReconcileInputState(error_list=error_list, is_cluster=is_cluster, app_id=aid,
                                              app_type=app_type, ), config={'configurable': {'thread_id': sid}},
             context=OperationsAndReconcileContext(app_id=aid, session_id=sid))
@@ -152,6 +153,10 @@ def worker_handle(aid: str, sid: str):
 
 def reconcile_from_db():
     pass
+
+
+def run_async(coro_func, *args, **kwargs):
+    return asyncio.run(coro_func(*args, **kwargs))
 
 
 def operations_main():
@@ -168,7 +173,7 @@ def operations_main():
                 continue
 
             # 开始分配任务：串行invoke
-            future = executor.submit(worker_handle, app_id, session_id)
+            future = executor.submit(run_async, worker_handle, app_id, session_id)
             app_to_future[app_id] = future
             future_to_app[future] = app_id
 

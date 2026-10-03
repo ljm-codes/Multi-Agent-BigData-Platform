@@ -2,6 +2,7 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal, List, TypedDict, NotRequired
 
 from langchain.agents.middleware import ModelRequest, ModelResponse
@@ -49,7 +50,7 @@ maximum_category = max(tool_categories.keys())
 _tool_progress_savepoint: dict[str, int] = {}
 logger = LogSetting.create(__name__)
 
-with open("./prompt/operations_agent.md", "r", encoding="utf-8") as f:
+with open(Path(__file__).parent / "prompt" / "operations_agent.md", "r", encoding="utf-8") as f:
     operations_rule_manual = f.read()
 
 _operations_system_prompt = f"""
@@ -255,7 +256,6 @@ async def operations_chat(state: OperationsAndReconcileMainState, runtime: Runti
         messages=[*state["messages"]],
         system_message=SystemMessage(content=_operations_system_prompt),
         tools=operations_tools,
-        tool_choice="any",
         state=state,  # type: ignore[arg-type]
         runtime=runtime,
     )
@@ -342,7 +342,7 @@ def forward_node(
 
     # 结束情况
     if route.get("type") == "error" and route.get("error_from") == "_parse_route_message":
-        return Send("chat_end", {"type": "error", "error_desc_text": json.dumps(route)})
+        return Send("chat_end", {"type": "error", "error_desc_text": json.dumps(route, ensure_ascii=False)})
     nodes = route.get("nodes")  # 理应来说是 List[SendMsgModel]
     if not nodes:
         # 都没有，就是出现了解析异常
@@ -352,7 +352,7 @@ def forward_node(
     for node in list(vy_type_dict.values()):
         node_name = node.get("node", "")
         if not node_name:
-            return Send("chat_end", {"type": "error", "error_desc_text": json.dumps(route)})
+            return Send("chat_end", {"type": "error", "error_desc_text": json.dumps(route, ensure_ascii=False)})
         if node_name == "summary":
             send_list.append(Send(
                 "summary",
@@ -366,9 +366,12 @@ def forward_node(
     return send_list
 
 
-def app_summary(state: SummaryMsgModel) -> Literal["chat_end"] | Send:
+def app_summary(state: SummaryMsgModel) -> dict | None:
     if not state:
-        return Send("chat_end", {"type": "error", "error_desc_text": "app_solve节点异常"})
+        return {
+            "type": "error",
+            "error_desc_text": "app_solve节点异常"
+        }
     solve_error_ids = state.get("solve_error_ids", [])
     unsolvable_error_ids = state.get("unsolvable_error_ids", [])
     app_id = state.get("app_id", "")
@@ -376,20 +379,31 @@ def app_summary(state: SummaryMsgModel) -> Literal["chat_end"] | Send:
     if unsolvable_error_ids:
         is_success, msg = send_warning_msg(error_id=unsolvable_error_ids, app_id=app_id, description=unsolvable_desc)
         if not is_success:
-            return Send("chat_end", {"type": "error", "error_desc_text": msg})
+            return {
+                "type": "error",
+                "error_desc_text": msg
+            }
     try:
         with SessionLocal() as session:
-            stmt = select(CheckLog).where(CheckLog.id.in_(solve_error_ids) and CheckLog.app_id == app_id)
-            check_logs = session.scalar(stmt).all()
+            stmt = select(CheckLog).where(
+                and_(
+                    CheckLog.id.in_(solve_error_ids),
+                    CheckLog.app_id == app_id
+                )
+            )
+            check_logs = session.execute(stmt).fetchall()
             for check_log in check_logs:
                 check_log.is_solved = True
                 check_log.status = "DONE"
                 check_log.update_time = datetime.now(timezone.utc)
 
             session.commit()
-        return "chat_end"
+        return None
     except Exception as e:
-        return Send("chat_end", {"type": "error", "error_desc_text": f"修改数据库时出错 {type(e).__name__}: {e}"})
+        return {
+            "type": "error",
+            "error_desc_text": f"修改数据库时出错 {type(e).__name__}: {e}"
+        }
 
 
 async def app_handover(state: HandoverMsgModel) -> Literal["chat_end"] | Send:
@@ -418,15 +432,14 @@ def _annotate_and_sort(tool_calls: list[ToolCall]) -> list[dict]:
 def _skip_tool_msg_encapsulation(remaining: list[dict], permission: int) -> list[ToolMessage]:
     rejected_tool_calls = []
     for unfinished in remaining:
-        for un in unfinished:
-            rejected_tool_calls.append(
-                ToolMessage(
-                    content=f"工具越级调用被拒，请先调用等级为{permission}的工具",
-                    name=un.get("name", ""),
-                    tool_chall_id=un.get("id", ""),
-                    id=f"rejected-{str(uuid.uuid4())}"
-                )
+        rejected_tool_calls.append(
+            ToolMessage(
+                content=f"工具越级调用被拒，请先调用等级为{permission}的工具",
+                name=unfinished.get("name", ""),
+                tool_call_id=unfinished.get("id", ""),
+                id=f"rejected-{str(uuid.uuid4())}"
             )
+        )
     return rejected_tool_calls
 
 
@@ -505,22 +518,20 @@ def tool_gateway(state: OperationsAndReconcileMainState, runtime: Runtime) -> Co
     clean_calls = []
     for tc in calls_this_round:
         # 当存在失败记录时，拒绝调用
-        if fail_situation.get(tc.get("id"), 0) >= 1:
+        if fail_situation.get(tc.get("name"), 0) >= 2:
             refuse_tool_calls.append(
                 ToolMessage(
                     content=f"工具{tc.get('name', '')}调用已经超过最大重试次数，已被拒绝",
                     name=tc.get("name", ""),
-                    tool_chall_id=tc.get("id", ""),
+                    tool_call_id=tc.get("id", ""),
                     id=f"rejected-{str(uuid.uuid4())}"
                 )
             )
             continue
-        for k, v in tc.items():
-            if k.startswith("_"):
-                continue
-            clean_calls.append({k: v})
+        tc.pop("_category", None)
+        clean_calls.append(tc)
 
-    temp_ai = AIMessage(content="", tools=clean_calls, id=f"temp-{str(uuid.uuid4())}")
+    temp_ai = AIMessage(content="", tool_calls=clean_calls, id=f"temp-{str(uuid.uuid4())}")
 
     return Command(
         goto="tool",
@@ -542,8 +553,8 @@ async def chat_end(
         async with AsyncSessionLocal() as session:
             stmt = delete(app_lease).where(
                 and_(
-                    app_lease.app_id == runtime.context.app_id,
-                    app_lease.session_id == runtime.context.session_id
+                    app_lease.c.app_id == runtime.context.app_id,
+                    app_lease.c.session_id == runtime.context.session_id
                 )
             )
             await session.execute(stmt)

@@ -35,8 +35,9 @@ class ToolFailMarkMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         result = handler(request)
         sid = request.runtime.context.session_id
+        self._lock_dict.setdefault(sid, Lock())
         app_id = request.runtime.context.app_id
-        tool_id = request.tool_call.get("id", "")
+        tool_name = request.tool_call.get("name", "")
 
         with self._lock_dict[sid]:
             if isinstance(result, ToolMessage):
@@ -47,17 +48,17 @@ class ToolFailMarkMiddleware(AgentMiddleware):
                         return result
                     if not (tool_res_json.status == "error" and tool_res_json.retryable):
                         return result
-                    if fail_situation.get(tool_id, ""):
-                        fail_count = fail_situation[tool_id] + 1
-                        if fail_count >= 1:
+                    if fail_situation.get(tool_name, ""):
+                        fail_count = fail_situation[tool_name] + 1
+                        if fail_count >= 2:
                             # 调用告警发送函数
                             send_warning_msg(
                                 app_id=app_id,
-                                description=f"工具 {tool_id} 失败 {fail_count} 次"
+                                description=f"工具 {tool_name} 失败 {fail_count} 次"
                             )
-                        fail_situation[tool_id] = fail_count
+                        fail_situation[tool_name] = fail_count
                     else:
-                        fail_situation.setdefault(tool_id, 1)
+                        fail_situation.setdefault(tool_name, 1)
                 except Exception as e:
                     logger.error(f"解析工具返回的json格式失败，错误信息：{e}")
         return result
@@ -69,29 +70,34 @@ class ToolFailMarkMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command[Any]:
         result = await handler(request)
         sid = request.runtime.context.session_id
+        self._lock_dict.setdefault(sid, Lock())
         app_id = request.runtime.context.app_id
-        tool_id = request.tool_call.get("id", "")
+        tool_name = request.tool_call.get("name", "")
 
         async with self._lock_dict[sid]:
             if isinstance(result, ToolMessage):
                 tool_res = result.content
                 try:
-                    tool_res_json = json.loads(tool_res)
-                    if not isinstance(tool_res_json, ToolResult):
+                    if not tool_res.strip():
                         return result
+
+                    tool_res_json = ToolResult.model_validate_json(tool_res)
                     if not (tool_res_json.status == "error" and tool_res_json.retryable):
                         return result
-                    if fail_situation.get(tool_id, ""):
-                        fail_count = fail_situation[tool_id] + 1
-                        if fail_count >= 1:
+                    if fail_situation.get(tool_name, ""):
+                        fail_count = fail_situation[tool_name] + 1
+                        if fail_count >= 2:
                             # 调用告警发送函数
-                            await asyncio.to_thread(send_warning_msg(
+                            await asyncio.to_thread(
+                                send_warning_msg,
                                 app_id=app_id,
-                                description=f"工具 {tool_id} 失败 {fail_count} 次"
-                            ))
-                        fail_situation[tool_id] = fail_count
+                                description=f"工具 {tool_name} 失败 {fail_count} 次",
+                                error_id=None
+                            )
+                        fail_situation[tool_name] = fail_count
                     else:
-                        fail_situation.setdefault(tool_id, 1)
+                        fail_situation.setdefault(tool_name, 1)
                 except Exception as e:
-                    logger.error(f"解析工具返回的json格式失败，错误信息：{e}")
+                    logger.warning(f"解析工具返回的json格式失败，错误信息：{e}")
+                    return result
         return result

@@ -232,8 +232,7 @@ def release_notice_to_redis():
                 return None
 
             for result in results:
-                # unique_id = result[0]
-                app_id = result[1]
+                app_id = result[0]
                 # 发送通知到 redis
                 error_app_infos.append(str(app_id))
 

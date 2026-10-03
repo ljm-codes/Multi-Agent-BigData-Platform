@@ -72,7 +72,7 @@ class CheckLog(Base):
 
 
 class AppLease(Base):
-    __tablename__ = "app_lease"
+    __tablename__ = "app_leases"
     __table_args__ = (
         {"schema": "public"},
     )
@@ -89,7 +89,7 @@ class AppLease(Base):
 
 
 app_lease = Table(
-    "app_lease", metadata,
+    "app_leases", metadata,
     Column("app_id", String, primary_key=True),
     Column("session_id", String, nullable=False),
     Column("acquired_at", TIMESTAMP(timezone=True), nullable=False),
