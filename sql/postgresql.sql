@@ -51,6 +51,7 @@ create table app_leases
     heartbeat_at timestamptz default now()  -- 最后一次心跳的时间
 );
 
+-- 以下 SQL 均为 未开发 完整
 create table code.ast(
     id             bigserial primary key,
     language varchar(20) not null

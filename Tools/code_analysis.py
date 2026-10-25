@@ -47,6 +47,47 @@ class VarCollector(ast.NodeVisitor):
 
         self.vars.append((scope_desc, name, lineno, how))
 
+    def _add_class_member(self, name, lineno):
+        """将变量记录为“纯类内变量”，作用域描述使用“类 xxx 内”"""
+        kind, scope_name = self.current_scope()
+
+        if kind == 'class':
+            class_name = scope_name
+        elif kind == 'function' and len(self.scope_stack) >= 2 and self.scope_stack[-2][0] == 'class':
+            # 当前在类的方法中（方法直接定义在类里）
+            class_name = self.scope_stack[-2][1]
+        else:
+            return
+
+        self.vars.append((f'类 {class_name} 内', name, lineno, '纯类内变量'))
+
+    def _collect_class_member_target(self, target):
+        """
+        根据当前作用域，收集类成员变量：
+        - 类体直接定义：收集 Name（如 A、B）
+        - 类方法内：收集 self.xxx
+        """
+        kind, _ = self.current_scope()
+
+        if kind == 'class':
+            for name_node in self._iter_store_names(target):
+                self._add_class_member(name_node.id, name_node.lineno)
+        elif kind == 'function' and len(self.scope_stack) >= 2 and self.scope_stack[-2][0] == 'class':
+            for attr_node in self._iter_self_attrs(target):
+                self._add_class_member(f'self.{attr_node.attr}', attr_node.lineno)
+
+    def _iter_self_attrs(self, node):
+        """从赋值目标中提取所有 self.xxx 的 Attribute 节点"""
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == 'self':
+                if isinstance(node.ctx, ast.Store):
+                    yield node
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                yield from self._iter_self_attrs(elt)
+        elif isinstance(node, ast.Starred):
+            yield from self._iter_self_attrs(node.value)
+
     # ---------- 作用域进入 / 退出 ----------
     def visit_ClassDef(self, node):
         # 类名绑定在当前作用域
@@ -80,6 +121,10 @@ class VarCollector(ast.NodeVisitor):
     def visit_AnnAssign(self, node):
         if node.value is not None:
             self._handle_target(node.target, '注解赋值')
+        else:
+            # 无值注解（如 A: int）：原有逻辑不记录到当前作用域，
+            # 但在类体/方法中需要作为类成员收集。
+            self._collect_class_member_target(node.target)
         self.generic_visit(node)
 
     def visit_AugAssign(self, node):
@@ -132,9 +177,12 @@ class VarCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     # ---------- 辅助函数 ----------
-    def _handle_target(self, target, how):
+    def _handle_target(self, target, how, collect_class_member=True):
         for name_node in self._iter_store_names(target):
             self.add_var(name_node.id, name_node.lineno, how)
+
+        if collect_class_member:
+            self._collect_class_member_target(target)
 
     def _iter_store_names(self, node):
         """从赋值目标里提取出所有 Store 上下文的 Name 节点"""
@@ -829,6 +877,17 @@ JAVA_SCOPE_NODES = JAVA_TYPE_NODES + JAVA_FUNC_NODES
 
 _JAVA_PARSER = None
 
+# 类/接口/枚举/record 等类型声明的节点类型 -> 对外暴露的 attribute 值
+_JAVA_CLASS_KINDS = {
+    "class_declaration": "class",
+    "interface_declaration": "interface",
+    "enum_declaration": "enum",
+    "record_declaration": "record",
+    "annotation_type_declaration": "annotation",
+}
+# interface 的隐式常量是 constant_declaration，class 是 field_declaration。
+_JAVA_FIELD_NODES = {"field_declaration", "constant_declaration"}
+
 
 def _java_parser():
     """惰性取 Java 解析器 —— 不碰 Java 就不需要 tree_sitter"""
@@ -911,6 +970,42 @@ def _java_scope_info(node):
             "name": _java_name(node), "start": start, "end": end}
 
 
+def _collect_java_vars(class_node, path, result):
+    """
+    递归收集某个类型声明下的成员字段
+
+    只遍历 body 的直接成员：field/constant 才收，子类型才递归；
+    method_declaration / constructor_declaration / static_initializer / block
+    都直接跳过 —— 因此天然不会收进方法体里的局部变量、局部类和匿名类。
+    """
+    name_node = class_node.child_by_field_name("name")
+    class_name = name_node.text.decode("utf-8") if name_node is not None else "<anonymous>"
+    kind = _JAVA_CLASS_KINDS[class_node.type]
+    current_path = path + [class_name]
+
+    body = class_node.child_by_field_name("body")
+    if body is None:
+        return
+
+    for member in body.named_children:
+        if member.type in _JAVA_FIELD_NODES:
+            names = []
+            for child in member.children:
+                if child.type == "variable_declarator":
+                    n = child.child_by_field_name("name")
+                    if n is not None:
+                        names.append(n.text.decode("utf-8"))
+            if not names:
+                continue
+            result.append({
+                "classes": ".".join(current_path),
+                "attribute": kind,
+                "variable": names[0] if len(names) == 1 else names,
+            })
+        elif member.type in _JAVA_CLASS_KINDS:
+            _collect_java_vars(member, current_path, result)
+
+
 class JavaAnalyzer:
     """
     一个 Java 文件的解析入口
@@ -978,6 +1073,26 @@ class JavaAnalyzer:
         """
         return [_serialize(r, self.children_of, _java_scope_info) for r in self.roots]
 
+    def vars(self):
+        """
+        获取类变量，不包括方法内的变量
+
+        支持嵌套类/接口/枚举，路径按定义层级用 "." 拼起来。
+        同一 field_declaration 里声明的多个变量合并成一个列表；
+        只有一个变量时直接给字符串。
+
+        :return: list，每项形如
+                 {"classes": "Main.SubA", "attribute": "class", "variable": "a"}
+                 {"classes": "Main",      "attribute": "class", "variable": ["b", "c"]}
+                 {"classes": "Main.SubB", "attribute": "interface", "variable": "CONST"}
+                 方法内的局部变量、局部类、匿名类一律不会出现
+        """
+        result = []
+        for node in self.root.named_children:
+            if node.type in _JAVA_CLASS_KINDS:
+                _collect_java_vars(node, [], result)
+        return result
+
     def entry(self):
         """
         找 Java 的入口 —— `public static void main(String[])` 的声明行
@@ -996,13 +1111,15 @@ class JavaAnalyzer:
         return first
 
     # ---------- 按限定名取 ----------
-    def code_by_name(self, qualname: str):
+    def code_by_name(self, qualname: str, start_idx: int | None = None, end_idx: int | None = None):
         """
         获取类或方法的代码段
 
         :param qualname: 限定名，**从文件顶层往下写全**，如 "FaultJob.RateSource.run"；
                          也吃栈帧写法（"com.ops.fault.FaultJob$RateSource.run"）——
                          包名整段去掉、$ 当 .，这两条只是写法换算，不做任何补全
+        :param start_idx: 开始行号，从 1 开始；默认 None，即从头开始
+        :param end_idx: 结束行号，默认 None，即到尾结束(若填了start_idx，而没填此参数，则只返回start_idx这行)
         :return: {"qualname", "code", "lineno", "end_lineno"}，qualname 是解析出来的全名；
                  同名方法（重载）时多一个 "overloads"，每项是 {"signature", "lineno", "end_lineno"}，
                  code 给的是**源码顺序最靠前**的那一个；
@@ -1024,9 +1141,14 @@ class JavaAnalyzer:
             return None
 
         start, end = _java_span(hits[0])
+        if start_idx is None and end_idx is None:
+            start_idx = start
+            end_idx = end
+        elif start_idx is not None and end_idx is None:
+            end_idx = start_idx
         got = {"qualname": full,
-               "code": "\n".join(self.source_code.splitlines()[start - 1:end]),
-               "lineno": start, "end_lineno": end}
+               "code": "\n".join(self.source_code.splitlines()[start_idx - 1:end_idx]),
+               "lineno": start_idx, "end_lineno": end_idx}
         if len(hits) > 1:
             got["overloads"] = [{"signature": _java_signature(n),
                                  "lineno": _java_span(n)[0], "end_lineno": _java_span(n)[1]}

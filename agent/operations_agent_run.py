@@ -14,7 +14,7 @@ from uuid import uuid4
 from sqlalchemy import func, select, and_
 from sqlalchemy.dialects.postgresql import insert
 
-from SPO.agent_state_model import OperationsAndReconcileInputState, OperationsAndReconcileContext, \
+from SPO.operations_agent_state_model import OperationsAndReconcileInputState, OperationsAndReconcileContext, \
     OperationsAndReconcileCheckInfo
 from SPO.postgresql_model import app_lease, CheckLog
 from Tools import LogSetting

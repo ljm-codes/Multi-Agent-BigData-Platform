@@ -81,8 +81,8 @@ from langchain_core.messages import AIMessage, ToolMessage  # noqa: E402
 from langchain_core.tools import tool as tool_dec  # noqa: E402
 from langgraph.graph import END, START, MessagesState, StateGraph  # noqa: E402
 from langgraph.prebuilt import ToolNode  # noqa: E402
-from SPO.agent_state_model import (OperationsAndReconcileContext,  # noqa: E402
-                                   OperationsAndReconcileInputState)
+from SPO.operations_agent_state_model import (OperationsAndReconcileContext,  # noqa: E402
+                                              OperationsAndReconcileInputState)
 from SPO.tool_result import ToolResult, fail, ok  # noqa: E402
 from Tools.registry import _TOOL_REGISTRY, get_priority_tools  # noqa: E402
 import agent.operations_agent_run as RUN  # noqa: E402

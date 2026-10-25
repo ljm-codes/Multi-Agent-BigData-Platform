@@ -1,5 +1,4 @@
 import json
-import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,14 +16,16 @@ from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field
 from sqlalchemy import select, delete, and_
 
-from SPO.agent_state_model import (OperationsAndReconcileMainState,
-                                   OperationsAndReconcileInputState,
-                                   OperationsAndReconcileOutputState, ErrorInfo)
+from SPO.operations_agent_state_model import (OperationsAndReconcileMainState,
+                                              OperationsAndReconcileInputState,
+                                              OperationsAndReconcileOutputState, ErrorInfo,
+                                              OperationsAndReconcileContext)
 from SPO.postgresql_model import CheckLog, app_lease
 from Tools import OM as OM_AGENT, LogSetting
 from Tools.alarm_sender import send_warning_msg
 from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.registry import get_tools, get_priority_tools
+from Tools.struct_analy import parse_route_message
 from load_config.config import config
 from middleware.compose import run_before_model, chain_model_call_wrappers, ComposedModelResult, run_after_model, \
     chain_tool_call_wrappers
@@ -164,83 +165,12 @@ def filter_msg_handler_node(state: dict) -> Literal["chat_end", "chat"]:
     return "chat"
 
 
-def _extract_text_content(message: BaseMessage) -> str:
-    """提取消息文本：兼容 str 与 OpenAI 风格内容块列表（[{'type': 'text', 'text': ...}, ...]）。"""
-    content = message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get('type') == 'text':
-                parts.append(str(block.get('text', '')))
-        return ''.join(parts)
-    return ''
-
-
-def _strip_json_wrappers(text: str) -> str:
-    """剥离常见 JSON 包装，返回最内层候选 JSON 文本（失败返回原文）：
-    ```json 代码块、首尾引号包裹。复杂注入下模型可能产出包装过的 JSON，
-    直接 model_validate_json 会失败，剥一层再试可避免被当作自然语言兜底。
-    """
-    s = text.strip()
-    match = re.match(r'^```(?:json)?\s*(.*?)\s*```$', s, re.S)
-    if match:
-        s = match.group(1).strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
-        s = s[1:-1].strip()
-    return s
-
-
 def _parse_route_message(message: BaseMessage) -> OperationsAndMaintenanceAgentOutModel | None:
     """
     将 大模型输出的 AIMessage 解析为 OperationsAndMaintenanceAgentOutModel 类型
     若无法解析 则返回 None
     """
-    # 理想情况
-    if isinstance(message, AIMessage) and message.tool_calls:
-        tool_call = message.tool_calls[0]
-        if tool_call['name'] == OperationsAndMaintenanceAgentOutModel.__name__:
-            try:
-                route = OperationsAndMaintenanceAgentOutModel.model_validate(tool_call["args"])
-                return route
-            except Exception as e:
-                logger.error(f"进行解析时出现了异常{type(e).__name__}: {e}")
-                return None
-        # 当 大模型调用工具时 进行返回 None
-        return None
-    # 避免出现大模型 将 消息 写在 content 中，所以需要进行解析
-    content = _extract_text_content(message)
-    if content.strip():
-        try:
-            # 若为简单的 JSON 字符串 则直接解析
-            route = OperationsAndMaintenanceAgentOutModel.model_validate_json(content)
-            return route
-        except Exception as e:
-            logger.debug(f"进行解析时出现了异常{type(e).__name__}: {e}")
-            # 尝试另一种方法：解包装后 再解析
-            stripped = _strip_json_wrappers(content)
-            if content != stripped.strip():
-                try:
-                    route = OperationsAndMaintenanceAgentOutModel.model_validate_json(stripped)
-                    return route
-                except Exception as e:
-                    logger.error(f"进行解析时出现了异常{type(e).__name__}: {e}")
-                    pass
-
-            match = re.search(r'\{.*}', content, re.S)
-            if match:
-                try:
-                    route = OperationsAndMaintenanceAgentOutModel.model_validate_json(match.group(0))
-                    return route
-                except Exception as e:
-                    logger.error(f"进行解析时出现了异常{type(e).__name__}: {e}")
-                    pass
-        # 实在没招了，走 告警 吧
-        logger.warning(f"无法解析消息 {content} 为 OperationsAndMaintenanceAgentOutModel 类型")
-    return None
+    return parse_route_message(message, OperationsAndMaintenanceAgentOutModel)
 
 
 async def operations_chat(state: OperationsAndReconcileMainState, runtime: Runtime) -> List[Command]:
@@ -578,6 +508,7 @@ async def chat_end(
 
 _builder = StateGraph(
     OperationsAndReconcileMainState,  # type: ignore
+    context_schema=OperationsAndReconcileContext,
     input_schema=OperationsAndReconcileInputState,  # type: ignore
     output_schema=OperationsAndReconcileOutputState,  # type: ignore
 )

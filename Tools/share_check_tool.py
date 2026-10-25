@@ -47,7 +47,6 @@ max_job_timeout = yarn_conf('max_job_timeout', 30 * 60)  # 最大运行时间，
 if not manager:
     raise ValueError("YARN 配置中缺少 manager 项，请现在主目录的 config.yaml 中配置 hadoop yarn 配置")
 
-# test -> 到时候要从yaml中获取数据
 redis_pool = redis.ConnectionPool(
     host=_redis_config.get("host", 'localhost'),
     port=_redis_config.get("port", 6379),

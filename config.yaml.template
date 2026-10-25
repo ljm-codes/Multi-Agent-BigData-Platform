@@ -29,11 +29,6 @@ AMQP:
     connection_attempts: 3
     retry_delay: 5
 
-# ---------------- ② 文件与模型缓存 ----------------
-file:
-  upload_dir: './data/uploads'
-  download_dir: './data/downloads'
-
 huggingface:
   mirror: true                 # 使用 hf-mirror.com 镜像（国内网络建议开启）
   download_dir: ./huggingface_cache
@@ -124,6 +119,23 @@ hadoop:
       # 低于执行池这个比例就当"没采到", 而不是"用得太少"。依据见 tests/spark/README.md
       p2_sampling_blind_ratio: 0.01
 
+      # spark-submit 提交端：二进制、Python、预上传 jars 归档（archive 可留空）
+      submit_bin: /export/server/spark3/bin/spark-submit
+      python: /export/server/miniconda3/envs/spark_study/bin/python3
+      archive: hdfs://node1:8020/user/hadoop/spark-libs.zip
+  hdfs:
+    webhdfs:
+      url: http://node1:8030
+      user: hadoop
+
+agent:
+  DDA:
+    java_maven_lib_dir: ~/.m2/repository
+  DAA:
+    python_lib_dir: /path/to/spark_sandbox/Lib/site-packages
+    test_python: /path/to/spark_sandbox/python.exe
+    spark_test_master: local[*]
+
 # ---------------- ⑤ 数据存储与告警 ----------------
 databases:
   mysql:                     # 商城业务数据（用户/商品/订单，当前以测试桩数据运行）
@@ -132,12 +144,13 @@ databases:
     user: root
     password: '123456'       # 本地开发默认值
     db: fireflymall
-  postgres:                  # 预留：LangGraph Checkpointer / Store 的生产存储
+  postgres:                  # LangGraph Checkpointer / Store 的生产存储
+    enabled: true            # false 时退回 InMemory，仅本地调试
     host: localhost
     port: 5432
     user: postgres
     password: '123456'
-    db: fireflymall
+    db: multiagentbigdataplatform
   rag:
     sqlite:                  # ★ 记忆片段向量库（sqlite-vec），记忆框架的存储层
       db_url: './database/test1.db'

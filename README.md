@@ -2,6 +2,8 @@
 Multi-Agent BigData Platform(多智能体大数据平台)
 </h1>
 
+**⚠️注意：本项目由于时间关系，只编写到 Demo 版本，后续会继续完善。**
+
 ## 项目介绍
 
 ### Multi-Agent BigData Platform 是什么？
@@ -18,10 +20,9 @@ Multi-Agent BigData Platform 是一个以`Agent`为主，`大数据`为背景，
 ## 项目结构
 
 ### 项目架构图
-![项目架构图](./Multi-agent BigData Platform.drawio.png "项目架构图")
+![项目架构图](Multi-agent-BigData-Platform.drawio.png)
 
 ### 项目目录结构
-
 
 ## 安装与部署
 

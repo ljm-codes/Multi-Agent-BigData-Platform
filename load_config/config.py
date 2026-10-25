@@ -48,6 +48,20 @@ with open(os.path.join(_BASE_DIR, 'config.yaml'), 'r', encoding='utf-8') as f:
     analysis_yaml = AnalysisYaml(yaml_dict=_config)
     config = analysis_yaml.analysis()
 
+
+def get_model_params(*, thinking: dict | None = None) -> dict:
+    """模型参数：thinking 必须放 extra_body，不能作为 OpenAI 客户端参数直接传"""
+    params = dict(((config.get("model") or {}).get("params") or {}))
+    configured = params.pop("thinking", None)
+    if thinking is not None:
+        configured = thinking
+    if configured is not None:
+        extra_body = dict(params.get("extra_body") or {})
+        extra_body["thinking"] = configured
+        params["extra_body"] = extra_body
+    return params
+
+
 if __name__ == '__main__':
     # text = read_sub_agent_prompt(
     #     r'D:\pycharm\pycharm study\intelligent_customer_service\agent\prompt\after_sales_service_prompt.md')

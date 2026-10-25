@@ -54,7 +54,7 @@ NM_LOG_DIRS = _yarn_conf.get("nm_log_dirs", "/data/nm-log")
 # bucket 号由应用 ID 决定、不在配置里 —— 路径里用通配符让 HDFS 自己展开，别去算
 REMOTE_APP_LOG_DIR = _yarn_conf.get("remote_app_log_dir", "/tmp/logs")
 LOG_USER = _yarn_conf.get("log_user", "hadoop")
-# 重提作业用的命令行落在 HDFS 的哪个目录下（{app_type}/cmd/{app_id}.cmd）
+# 重提作业用的命令行落在 HDFS 的哪个目录下（{app_type}/cmd/{app_name}.cmd）
 STARTUP_CMD_DIR = _yarn_conf.get("startup_cmd_dir", "/app")
 
 # grep -n 的命中行是「行号:内容」，-A 带出来的上下文行是「行号-内容」
@@ -685,7 +685,7 @@ def _analyzer_of(source: str):
 
     try:
         analyzer = JavaAnalyzer(source_code=source)
-    except RuntimeError as exc:      # 环境里没有 tree_sitter
+    except RuntimeError as exc:  # 环境里没有 tree_sitter
         return fail(ERR_UNSUPPORTED, str(exc))
 
     if analyzer.has_error and not analyzer.class_hierarchy():
@@ -873,29 +873,31 @@ def _client_host() -> str:
 
 @register_tool(AGENT_NAME, 4)
 @tool("job__restart")
-def job_restart(app_id: str, dry_run: bool = True) -> str:
+def job_restart(app_id: str, dry_run: bool = True, app_name: str | None = None) -> str:
     """
     (工具优先级：4)
     重提一个作业：把当初提交它的那条命令原样再跑一次。
 
-    命令取自 HDFS 上按应用存档的 `{startup_cmd_dir}/{spark|flink}/{app_id}.cmd`。
+    命令取自 HDFS 上按应用名存档的 `{startup_cmd_dir}/{spark|flink}/cmd/{name}.cmd`。
 
     Args:
-        app_id: YARN 应用 ID
+        app_id: YARN 应用 ID；内部会用 YARN 返回的 name 去找命令文件
         dry_run: True（默认）只把命令取回来，**不执行**；False 才真的提交
+        app_name: YARN 应用名称；不给则用 app_id 去找(可选)
 
     Returns:
-        data: {app_id, cmd_path, command, executed, output}
+        data: {app_id, app_name, app_type, cmd_path, command, executed, output}
         其中：
+            - app_name 是 YARN 返回的应用名称（也是 cmd 文件名）
             - status = not_found 表示这个应用没有存档命令 —— 只能人工重提。
         （Spark 可以用 log__read 读它的 launch_container.sh，里面有 AM 当时的实际命令行，
         但那是 ApplicationMaster 的形态，和 spark-submit 的那条不是一回事。）
     """
     app_id = (app_id or "").strip()
     if not app_id:
-        return _dump(fail(ERR_UNKNOWN, "app_id 不能为空"))
+        return _dump(fail(ERR_UNKNOWN, "app_name 不能为空"))
 
-    _app, app_type, err, cost = _job_app(app_id, "启动命令")
+    app, app_type, err, cost = _job_app(app_id, "启动命令")
     if err:
         return _dump(err)
 
@@ -904,7 +906,9 @@ def job_restart(app_id: str, dry_run: bool = True) -> str:
         return _dump(fail(ERR_UNKNOWN, f"从 manager 配置里解析不出客户端主机: {manager}",
                           cost_ms=cost))
 
-    cmd_path = f"{STARTUP_CMD_DIR}/{app_type}/cmd/{app_id}.cmd"
+    # app_name 传的是 app_id；命令文件按 YARN 的 name 存
+    resolved_name = ((app or {}).get("name") or app_name).strip()
+    cmd_path = f"{STARTUP_CMD_DIR}/{app_type}/cmd/{resolved_name}.cmd"
     res = node_ssh.run(host, f'hdfs dfs -cat {shlex.quote(cmd_path)} 2>&1')
     if not res.ok:
         return _dump(fail(res.error_kind, res.message, cost_ms=res.cost_ms))
@@ -914,8 +918,8 @@ def job_restart(app_id: str, dry_run: bool = True) -> str:
             f"没有这个应用的启动命令存档: hdfs://{cmd_path} —— 只能人工重提",
             cost_ms=res.cost_ms))
 
-    payload = {"app_id": app_id, "app_type": app_type, "cmd_path": cmd_path,
-               "command": command, "executed": False, "output": ""}
+    payload = {"app_id": app_name, "app_name": resolved_name, "app_type": app_type,
+               "cmd_path": cmd_path, "command": command, "executed": False, "output": ""}
     if dry_run:
         payload["note"] = "dry_run=True，只回显命令没有执行"
         return _dump(ok(payload, cost_ms=res.cost_ms))

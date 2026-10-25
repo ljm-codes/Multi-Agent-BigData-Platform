@@ -36,12 +36,22 @@ cache/
 database/
 log/
 tmp/
+tmp_code/
 huggingface_cache/
+tests/metrics/*.json
 *.db
 *.sqlite3
 *.db-wal
 *.db-shm
 
+# ---------- 本地草稿/大文件 ----------
+sandbox/
+Maven/mvn-3.9.9.7z
+
 # ---------- 模型文件与缓存（大文件/下载缓存不入库：ONNX 从 Kaggle 导出后手动放置） ----------
 model/*.onnx
 model/hfl/
+
+# ---------- maven+mcp源代码 ----------
+Maven/mvn-3.9.9/
+Maven/mcp/maven_mcp_source_code.js
