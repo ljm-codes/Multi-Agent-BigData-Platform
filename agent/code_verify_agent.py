@@ -2,6 +2,7 @@
 代码质检Agent
 需要额外编写一个子图
 """
+import ast
 import asyncio
 import json
 import os
@@ -208,6 +209,42 @@ class TextBuffer:
 # ---------------  utils ---------------
 def _parse_verify_agent_message(ver_res: BaseMessage) -> VerifyAgentOutClass | None:
     return parse_route_message(ver_res, VerifyAgentOutClass)
+
+
+def _repair_invalid_tool_calls(ver_res: AIMessage) -> AIMessage | None:
+    """模型偶尔把 JSON 里的 true/false/null 写成 Python 的 True/False/None。
+
+    LangChain 会把这些调用放进 invalid_tool_calls，tool_calls 为空。
+    这里尽量按 Python 字面量解析参数，转成合法工具调用后继续跑。
+    """
+    invalid_calls = getattr(ver_res, "invalid_tool_calls", None) or []
+    repaired_calls = []
+    for call in invalid_calls:
+        raw_args = call.get("args")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except Exception:  # noqa: BLE001
+                try:
+                    args = ast.literal_eval(raw_args)
+                except Exception:  # noqa: BLE001
+                    continue
+        else:
+            args = raw_args
+        if not isinstance(args, dict):
+            continue
+        repaired_calls.append({
+            "name": call.get("name"),
+            "args": args,
+            "id": call.get("id"),
+            "type": "tool_call",
+        })
+    if not repaired_calls:
+        return None
+    return ver_res.model_copy(update={
+        "tool_calls": [*(getattr(ver_res, "tool_calls", None) or []), *repaired_calls],
+        "invalid_tool_calls": [],
+    })
 
 
 def _parse_command(command_list: list[dict]) -> list[str]:
@@ -745,6 +782,10 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
         model_ = ver_request.model.bind_tools(tools)
 
         ver_res = await model_.ainvoke(mags)
+        if isinstance(ver_res, AIMessage) and getattr(ver_res, "invalid_tool_calls", None):
+            repaired = _repair_invalid_tool_calls(ver_res)
+            if repaired is not None:
+                ver_res = repaired
         ver_out = _parse_verify_agent_message(ver_res)
         if ver_out is None:
             # 调用工具时
@@ -872,27 +913,26 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
         )
 
     if goto == "execute":
+        if fail_num := state.get("fail_num"):
+            # 浅层连续失败超过 2 次就强制转人工，Spark/Flink 同一规则
+            if fail_num > 2:
+                shallow_result = state.get("shallow_result")
+                if hasattr(shallow_result, "__dataclass_fields__"):
+                    shallow_result = asdict(shallow_result)
+                test_code_dict = {
+                    "type": "error",
+                    **(shallow_result or {}),
+                    "app_type": app_type,
+                    "source": state.get("source"),
+                    "original_task_list": state.get("original_task_list") or [],
+                    "date": date,
+                    "project_name": p_name,
+                }
+                return Send(
+                    "ver_manual",
+                    test_code_dict
+                )
         if app_type == "flink":
-            if fail_num := state.get("fail_num"):
-                # 只能失败2次
-                if fail_num > 2:
-                    # 不行只能交给人工
-                    shallow_result = state.get("shallow_result")
-                    if hasattr(shallow_result, "__dataclass_fields__"):
-                        shallow_result = asdict(shallow_result)
-                    test_code_dict = {
-                        "type": "error",
-                        **(shallow_result or {}),
-                        "app_type": app_type,
-                        "source": state.get("source"),
-                        "original_task_list": state.get("original_task_list") or [],
-                        "date": date,
-                        "project_name": p_name,
-                    }
-                    return Send(
-                        "ver_manual",
-                        test_code_dict
-                    )
             shallow_commands = _parse_command(flink_command.get("flink_shallow_command") or [])
         elif app_type == "spark":
             shallow_commands = _parse_spark_command(spark_command.get("spark_shallow_command") or [])

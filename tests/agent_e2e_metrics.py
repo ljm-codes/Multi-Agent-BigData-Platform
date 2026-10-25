@@ -581,6 +581,21 @@ async def run_segment(
                 return output, interrupts
 
         output, interrupts = await asyncio.wait_for(consume(), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        # 图运行失败也要把已采集到的节点/工具/消息落盘，避免整轮数据丢失
+        segment = store.as_dict()
+        error_text = f"{type(exc).__name__}: {exc}"
+        segment.update({
+            "kind": kind,
+            "started_at": started_at,
+            "duration_ms": (time.perf_counter() - started) * 1000,
+            "interrupted": False,
+            "interrupts": [],
+            "final_state": {"error": error_text},
+            "error": error_text,
+        })
+        print(f"[segment error] {error_text}")
+        return segment, {"error": error_text}, []
     finally:
         MetricsTransformer.store = None
 
@@ -606,6 +621,9 @@ def _auto_answer(interrupts: list[Any], args: argparse.Namespace) -> Any:
         return args.submit
     if not args.auto_pass:
         return None
+    if isinstance(value, dict) and value.get("type") == "error":
+        # 浅层/深层连续失败后转人工：自动终止，避免 manual -> deep 死循环
+        return {"pass": False, "msg": "auto-terminated by metrics test", "force_terminate": True}
     # CVA 人工确认：回 dict
     return {"pass": True, "msg": "auto-passed by metrics test"}
 

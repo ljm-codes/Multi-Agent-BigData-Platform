@@ -1,10 +1,14 @@
 """
 项目主运行入口
 """
-import os
 import asyncio
+import sys
 
-if os.name == 'nt':
+if sys.platform.startswith("win"):
+    try:
+        asyncio.get_event_loop().close()
+    except RuntimeError:
+        pass
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from langchain_core.messages import AIMessage
@@ -62,13 +66,13 @@ app = start_app()
 
 if __name__ == '__main__':
     server = config.get("server")
-    host = config.get("host")
-    port = config.get("port")
+    host = server.get("host")
+    port = server.get("port")
     uvicorn.run(
         app,
         host=host,
         port=port,
-        loop="asyncio",
+        loop="none",
         reload=False,
         log_level="warning",
     )

@@ -351,17 +351,19 @@ def add_maven_dependence(runtime: ToolRuntime, maven_list: MavenList) -> str:
             artifact_id = dependency.findtext(_qn("artifactId"))
             # 处理版本号占位符
             if version:
-                if version_placeholder := re.match(r"\$\{(.*?)}", version).group(1):
+                version_match = re.match(r"\$\{(.*?)}", version)
+                if version_match:
                     # 版本号是占位符, 进行处理
+                    version_placeholder = version_match.group(1)
                     properties = pom_root.find(_qn("properties"))
-                    version = properties.findtext(_qn(f"{version_placeholder}"))
+                    version = properties.findtext(_qn(f"{version_placeholder}")) if properties is not None else None
                     if not version:
                         logger.warning(f"版本号 {version_placeholder} 未定义")
                         version = "undefined"
                     else:
                         version = version.strip()
                 else:
-                    version = "undefined"
+                    version = version.strip()
             already_have_info_dict[f"{group_id}:{artifact_id}"] = version or "undefined"
         # 过滤已存在的依赖, 只添加不存在的依赖
         for maven_info in maven_infos:
@@ -1028,15 +1030,15 @@ def view_app_interval_code(runtime: ToolRuntime, file_path: str, start_idx: int,
     if start_idx <= 0:
         logger.warning(f"Agent填入了无效的起始索引 start_idx: {start_idx}，已经自动调整为1")
         start_idx = 1
-    if start_idx > end_idx:
-        logger.error("不允许出现 start_idx 大于 end_idx 的情况")
-        return f"不允许出现 start_idx 大于 end_idx 的情况. start_idx: {start_idx}, end_idx: {end_idx}"
     try:
         print_list = []
         with open((app_path / file_path), "r", encoding='utf-8', newline='') as f:
             code = f.readlines()
         if end_idx is None:
             end_idx = len(code) + 1
+        if start_idx > end_idx:
+            logger.error("不允许出现 start_idx 大于 end_idx 的情况")
+            return f"不允许出现 start_idx 大于 end_idx 的情况. start_idx: {start_idx}, end_idx: {end_idx}"
         for i, line in enumerate(code, start=1):
             # 筛选出 [start_idx - 1:end_idx - 1] 区间的行
             if start_idx <= i < end_idx:
