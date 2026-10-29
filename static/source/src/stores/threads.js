@@ -21,7 +21,12 @@ export const useThreadStore = defineStore('threads', {
     error: '',
   }),
   getters: {
-    titleOf: (state) => (threadId) => state.titles[threadId] || `会话 ${shortId(threadId)}`,
+    titleOf: (state) => (threadId) => {
+      // 后端 thread_name 最准（新建时取首条消息前 10 字）
+      const record = [...state.lists.active, ...state.lists.archived]
+        .find((item) => item.thread_id === threadId)
+      return record?.thread_name || state.titles[threadId] || `会话 ${shortId(threadId)}`
+    },
     isPinned: (state) => (threadId) => state.pins.includes(threadId),
     recordsOf: (state) => (tab) => {
       const list = state.lists[tab] || []
@@ -74,7 +79,6 @@ export const useThreadStore = defineStore('threads', {
     async remove(threadId) {
       await threadsApi.deleteThread(threadId)
       removeTitle(threadId)
-      delete this.lists.active
       delete this.titles[threadId]
       await this.loadAll()
     },

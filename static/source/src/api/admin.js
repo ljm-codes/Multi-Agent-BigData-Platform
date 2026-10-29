@@ -31,3 +31,12 @@ export function setAccountStatus({ id, disabled, reason = '' }) {
     body: { id, disabled, reason },
   })
 }
+
+/** 修改账号资料：只传要改的字段；只有 permission=2 能调 */
+export function updateUser({ id, username, email, permission }) {
+  const body = { id }
+  if (username !== undefined && username !== null && username !== '') body.username = username
+  if (email !== undefined && email !== null && email !== '') body.email = email
+  if (permission !== undefined && permission !== null) body.permission = permission
+  return request('/auth/admin/account/update', { method: 'POST', body })
+}

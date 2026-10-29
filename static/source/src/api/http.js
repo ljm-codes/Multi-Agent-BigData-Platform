@@ -22,6 +22,14 @@ export function clearToken() {
   localStorage.removeItem('token')
 }
 
+/** token 失效：清本地凭证并回登录页（已经在登录页就不重复跳） */
+export function handleUnauthorized() {
+  clearToken()
+  if (!location.pathname.startsWith('/login')) {
+    location.href = '/login'
+  }
+}
+
 async function toJson(resp) {
   const text = await resp.text()
   if (!text) return null
@@ -35,7 +43,7 @@ async function toJson(resp) {
 /**
  * 统一请求：自动带 token、解 {code, msg, data} 信封、401 时清掉本地 token
  */
-export async function request(path, { method = 'GET', body, auth = true } = {}) {
+export async function request(path, { method = 'GET', body, auth = true, raw = false } = {}) {
   const headers = {}
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (auth && getToken()) headers.Authorization = AUTH_PREFIX + getToken()
@@ -48,7 +56,7 @@ export async function request(path, { method = 'GET', body, auth = true } = {}) 
   const payload = await toJson(resp)
 
   if (resp.status === 401) {
-    clearToken()
+    handleUnauthorized()
     throw new ApiError(payload?.msg || '登录已失效，请重新登录', 401)
   }
   if (!resp.ok) {
@@ -58,5 +66,6 @@ export async function request(path, { method = 'GET', body, auth = true } = {}) 
   if (payload && typeof payload === 'object' && 'code' in payload && payload.code !== 0) {
     throw new ApiError(payload.msg || '请求失败', payload.code)
   }
-  return payload?.data ?? null
+  // raw: 有些接口直接返回裸数组（比如 /ai/background），不解信封
+  return raw ? payload : payload?.data ?? null
 }

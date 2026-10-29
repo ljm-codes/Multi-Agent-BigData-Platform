@@ -1,4 +1,4 @@
-import { AUTH_PREFIX, ApiError, getToken, request } from './http'
+import { AUTH_PREFIX, ApiError, getToken, handleUnauthorized, request } from './http'
 
 /**
  * 解析一个 SSE 事件块（形如 "event: token\ndata: {...}"）
@@ -70,6 +70,7 @@ export async function streamChat({ userId, message, threadId, signal }, handlers
     } catch {
       /* 忽略非 JSON 响应 */
     }
+    if (resp.status === 401) handleUnauthorized()
     throw new ApiError(detail, resp.status)
   }
 

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
-import { buildRecommendLink, listUsers, setAccountStatus } from '@/api/admin'
+import { buildRecommendLink, listUsers, setAccountStatus, updateUser } from '@/api/admin'
 
 const router = useRouter()
 const user = useUserStore()
@@ -17,6 +17,10 @@ const level = ref(0)
 const reason = ref('')
 const link = ref('')
 const generating = ref(false)
+
+const editing = ref(null)
+const editForm = ref({ username: '', email: '', permission: 0 })
+const saving = ref(false)
 
 const canManage = computed(() => user.permission === 2)
 const canInvite = computed(() => Number(user.permission ?? 0) > 0)
@@ -87,6 +91,39 @@ function formatTime(value) {
   if (!value) return '-'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString()
+}
+
+function startEdit(row) {
+  editing.value = row
+  editForm.value = {
+    username: row.username || '',
+    email: row.email && !row.email.includes('*') ? row.email : '',
+    permission: Number(row.permission ?? 0),
+  }
+}
+
+function cancelEdit() {
+  editing.value = null
+}
+
+async function saveEdit() {
+  if (!editing.value) return
+  saving.value = true
+  error.value = ''
+  try {
+    await updateUser({
+      id: editing.value.id,
+      username: editForm.value.username,
+      email: editForm.value.email,
+      permission: editing.value.permission === 2 ? undefined : Number(editForm.value.permission),
+    })
+    editing.value = null
+    await load()
+  } catch (e) {
+    error.value = e?.message || '修改失败'
+  } finally {
+    saving.value = false
+  }
 }
 
 onMounted(load)
@@ -162,7 +199,8 @@ watch(tab, load)
               <td class="muted">{{ row.email }}</td>
               <td>{{ row.permission }}</td>
               <td class="muted">{{ formatTime(row.create_time) }}</td>
-              <td v-if="canManage">
+              <td v-if="canManage" class="ops">
+                <button class="ghost small" @click="startEdit(row)">编辑</button>
                 <button class="ghost small" :class="{ danger: !row.disabled }" @click="toggleStatus(row)">
                   {{ row.disabled ? '启用' : '封禁' }}
                 </button>
@@ -171,6 +209,31 @@ watch(tab, load)
           </tbody>
         </table>
       </section>
+    </div>
+
+    <div v-if="editing" class="mask" @click.self="cancelEdit">
+      <div class="dialog">
+        <h3>修改账号 #{{ editing.id }}</h3>
+
+        <label>用户名</label>
+        <input v-model="editForm.username" maxlength="255" />
+
+        <label>邮箱</label>
+        <input v-model="editForm.email" type="email" maxlength="255" placeholder="留空表示不修改" />
+
+        <label>权限等级</label>
+        <select v-model.number="editForm.permission" :disabled="editing.permission === 2">
+          <option :value="0">0</option>
+          <option :value="1">1</option>
+          <option :value="2">2</option>
+        </select>
+        <p v-if="editing.permission === 2" class="muted small">同级账号的权限不可修改</p>
+
+        <div class="dialog-actions">
+          <button class="ghost" @click="cancelEdit">取消</button>
+          <button class="primary" :disabled="saving" @click="saveEdit">{{ saving ? '保存中…' : '保存' }}</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -302,5 +365,60 @@ watch(tab, load)
 .ghost.danger {
   color: var(--danger);
   border-color: var(--danger);
+}
+
+.ops {
+  display: flex;
+  gap: 6px;
+}
+
+.mask {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.dialog {
+  width: 340px;
+  padding: 22px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.dialog h3 {
+  margin: 0 0 14px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.dialog label {
+  display: block;
+  margin: 12px 0 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.dialog input,
+.dialog select {
+  width: 100%;
+  padding: 8px 10px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+.dialog select:disabled {
+  opacity: 0.55;
+}
+.small {
+  font-size: 12px;
+}
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
 }
 </style>
