@@ -14,7 +14,6 @@ __pycache__/
 *.egg-info/
 .eggs/
 build/
-dist/
 .venv/
 venv/
 env/
@@ -27,9 +26,6 @@ env/
 .vscode/
 *.iml
 
-# ---------- 前端代码（独立仓库维护，本仓库不含前端） ----------
-static/
-
 # ---------- 运行时数据与产物 ----------
 data/
 cache/
@@ -38,6 +34,8 @@ log/
 tmp/
 tmp_code/
 huggingface_cache/
+static/source/node_modules/
+static/dist/
 *.db
 *.sqlite3
 *.db-wal
