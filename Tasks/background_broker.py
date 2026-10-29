@@ -278,6 +278,13 @@ class BackgroundTaskRegistry:
     def is_locked(self, main_thread_id: str) -> bool:
         return bool(self.locked_records(main_thread_id))
 
+    def remove_thread(self, main_thread_id: str) -> int:
+        """删掉某会话的全部后台任务记录，返回删掉的条数（会话被删时调用）"""
+        task_ids = [record.task_id for record in self.list_for_thread(main_thread_id)]
+        for task_id in task_ids:
+            self._records.pop(task_id, None)
+        return len(task_ids)
+
 
 # 进程内单例：主图、CVA middleware、perceptron 共用同一份
 background_broker = BackgroundBroker()

@@ -15,6 +15,8 @@ class ResultCode(IntEnum):
     DOWNLOAD_ERROR = 4002
     UPLOAD_LIMIT_ERROR = 4003
     INVALID_VALUE_ERROR = 4004
+    PERMISSION_ERROR = 4005
+    RECOMMEND_CODE_ERROR = 4006
     DB_ERROR = 4010
     UNAUTHORIZED = 401
     NOT_FOUND = 402
@@ -24,6 +26,8 @@ class ResultCode(IntEnum):
         msg_map = {
             ResultCode.SUCCESS: "响应成功",
             ResultCode.SERVER_ERROR: "服务器错误",
+            ResultCode.PERMISSION_ERROR: "权限等级不足",
+            ResultCode.RECOMMEND_CODE_ERROR: "推荐码无效或已过期",
             ResultCode.UNAUTHORIZED: "未授权",
             ResultCode.UPLOAD_SUCCESS: "上传成功",
             ResultCode.DOWNLOAD_SUCCESS: "下载成功",

@@ -88,6 +88,107 @@ class AppLease(Base):
     )
 
 
+class AdminInfo(Base):
+    __tablename__ = "admin_info"
+    __table_args__ = (
+        CheckConstraint(
+            "permission in (0, 1, 2)",
+            name="permission_check_constraint",
+        ),
+        {"schema": "public"},
+    )
+    id: Mapped[int] = mapped_column(
+        BIGINT,
+        primary_key=True,
+    )
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    password: Mapped[str] = mapped_column(String(255), nullable=False)
+    permission: Mapped[int] = mapped_column(
+        INTEGER,
+        nullable=False,
+        server_default=text("0"),
+    )
+    disabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    )
+    email: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+    )
+    create_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+    update_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+
+
+class RecommendApprovalTable(Base):
+    __tablename__ = "recommend_approval_log"
+    __table_args__ = (
+        CheckConstraint(
+            "level in (0, 1, 2)",
+            name="level_check_constraint",
+        ),
+        CheckConstraint(
+            "recommended_level in (0, 1, 2)",
+            name="recommended_level_check_constraint",
+        ),
+        {"schema": "log"},
+    )
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, )
+    recommend_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(
+        TEXT,
+        nullable=True,
+        server_default=text("''"),
+    )
+    level: Mapped[int] = mapped_column(
+        INTEGER, nullable=False, server_default=text("0")
+    )
+    recommended_level: Mapped[int] = mapped_column(
+        INTEGER, nullable=False, server_default=text("0")
+    )
+    is_pass: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    create_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+    update_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+
+
+class AdminThread(Base):
+    __tablename__ = "admin_thread"
+    __table_args__ = (
+        {"schema": "public"},
+    )
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True,)
+    thread_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    thread_name: Mapped[str] = mapped_column(String(20), nullable=False)
+    admin_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    is_archive: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    create_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+    update_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+
+
 app_lease = Table(
     "app_leases", metadata,
     Column("app_id", String, primary_key=True),
