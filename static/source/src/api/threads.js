@@ -34,3 +34,19 @@ export function deleteThreads(threadIds) {
   threadIds.forEach((id) => q.append('thread_ids', id))
   return request(`/ai/thread/deletes?${q.toString()}`, { method: 'DELETE' })
 }
+
+/** 重命名会话（后端会把名字截到 10 个字符） */
+export function renameThread(threadId, threadName) {
+  return request('/ai/thread/change', {
+    method: 'PUT',
+    body: { thread_id: threadId, thread_name: threadName, is_top: false },
+  })
+}
+
+/** 置顶 / 取消置顶；后端模型里 thread_name 是必填字段，这里传当前标题 */
+export function topThread(threadId, isTop, threadName = '') {
+  return request('/ai/thread/top', {
+    method: 'PUT',
+    body: { thread_id: threadId, thread_name: threadName, is_top: isTop },
+  })
+}

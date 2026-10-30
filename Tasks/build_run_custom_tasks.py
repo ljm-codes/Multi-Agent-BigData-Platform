@@ -4,7 +4,7 @@ import asyncio
 from typing import Callable, Literal, Awaitable, Any, ClassVar
 
 from SPO.main_agent_state_model import TaskOutcome
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 
 OutcomeStatus = Literal[
     "completed",

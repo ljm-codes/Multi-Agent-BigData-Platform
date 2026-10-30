@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, WebSocket
 from fastapi.responses import FileResponse, StreamingResponse
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -214,6 +214,32 @@ async def background(thread_id: str | None = None):
          "summary": "深度验证 flink 词频", "result": "全部测试通过（12/12）", "interrupt": None,
          "created_at": now_iso(40), "updated_at": now_iso(30)},
     ]
+
+
+@app.post("/ai/background/verify")
+async def background_verify():
+    """假 Ticket，WS 那边不校验，只为了跑通前端流程"""
+    return ok({"ticket": "mock-ticket"})
+
+
+@app.websocket("/ai/ws/background")
+async def background_ws(websocket: WebSocket):
+    await websocket.accept()
+    snapshot = await background()
+    await websocket.send_json({"type": "snapshot", "records": snapshot})
+    try:
+        # 每 10 秒推一条“运行中”的更新，方便看实时效果
+        while True:
+            await asyncio.sleep(10)
+            await websocket.send_json({"type": "update", "record": {
+                "task_id": "deep-8f2a", "user_id": "1",
+                "main_thread_id": snapshot[0]["main_thread_id"],
+                "bg_thread_id": snapshot[0]["bg_thread_id"], "status": "running",
+                "summary": snapshot[0]["summary"], "result": "", "interrupt": None,
+                "created_at": snapshot[0]["created_at"], "updated_at": now_iso(),
+            }})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.get("/open/app/get_ides")

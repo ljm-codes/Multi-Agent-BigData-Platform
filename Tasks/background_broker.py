@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable, Literal
 from langchain_core.messages import AIMessage
 
 from SPO.main_agent_state_model import TaskOutcome
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 
 logger = LogSetting.create(__name__)
 

@@ -58,16 +58,44 @@ if not getattr(ChatDeepSeek, "_reasoning_content_patched", False):
     ChatDeepSeek._reasoning_content_patched = True
 
 import uvicorn
+import inspect
+import signal
 
 from main import start_app
 from load_config.config import config
+from Tools.log_settings import LogSetting
 
 app = start_app()
+logger = LogSetting.create(__name__)
+
+
+# 这里查看 ctrl+c 后的“无界”栈，看看为什么会出现同时出现KeyboardInterrupt, asyncio.CancelledError
+def dump_tasks(signum, frame):
+    print("\n=== DUMPING ASYNCIO TASKS (before shutdown proceeds) ===", file=sys.stderr)
+    try:
+        loop = asyncio.get_event_loop()
+        tasks = asyncio.all_tasks(loop)
+        for task in tasks:
+            if task.done():
+                continue
+            print(f"\n--- TASK: {task.get_name()} ---", file=sys.stderr)
+            # 打印该任务当前挂起位置的调用栈
+            for line in task.get_stack():
+                frameinfo = inspect.getframeinfo(line)
+                print(f"  {frameinfo.filename}:{frameinfo.lineno} in {frameinfo.function}", file=sys.stderr)
+    except Exception as e:
+        print(f"Failed to dump tasks: {e}", file=sys.stderr)
+    print("=== END DUMP ===\n", file=sys.stderr)
+
 
 if __name__ == '__main__':
     server = config.get("server")
     host = server.get("host")
     port = server.get("port")
+    CONNECT_TO_CLUSTER = bool((config.get("app") or {}).get("connect_to_cluster", True))
+    if not CONNECT_TO_CLUSTER:
+        logger.warning(f"当前命令禁止链接集群，该项目的部分工具与功能将无法使用，但你仍能继续运行")
+    signal.signal(signal.SIGINT, dump_tasks)
     uvicorn.run(
         app,
         host=host,
@@ -75,4 +103,5 @@ if __name__ == '__main__':
         loop="none",
         reload=False,
         log_level="warning",
+        timeout_graceful_shutdown=5,
     )

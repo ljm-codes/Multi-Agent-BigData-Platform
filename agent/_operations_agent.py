@@ -21,7 +21,8 @@ from SPO.operations_agent_state_model import (OperationsAndReconcileMainState,
                                               OperationsAndReconcileOutputState, ErrorInfo,
                                               OperationsAndReconcileContext)
 from SPO.postgresql_model import CheckLog, app_lease
-from Tools import OM as OM_AGENT, LogSetting
+from Tools.operations_agent_tools import AGENT_NAME as OM_AGENT
+from Tools.log_settings import LogSetting
 from Tools.alarm_sender import send_warning_msg
 from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.registry import get_tools, get_priority_tools

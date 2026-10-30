@@ -6,9 +6,21 @@ const props = defineProps({
   interrupt: { type: Object, required: true },
 })
 
-const emit = defineEmits(['submit'])
+const emit = defineEmits(['submit', 'open-ide'])
 
 const reason = ref('')
+
+function onClickBody(event) {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const link = target.closest('a')
+  if (!link) return
+  const href = link.getAttribute('href') || ''
+  if (!href.toLowerCase().startsWith('ide://')) return
+  event.preventDefault()
+  event.stopPropagation()
+  emit('open-ide', href)
+}
 
 const isManual = computed(() => props.interrupt.kind === 'manual')
 const html = computed(() => renderMarkdownLite(props.interrupt.text || ''))
@@ -45,7 +57,7 @@ function manualSubmit() {
       </span>
     </div>
 
-    <div class="body md" v-html="html"></div>
+    <div class="body md" v-html="html" @click="onClickBody"></div>
 
     <div v-if="isManual" class="reason">
       <label for="interrupt-reason">拒绝原因（选择“拒绝”时必填）</label>
@@ -100,13 +112,18 @@ function manualSubmit() {
   background: var(--bg);
   border-radius: 8px;
 }
-.body :deep(pre.code) {
+.body :deep(pre) {
   margin: 8px 0;
   padding: 10px;
   overflow-x: auto;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+.body :deep(pre code) {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
 }
 .body :deep(code) {
   padding: 1px 4px;
@@ -121,10 +138,45 @@ function manualSubmit() {
 .body :deep(p) {
   margin: 0 0 8px;
 }
+.body :deep(h1),
+.body :deep(h2),
 .body :deep(h3),
-.body :deep(h4) {
+.body :deep(h4),
+.body :deep(h5),
+.body :deep(h6) {
   margin: 10px 0 6px;
   font-size: 13px;
+}
+.body :deep(.md-table-wrap) {
+  margin: 8px 0;
+  overflow-x: auto;
+}
+.body :deep(table) {
+  width: 100%;
+  font-size: 12px;
+  border-collapse: collapse;
+}
+.body :deep(table th),
+.body :deep(table td) {
+  padding: 5px 8px;
+  text-align: left;
+  border: 1px solid var(--border);
+}
+.body :deep(pre.mermaid) {
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+.body :deep(pre.mermaid-error) {
+  padding: 10px;
+  white-space: pre-wrap;
+  background: var(--bg-elevated);
+  border: 1px solid var(--danger);
+}
+.body :deep(pre.mermaid svg),
+.body :deep(pre.mermaid + svg) {
+  max-width: 100%;
+  height: auto;
 }
 .reason {
   margin-top: 10px;

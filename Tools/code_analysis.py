@@ -2,21 +2,21 @@
 专门的代码解析工具，只支持 python java 代码
 """
 import ast
-import logging
+# import logging
 import os
 import re
 import sys
 from typing import Literal, cast, Optional
 
-# from Tools import LogSetting
+from Tools.log_settings import LogSetting
 
 FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 SCOPE_NODES = FUNC_NODES + (ast.ClassDef,)
 
-# logger = LogSetting.create(__name__)
+logger = LogSetting.create(__name__)
 
 
-logger = logging.getLogger(__name__)  # 临时测试用，避免出现 需要其他配置的问题
+# logger = logging.getLogger(__name__)  # 临时测试用，避免出现 需要其他配置的问题
 
 
 class VarCollector(ast.NodeVisitor):

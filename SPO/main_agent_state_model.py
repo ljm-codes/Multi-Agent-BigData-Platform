@@ -27,6 +27,40 @@ class TaskOutcome:
     error: str | None = None
 
 
+def content_text(content: Any) -> str:
+    """把消息 content 归一化成字符串：兼容 str 和 content-block list。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") in (None, "text"):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def agent_label(from_: str | None) -> str:
+    """把链路里的 from_ 归一成 UI 上展示的 Agent 名。"""
+    if not from_:
+        return "dis_chat"
+    if from_ in {"code_verify", "verify_agent"} or from_.startswith("ver_"):
+        return "code_verify"
+    if from_ in {"data_analysis", "data_analysis_agent"}:
+        return "data_analysis"
+    if from_ in {"data_develop", "data_develop_agent"}:
+        return "data_develop"
+    if from_ in {"dis_chat", "work_end", "handler", "distribute_task_to_agent"}:
+        return "dis_chat"
+    return from_
+
+
 # 大数据开发Agent的状态模型
 class DevelopAgentInputState(TypedDict):
     input_msg: str

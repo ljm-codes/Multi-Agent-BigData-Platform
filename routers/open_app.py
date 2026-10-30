@@ -8,7 +8,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from SPO.route_results import RouteResponse
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 
 route = APIRouter()
 logger = LogSetting.create(__name__)
@@ -65,11 +65,27 @@ def _scan_windows_registry():
 
 
 def _scan_windows_notepad():
-    """通过 shutil 查找记事本路径"""
+    """优先用系统自带 notepad.exe；shutil.which 会命中 Git 的 usr/bin/notepad 脚本。"""
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    native = Path(system_root) / "System32" / "notepad.exe"
+    if native.is_file():
+        return {"notepad": {"path": str(native), "display": "Notepad"}}
     notepad_path = shutil.which("notepad")
     if notepad_path:
         return {"notepad": {"path": notepad_path, "display": "notepad"}}
     return {}
+
+
+def _resolve_jetbrains_launcher(path: str) -> str:
+    """JetBrains 在 PATH 上一般是 pycharm.bat/idea.bat；优先用同目录的 64 位 exe。"""
+    p = Path(path)
+    if p.suffix.lower() not in {".bat", ".cmd"}:
+        return path
+    stem = p.stem
+    for candidate in (p.with_name(f"{stem}64.exe"), p.with_suffix(".exe")):
+        if candidate.is_file():
+            return str(candidate)
+    return path
 
 
 def _scan_macos_apps():
@@ -163,12 +179,17 @@ def detect_ides():
     for exe, info in IDE_CANDIDATES.items():
         path = shutil.which(exe)
         if path:
+            if exe in JETBRAINS_IDES:
+                path = _resolve_jetbrains_launcher(path)
             found[exe] = {"path": path, "display": info["display"]}
 
     # 2. Windows：补充查询注册表 App Paths
     if system == "Windows":
         found.update(_scan_windows_notepad())
         found.update(_scan_windows_registry())
+        for exe, info in found.items():
+            if exe in JETBRAINS_IDES:
+                info["path"] = _resolve_jetbrains_launcher(info["path"])
 
     # 3. macOS：扫描 .app 包
     elif system == "Darwin":
@@ -196,6 +217,8 @@ async def get_ides() -> RouteResponse:
 def _build_argv(ide_name: str, ide_path: str, file_path: str, line: int):
     """返回 argv 列表；返回 None 表示需要走特殊逻辑（TextEdit / 兜底）。"""
     if ide_name in JETBRAINS_IDES:
+        # .bat 启动器在带空格的路径上会被 cmd 拆错，直接换成同目录的 64 位 exe
+        ide_path = _resolve_jetbrains_launcher(ide_path)
         return [ide_path, "--line", str(line), file_path]
     if ide_name in VSCODE_LIKE:
         return [ide_path, "--goto", f"{file_path}:{line}"]
@@ -218,9 +241,15 @@ def _popen_detached(argv):
     kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if platform.system() == "Windows":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        if Path(argv[0]).suffix.lower() in (".bat", ".cmd"):
+            # cmd /c 直接接带空格的 bat 路径会被拆开；拼成一条命令再交给 cmd
+            command = subprocess.list2cmdline([argv[0], *argv[1:]])
+            argv = [os.environ.get("COMSPEC", "cmd.exe"), "/c", command]
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen(argv, **kwargs)
+    logger.info(f"启动编辑器：{argv}")
+    proc = subprocess.Popen(argv, **kwargs)
+    logger.info(f"编辑器进程已启动：pid={proc.pid}")
 
 
 def _open_with_default(file_path: str):
@@ -237,7 +266,12 @@ def _open_with_default(file_path: str):
 async def open_file(file_info: OpenFileInfo) -> RouteResponse:
     try:
         file_path = str(Path(file_info.file_path).expanduser().resolve())
+        logger.info(
+            f"打开文件请求：raw={file_info.file_path!r}, resolved={file_path!r}, "
+            f"ide={file_info.ide_name!r}"
+        )
         if not os.path.exists(file_path):
+            logger.warning(f"文件不存在：{file_path}")
             return RouteResponse.error(msg=f"文件不存在：{file_path}")
 
         ide_name = (file_info.ide_name or "code").lower()
@@ -246,6 +280,7 @@ async def open_file(file_info: OpenFileInfo) -> RouteResponse:
         if not ide_path:
             ides = detect_ides()
             if ide_name not in ides:
+                logger.warning(f"未找到 IDE：{ide_name}，已检测到：{list(ides)}")
                 return RouteResponse.error(
                     msg=f"未找到 IDE：{ide_name}，请显式传入 ide_path"
                 )
@@ -262,6 +297,7 @@ async def open_file(file_info: OpenFileInfo) -> RouteResponse:
             })
 
         # 构造命令
+        logger.info(f"打开文件：ide={ide_name}, path={file_path}, line={line}")
         argv = _build_argv(ide_name, ide_path, file_path, line)
 
         if argv is None:

@@ -1,3 +1,4 @@
+import threading
 from typing import List, Dict, Optional, Any
 
 import redis
@@ -56,7 +57,44 @@ redis_pool = redis.ConnectionPool(
 )
 redis_con = redis.Redis(connection_pool=redis_pool)
 
-rm = ResourceManager(service_endpoints=[manager])
+
+# 集群开关：false 时完全不初始化 YARN ResourceManager（import 阶段也不连集群）
+_connect_to_cluster = bool(((_app_config or {}).get("app") or {}).get("connect_to_cluster", True))
+
+
+class _LazyResourceManager:
+    """YARN ResourceManager 客户端惰性单例：
+    import 阶段不连接集群；首次真正使用时才初始化。
+    集群不可达或开关为 false 时不抛全局异常（多数调用方自带 try/except 兜底），
+    只记录日志并标记为不可用，后续调用返回 None/空结构。"""
+    def __init__(self, manager_url: str):
+        self._manager_url = manager_url
+        self._inst = None
+        self._failed = not _connect_to_cluster
+        self._lock = threading.Lock()
+
+    def _get(self):
+        if self._failed:
+            return None
+        if self._inst is None:
+            with self._lock:
+                if self._inst is None and not self._failed:
+                    try:
+                        self._inst = ResourceManager(service_endpoints=[self._manager_url])
+                    except Exception as e:  # 集群不可达 / 未启动
+                        self._failed = True
+                        logger.error(f"初始化 YARN ResourceManager 失败(集群未启动或不可达): {e}")
+        return self._inst
+
+    def __getattr__(self, name):
+        inst = self._get()
+        if inst is None:
+            raise RuntimeError("当前未连接集群(app.connect_to_cluster=false 或集群不可达)，"
+                               "YARN 客户端不可用，请调用方兜底处理")
+        return getattr(inst, name)
+
+
+rm = _LazyResourceManager(manager)
 
 
 def get_all_running_apps() -> List[Dict]:

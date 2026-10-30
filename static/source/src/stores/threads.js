@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import * as threadsApi from '@/api/threads'
 import { loadTitles, removeTitle, saveTitle, shortId, titleFromText } from '@/utils/text'
 
+// 老版本把置顶存在本地；现在后端 admin_thread.is_top 才是准的，这里只当兜底
 const PIN_KEY = 'thread_pins'
 
 function loadPins() {
@@ -21,21 +22,24 @@ export const useThreadStore = defineStore('threads', {
     error: '',
   }),
   getters: {
-    titleOf: (state) => (threadId) => {
-      // 后端 thread_name 最准（新建时取首条消息前 10 字）
-      const record = [...state.lists.active, ...state.lists.archived]
-        .find((item) => item.thread_id === threadId)
-      return record?.thread_name || state.titles[threadId] || `会话 ${shortId(threadId)}`
+    recordOf: (state) => (threadId) =>
+      [...state.lists.active, ...state.lists.archived]
+        .find((item) => item.thread_id === threadId),
+    titleOf() {
+      return (threadId) =>
+        this.recordOf(threadId)?.thread_name || this.titles[threadId] || `会话 ${shortId(threadId)}`
     },
-    isPinned: (state) => (threadId) => state.pins.includes(threadId),
-    recordsOf: (state) => (tab) => {
-      const list = state.lists[tab] || []
-      // 置顶的排前面，其余按后端返回顺序（create_time desc，最新在前）
-      return [...list].sort((a, b) => {
-        const pa = state.pins.includes(a.thread_id) ? 0 : 1
-        const pb = state.pins.includes(b.thread_id) ? 0 : 1
-        return pa - pb
-      })
+    isPinned() {
+      return (threadId) => {
+        const record = this.recordOf(threadId)
+        return Boolean(record?.is_top ?? this.pins.includes(threadId))
+      }
+    },
+    recordsOf() {
+      return (tab) =>
+        [...(this.lists[tab] || [])]
+          // 置顶在前；sort 是稳定的，同组保持后端返回顺序（create_time desc）
+          .sort((a, b) => Number(b.is_top || 0) - Number(a.is_top || 0))
     },
   },
   actions: {
@@ -54,23 +58,25 @@ export const useThreadStore = defineStore('threads', {
     async loadAll() {
       await Promise.all([this.load('active'), this.load('archived')])
     },
+    /** 本地兜底标题：新建会话到列表刷新之间先用它顶着 */
     setTitle(threadId, text) {
       if (!threadId || !text) return
       const title = titleFromText(text)
       this.titles[threadId] = title
       saveTitle(threadId, title)
     },
-    rename(threadId, title) {
-      const clean = String(title || '').trim()
+    async rename(threadId, title) {
+      const clean = String(title || '').trim().slice(0, 10)
       if (!clean) return
+      await threadsApi.renameThread(threadId, clean)
       this.titles[threadId] = clean
       saveTitle(threadId, clean)
+      await this.loadAll()
     },
-    togglePin(threadId) {
-      const index = this.pins.indexOf(threadId)
-      if (index >= 0) this.pins.splice(index, 1)
-      else this.pins.push(threadId)
-      localStorage.setItem(PIN_KEY, JSON.stringify(this.pins))
+    async togglePin(threadId) {
+      const next = !this.isPinned(threadId)
+      await threadsApi.topThread(threadId, next, this.titleOf(threadId))
+      await this.loadAll()
     },
     async archive(threadId) {
       await threadsApi.archiveThread(threadId)

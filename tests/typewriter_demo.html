@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>打字机参数实验</title>
+<style>
+  :root {
+    --bg: #1e1f22;
+    --panel: #2b2d30;
+    --border: #3a3d41;
+    --text: #e6e6e6;
+    --muted: #9aa0a6;
+    --primary: #4f8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px;
+    font-family: system-ui, "Microsoft YaHei", sans-serif;
+    background: #111214;
+    color: var(--text);
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { margin: 0 0 6px; font-size: 18px; }
+  .tip { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+  .panel {
+    display: grid;
+    gap: 10px;
+    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  label { min-width: 150px; font-size: 13px; color: var(--muted); }
+  input[type="range"] { width: 220px; }
+  select {
+    padding: 6px 10px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  button {
+    padding: 7px 14px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button.primary { color: #fff; background: var(--primary); border-color: var(--primary); }
+  .chat {
+    min-height: 220px;
+    margin-top: 16px;
+    padding: 18px;
+    background: #17181a;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  .bubble {
+    max-width: 760px;
+    padding: 12px 14px;
+    line-height: 1.75;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #232529;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  .pending { color: var(--muted); font-size: 12px; }
+  .caret {
+    display: inline-block;
+    width: 6px;
+    height: 14px;
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    background: var(--primary);
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
+  .log {
+    max-height: 200px;
+    margin-top: 12px;
+    padding: 10px;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    background: #141518;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>打字机参数实验</h1>
+  <p class="tip">
+    独立页面，不依赖项目。先试 <b>客户端打字机</b>；如果它能明显逐字、而 <b>模拟后端 SSE 分帧</b> 怎么调都像一次性出现，
+    说明问题不是参数，而是 SSE 帧到达后被浏览器/代理合批了。<br>
+    “整段一次性到达”用来模拟合批后的效果，方便对比。
+  </p>
+
+  <div class="panel">
+    <div class="row">
+      <label for="mode">模式</label>
+      <select id="mode">
+        <option value="sse">模拟后端 SSE 分帧（chunk + delay）</option>
+        <option value="burst">整段一次性到达（模拟网络合批）</option>
+        <option value="client" selected>客户端打字机（整段到达后本地逐字）</option>
+      </select>
+    </div>
+    <div class="row">
+      <label for="think">思考等待 ms</label>
+      <input id="think" type="range" min="0" max="8000" step="100" value="1500">
+      <span id="thinkVal">1500</span>
+    </div>
+    <div class="row">
+      <label for="chunk">每帧字数</label>
+      <input id="chunk" type="range" min="1" max="24" value="6">
+      <span id="chunkVal">6</span>
+    </div>
+    <div class="row">
+      <label for="delay">帧间隔 ms</label>
+      <input id="delay" type="range" min="5" max="150" value="30">
+      <span id="delayVal">30</span>
+    </div>
+    <div class="row">
+      <label for="perTick">客户端每次加字数</label>
+      <input id="perTick" type="range" min="1" max="8" value="2">
+      <span id="perTickVal">2</span>
+    </div>
+    <div class="row">
+      <label for="tick">客户端 tick ms</label>
+      <input id="tick" type="range" min="10" max="120" value="30">
+      <span id="tickVal">30</span>
+    </div>
+    <div class="row">
+      <button class="primary" id="start">开始</button>
+      <button id="stop">停止 / 清空</button>
+    </div>
+  </div>
+
+  <div class="chat">
+    <div class="bubble">
+      <span id="text"></span><span id="caret" class="caret" hidden></span><span id="pending" class="pending">正在生成…</span>
+    </div>
+  </div>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+  const SAMPLE = `你好！我是大数据多智能体平台的调度者。我不直接写代码，而是把你的需求拆解后派给合适的下游开发 Agent：
+1. data_develop 只做 Java + Flink：Flink 应用开发、改代码、修编译/逻辑问题、Flink 提交信息登记。
+2. data_analysis 只做 Python + Spark：取数、统计、报表、数据探索、ETL/数据处理、Spark 提交信息登记。
+你可以直接把需求告诉我要做什么，比如“用 Flink 写个从 Kafka 读数据写进 Hive 的作业”或“用 Spark 统计某张表近 7 天各渠道下单量”。如果需求里缺关键信息，我会先跟你确认再派活。`
+
+  const $ = (id) => document.getElementById(id)
+  const textEl = $('text')
+  const caretEl = $('caret')
+  const pendingEl = $('pending')
+  const logEl = $('log')
+  let runId = 0
+  let timer = null
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  function bindRange(id) {
+    const input = $(id)
+    const label = $(`${id}Val`)
+    const sync = () => { label.textContent = input.value }
+    input.addEventListener('input', sync)
+    sync()
+    return () => Number(input.value)
+  }
+
+  const getThink = bindRange('think')
+  const getChunk = bindRange('chunk')
+  const getDelay = bindRange('delay')
+  const getPerTick = bindRange('perTick')
+  const getTick = bindRange('tick')
+
+  function log(line) {
+    const now = performance.now().toFixed(0)
+    logEl.textContent += `[${now}ms] ${line}\n`
+    logEl.scrollTop = logEl.scrollHeight
+  }
+
+  function resetView() {
+    runId += 1
+    if (timer) clearInterval(timer)
+    timer = null
+    textEl.textContent = ''
+    caretEl.hidden = true
+    pendingEl.hidden = false
+    pendingEl.textContent = '正在生成…'
+    logEl.textContent = ''
+  }
+
+  async function runSse(id) {
+    const chunk = getChunk()
+    const delay = getDelay()
+    await sleep(getThink())
+    if (id !== runId) return
+    pendingEl.hidden = true
+    caretEl.hidden = false
+    log(`SSE 模式：chunkSize=${chunk}, delay=${delay}ms`)
+    for (let i = 0; i < SAMPLE.length; i += chunk) {
+      if (id !== runId) return
+      textEl.textContent += SAMPLE.slice(i, i + chunk)
+      log(`append ${Math.min(chunk, SAMPLE.length - i)} chars -> total ${textEl.textContent.length}`)
+      await sleep(delay)
+    }
+    caretEl.hidden = true
+    log('done')
+  }
+
+  async function runBurst(id) {
+    await sleep(getThink())
+    if (id !== runId) return
+    pendingEl.hidden = true
+    textEl.textContent = SAMPLE
+    log(`整段到达：${SAMPLE.length} chars（一次性）`)
+  }
+
+  async function runClient(id) {
+    const perTick = getPerTick()
+    const tick = getTick()
+    await sleep(getThink())
+    if (id !== runId) return
+    pendingEl.hidden = true
+    caretEl.hidden = false
+    log(`客户端打字机：${perTick} chars / ${tick}ms（整段先到达）`)
+    let i = 0
+    timer = setInterval(() => {
+      if (id !== runId) {
+        clearInterval(timer)
+        return
+      }
+      i = Math.min(SAMPLE.length, i + perTick)
+      textEl.textContent = SAMPLE.slice(0, i)
+      log(`本地 reveal -> ${i}/${SAMPLE.length}`)
+      if (i >= SAMPLE.length) {
+        clearInterval(timer)
+        timer = null
+        caretEl.hidden = true
+        log('done')
+      }
+    }, tick)
+  }
+
+  $('start').addEventListener('click', () => {
+    resetView()
+    const id = runId
+    const mode = $('mode').value
+    if (mode === 'sse') runSse(id)
+    else if (mode === 'burst') runBurst(id)
+    else runClient(id)
+  })
+
+  $('stop').addEventListener('click', () => {
+    resetView()
+    pendingEl.textContent = '已停止'
+    log('stopped')
+  })
+</script>
+</body>
+</html>

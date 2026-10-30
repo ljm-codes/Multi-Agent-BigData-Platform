@@ -19,7 +19,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
 
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.code_analysis import PyAnalyzer, find_definition, find_module_path
 from Tools.registry import register_tool
 from Tools.share_check_tool import redis_con

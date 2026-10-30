@@ -50,7 +50,7 @@
 ## code_summary（goto="user" 时）
 
 - `data_result`：数据验证结果，轻量、突出异常值；
-- `mermaid_flowgraph`：数据/控制流的 Mermaid 文本；
+- `mermaid_flowgraph`：数据/控制流的 Mermaid 文本。第一行必须是 `graph TD` 或 `flowchart TD`；一行只写一个节点/一条边，不要把多条语句拼在同一行；节点标签含空格、括号、加号等字符时用双引号包起来，例如 `A["transformDataFrame S + lit(P)"]`；不要输出 ```mermaid 围栏。
 - `snippets`：按优先级排序的代码片段，填写 `file_path`、`start_line`、`end_line`、`priority`、`note`。
 
 人工靠这份摘要判断是否继续深层测试，所以要给出可核对的证据，不要只写“看起来没问题”。

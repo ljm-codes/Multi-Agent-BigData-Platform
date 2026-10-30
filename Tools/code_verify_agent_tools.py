@@ -9,7 +9,7 @@ from typing import Literal
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.code_analysis import JavaAnalyzer, PyAnalyzer
 from Tools.registry import register_tool
 from Tools.run_command import run_mvn_command, run_java_command

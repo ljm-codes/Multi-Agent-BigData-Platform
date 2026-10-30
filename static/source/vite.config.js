@@ -18,7 +18,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/ai': backend,
+      // ws: true 是给 /ai/ws/background 用的，否则 dev 下 WebSocket 连不上
+      '/ai': { target: backend, changeOrigin: true, ws: true },
       '/auth/admin': backend,
       '/open/app': backend,
     },

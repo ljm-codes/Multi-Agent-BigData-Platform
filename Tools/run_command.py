@@ -4,7 +4,7 @@ import signal
 import subprocess
 from typing import Any
 
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from load_config.config import ROOT_BASE_DIR_PATH
 
 logger = LogSetting.create(__name__)

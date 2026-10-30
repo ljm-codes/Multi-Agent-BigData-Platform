@@ -28,7 +28,7 @@ from SPO.main_agent_state_model import MainStateContext
 from SPO.postgresql_model import AdminInfo
 from Tasks.background_handler import start_perceptron
 from Tasks.jwt_key_manage import KeyManage
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.db import SessionLocal
 from Tools.share_check_tool import redis_con
 from agent.develop_main_agent import builder
@@ -48,6 +48,9 @@ logger = LogSetting.create(__name__)
 token_prefix = "Bearer token "
 whitelist = {"/auth/admin/recommend/register", "/auth/admin/login", "/open/app/get_ides", "/",
              "/favicon.ico"}
+# 只保护这三组接口；其余路径（静态资源、/admin 这种 SPA 路由）一律放行 ——
+# 浏览器直接访问页面时不会带 Authorization 头，拦了就打不开
+_PROTECTED_PREFIXES = ("/ai/", "/auth/admin/", "/open/app/")
 
 if not os.path.isdir(ROOT_BASE_DIR_PATH / 'cache'):
     os.makedirs(ROOT_BASE_DIR_PATH / 'cache')
@@ -225,7 +228,7 @@ def start_app():
         """
         url = request.url.path
         # 匹配前端静态资源
-        if url in whitelist or url.startswith("/assets/"):
+        if url in whitelist or not url.startswith(_PROTECTED_PREFIXES):
             return await call_next(request)
         authorization = request.headers.get("Authorization")
         if not authorization:
@@ -255,9 +258,6 @@ def start_app():
         expose_headers=["replace_jwt"],
     )
     app.state = State()
-    # WebSocket 不走 HTTP 中间件，把校验函数和前缀挂到 state 上供它复用
-    app.state.verify_token = _verify_authorization_header
-    app.state.auth_prefix = token_prefix
     app.include_router(ai_chat_route, prefix="/ai", tags=["Agent对话聊天等操作"])
     app.include_router(login_route, prefix="/auth/admin", tags=["账号管理"])
     app.include_router(open_app_route, prefix="/open/app", tags=["打开应用操作"])

@@ -1,15 +1,34 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { renderMarkdownLite } from '@/utils/text'
+import { renderMermaid } from '@/utils/mermaid'
+import InterruptPanel from '@/components/InterruptPanel.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
   readOnly: { type: Boolean, default: false },
+  interrupt: { type: Object, default: null },
+  elapsed: { type: Number, default: 0 },
 })
 
-const emit = defineEmits(['open-ide'])
+const emit = defineEmits(['open-ide', 'submit'])
 const root = ref(null)
 const hovered = ref(null)
+
+const hasStreaming = computed(() => props.messages.some((m) => m.streaming))
+
+/** 流式期间先显示 mermaid 源码，等所有消息都结束后一次渲染，避免反复重建 SVG */
+async function drawMermaid() {
+  if (hasStreaming.value) return
+  await nextTick()
+  await renderMermaid(root.value)
+}
+
+onMounted(drawMermaid)
+// 只在“流式从 true 变 false”或消息数组被整体替换（换会话/加载历史）时重绘
+watch(hasStreaming, (streaming) => { if (!streaming) drawMermaid() })
+watch(() => props.messages, drawMermaid)
+watch(() => props.interrupt, drawMermaid, { deep: true })
 
 const guides = computed(() =>
   props.messages
@@ -42,10 +61,12 @@ defineExpose({ scrollToBottom, jumpTo })
 function onClick(event) {
   const target = event.target
   if (!(target instanceof Element)) return
-  const link = target.closest('a[href^="IDE://"]')
+  const link = target.closest('a')
   if (!link) return
+  const href = link.getAttribute('href') || ''
+  if (!href.toLowerCase().startsWith('ide://')) return
   event.preventDefault()
-  emit('open-ide', link.getAttribute('href'))
+  emit('open-ide', href)
 }
 
 function assistantHtml(message) {
@@ -67,19 +88,25 @@ function preview(text, size = 10) {
 
       <div
         v-for="(message, index) in messages"
-        :key="index"
+        :key="message.id || index"
         :data-index="index"
         class="row"
         :class="message.role"
       >
         <div v-if="message.role === 'assistant'" class="stack">
+          <span v-if="message.agent" class="agent-name">{{ message.agent }}</span>
           <div
             v-if="message.content || message.streaming"
             class="bubble"
             :class="{ streaming: message.streaming, error: message.error }"
           >
-            <div class="md" v-html="assistantHtml(message)"></div>
-            <span v-if="message.streaming" class="caret"></span>
+            <div v-if="message.content" class="md" v-html="assistantHtml(message)"></div>
+            <span v-else class="pending-hint" title="Agent 工具执行期间可能较久">
+              正在生成…
+              <span v-if="elapsed" class="pending-elapsed">{{ elapsed }}s</span>
+            </span>
+            <span v-if="message.status" class="tool-status">{{ message.status }}</span>
+            <span v-if="message.streaming && message.content" class="caret"></span>
           </div>
 
           <details v-if="message.tools && message.tools.length" class="tools">
@@ -92,6 +119,13 @@ function preview(text, size = 10) {
           {{ message.content }}
         </div>
       </div>
+
+      <InterruptPanel
+        v-if="interrupt"
+        :interrupt="interrupt"
+        @submit="emit('submit', $event)"
+        @open-ide="emit('open-ide', $event)"
+      />
     </div>
 
     <div v-if="guides.length" class="rail">
@@ -166,6 +200,13 @@ function preview(text, size = 10) {
 .stack .bubble {
   max-width: none;
 }
+.agent-name {
+  padding: 0 2px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
 
 .tools {
   background: var(--bg);
@@ -197,6 +238,20 @@ function preview(text, size = 10) {
 .bubble.streaming {
   opacity: 0.92;
 }
+.pending-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.pending-elapsed {
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.tool-status {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
 .caret {
   display: inline-block;
   width: 6px;
@@ -217,13 +272,18 @@ function preview(text, size = 10) {
 .md :deep(p:last-child) {
   margin-bottom: 0;
 }
-.md :deep(pre.code) {
+.md :deep(pre) {
   margin: 8px 0;
   padding: 10px 12px;
   overflow-x: auto;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+.md :deep(pre code) {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
 }
 .md :deep(code) {
   padding: 1px 4px;
@@ -235,8 +295,12 @@ function preview(text, size = 10) {
 .md :deep(a) {
   color: var(--primary);
 }
+.md :deep(h1),
+.md :deep(h2),
 .md :deep(h3),
-.md :deep(h4) {
+.md :deep(h4),
+.md :deep(h5),
+.md :deep(h6) {
   margin: 10px 0 6px;
   font-size: 14px;
 }
@@ -245,6 +309,51 @@ function preview(text, size = 10) {
   padding-left: 10px;
   color: var(--text-muted);
   border-left: 2px solid var(--border);
+}
+.md :deep(.md-table-wrap) {
+  margin: 8px 0;
+  overflow-x: auto;
+}
+.md :deep(table) {
+  width: 100%;
+  font-size: 12.5px;
+  border-collapse: collapse;
+}
+.md :deep(table th),
+.md :deep(table td) {
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: pre-wrap;
+  border: 1px solid var(--border);
+}
+.md :deep(table th) {
+  font-weight: 600;
+  background: var(--bg);
+}
+.md :deep(pre.mermaid) {
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+.md :deep(pre.mermaid-error) {
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  background: var(--bg);
+  border: 1px solid var(--danger);
+}
+.md :deep(pre.mermaid svg),
+.md :deep(pre.mermaid + svg) {
+  max-width: 100%;
+  height: auto;
+}
+.md :deep(ul),
+.md :deep(ol) {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+.md :deep(li) {
+  margin: 2px 0;
 }
 .empty-hint {
   margin: auto;

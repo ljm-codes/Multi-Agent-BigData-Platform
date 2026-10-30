@@ -70,6 +70,24 @@ YARN 运行中的应用
 - **两层测试**：浅层验证业务结果，深层验证抗造；深层超时用 `TaskSupervisor` 移交后台，完成后由感知层把结果送回原会话。
 - **旁挂部署**：平台不装在大数据节点上，所有集群操作都走 REST / SSH / WebHDFS。
 
+### 前端对话体验
+
+- **Markdown / Mermaid**：`markdown-it` 负责解析，原始 HTML 关闭；Mermaid 代码块由 Mermaid 懒加载渲染。
+  Mermaid 只在消息流式结束后渲染，避免每个 token 重建 SVG；人工确认面板里的“流程图”同样生效。
+  模型常见的 Mermaid 写法问题（标签里括号没加引号、多条语句挤一行）会在前端做一次保守修复，修不好则保留源码并标红。
+- **打字机**：后端只负责把 Agent token / 最终 `output_msg` 作为数据送达；前端用队列按固定节拍逐字显示，
+  不依赖 SSE 的到达节奏。相关参数在 `static/source/src/views/ChatView.vue` 的
+  `TYPE_CHARS_PER_TICK` / `TYPE_TICK_MS`；纯逐字可改成 `1 / 20`。
+- **长任务状态**：等待模型或工具执行时，气泡会显示 `正在生成… Ns`；分析/开发 Agent 发出工具调用时显示
+  `正在调用工具：xxx`，避免看起来像卡死。
+- **会话历史**：root `messages` 就是用户可见的对话记录；分析和开发 Agent 的最终输出、`work_end` 的最终回复都会写回
+  `messages`。`/ai/history` 同时返回 `interrupt`，刷新后能恢复当前 pending 的人工确认面板。
+  旧会话在本次修复前没有把助手正文写进 `messages`，只能保留最后一条 `output_msg` 兜底，不做回填。
+- **刷新保持会话**：当前 `thread_id` 存在浏览器 `localStorage` 的 `last_thread_id`，刷新会自动回到上次打开的会话。
+- **IDE 打开**：`open_app` 优先使用 JetBrains 的 `*64.exe`（避免 `.BAT` 在带空格路径下被 cmd 拆坏），
+  Windows 记事本优先 `System32\notepad.exe`；代码片段链接使用绝对路径并做 URL 编码。
+- **调试**：`tests/typewriter_demo.html` 是独立的打字机参数实验页，可手工对比“后端分帧”和“前端逐字”的效果。
+
 ## 技术栈
 
 | 层     | 选型                                                           |
@@ -79,7 +97,7 @@ YARN 运行中的应用
 | 模型    | DeepSeek（`deepseek-flash`），支持 thinking 模式                    |
 | 数据    | PostgreSQL（会话状态 + 业务表）、Redis（JWT 密钥、运维队列）                    |
 | 集群    | YARN REST、Flink REST、HDFS WebHDFS、节点侧 SSH                    |
-| 前端    | Vue 3 + Vite 6 + Pinia + vue-router                          |
+| 前端    | Vue 3 + Vite 6 + Pinia + vue-router + markdown-it + Mermaid  |
 | 其他    | SQLAlchemy 2.0、APScheduler、bcrypt、PyJWT、MCP（Maven 依赖查询）      |
 
 Python 3.12，Node 18+。
@@ -203,17 +221,21 @@ python scripts/mock_backend.py   # 假后端，127.0.0.1:8010
 | GET      | `/open/app/get_ides`             | 探测本机 IDE                        |
 | POST     | `/open/app/open_file`            | 用 IDE 打开文件 / 项目目录               |
 
-SSE 事件：`meta`、`update`、`token`、`interrupt`、`thread_switch`、`done`、`error`。
+SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_switch`、`done`、`error`。
+`/ai/history` 返回 `messages`、`output_msg`、`interrupted`、`interrupt`、`metadata` 与 `project_dir`。
 
 ## 项目的不足
 
-1. 仍是 Demo，缺少 `requirements.txt` / 依赖锁文件。
+1. 仍是 Demo，Python 侧缺少 `requirements.txt`；前端已有 `pnpm-lock.yaml`。
 2. **运维链路还没接入 HTTP 层**，只有后台进程，前端暂时看不到巡检结果。
 3. 运维取队列用的是 `ZPOPMIN`，需要 Redis ≥ 5.0；低于这个版本的异常会被吞掉，表现为「队列永远是空的」。
 4. 运维 Agent 只能通过 SSH 拉代码，且相同代码每次都要重新做 AST 解析。
 5. MCP 目前只用于 Maven 依赖查询，还没做通用 MCP / Skill 接入。
 6. LangGraph 的 `store` 与 `cache` 已编译进图，但还没有节点声明 `cache_policy`，实际未启用。
 7. 会话标题取首条用户消息前 10 字，重命名和置顶只存在浏览器本地。
+8. 旧会话在历史修复前没有把助手正文写进 `messages`，刷新后只能显示最后一条 `output_msg`，无法回填。
+9. Mermaid 语法仍由模型生成，前端只做常见写法修复；复杂/非法图仍可能显示源码和错误。
+10. 并行产生多个 pending interrupt 时，`/ai/resume` 仍按单个 answer 恢复，暂未处理多 interrupt 选择。
 
 ## 项目的未来方向
 

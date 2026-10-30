@@ -1,25 +1,31 @@
 import asyncio
+import base64
 import json
+import os
+import secrets
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
+import jwt
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, false, true, delete, update, func
 from sqlalchemy.dialects.postgresql import insert
-from starlette.concurrency import run_in_threadpool
 
-from SPO.main_agent_state_model import MainStateContext
+from SPO.main_agent_state_model import MainStateContext, content_text
 from SPO.postgresql_model import AdminThread
 from SPO.route_results import RouteResponse, ResultCode
 from Tasks.background_broker import background_broker, background_registry
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.db import AsyncSessionLocal
+from Tools.share_check_tool import redis_con
+from Tools.ws_registry import register_ws, unregister_ws
 from load_config.config import ROOT_BASE_DIR_PATH
 
 route = APIRouter()
@@ -30,6 +36,12 @@ class ChatRequest(BaseModel):
     user_id: str = Field(default="default", description="用户 id")
     message: str = Field(min_length=1, description="用户原话")
     thread_id: str | None = Field(default=None, description="会话 id；不传则新建")
+
+
+class ThreadRequest(BaseModel):
+    thread_id: str = Field(description="会话 id")
+    thread_name: str = Field(description="新会话名称")
+    is_top: bool = Field(default=False, description="是否置顶")
 
 
 class ResumeRequest(BaseModel):
@@ -123,14 +135,16 @@ def _project_dir(metadata: dict) -> str | None:
 
 def _response(result: dict, thread_id: str, **extra: Any) -> RouteResponse:
     metadata = result.get("metadata") or {}
+    interrupted = _is_interrupted(result)
     fields: dict[str, Any] = {
         "thread_id": thread_id,
-        "output_msg": result.get("output_msg", ""),
+        # 停在 interrupt 时 output_msg 还是上一轮的标量值，不能回给前端
+        "output_msg": "" if interrupted else result.get("output_msg", ""),
         "out_time": result.get("out_time"),
         "metadata": metadata,
         "thread_action": metadata.get("thread_action", "continue"),
         "thread_title": metadata.get("thread_title"),
-        "interrupted": _is_interrupted(result),
+        "interrupted": interrupted,
         "interrupt": jsonable_encoder(result.get("__interrupt__")),
         "project_dir": _project_dir(metadata),
     }
@@ -166,7 +180,7 @@ def _done_payload(
 
 
 async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: Any, ctx: dict):
-    """一次流式图运行（event streaming v3）；负责该 thread 的 occupancy 释放"""
+    """一次流式图运行（astream messages）；负责该 thread 的 occupancy 释放"""
     async with _lock_for(thread_id):
         try:
             await _wait_until_idle(thread_id)
@@ -174,34 +188,66 @@ async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: A
             yield "error", {"thread_id": thread_id, "detail": exc.detail, "status": exc.status_code}
             return
         background_broker.set_active(thread_id)
+        last_tool_by_agent: dict[str, str] = {}
         try:
-            stream = await graph.astream_events(
+            last_agent = None
+            async for chunk, metadata in graph.astream(
                 payload,
                 config={"configurable": {"thread_id": thread_id}},
                 context=MainStateContext(thread_id=thread_id, user_id=user_id),
-                version="v3",
-            )
-            async with stream:
-                async for message in stream.messages:
-                    node = getattr(message, "node", None)
-                    ns = list(getattr(message, "namespace", []) or [])
+                stream_mode="messages",
+            ):
+                # handler 回传的 HumanMessage 也会出现在 messages 流里；
+                # 只认打了 agent:* tag 的 AIMessageChunk，避免把用户原文当成助手输出。
+                if not isinstance(chunk, AIMessageChunk):
+                    continue
+                metadata = metadata or {}
+                tags = metadata.get("tags") or ()
+                if isinstance(tags, str):
+                    tags = [tags]
+                agent = next(
+                    (tag.split(":", 1)[1] for tag in tags
+                     if isinstance(tag, str) and tag.startswith("agent:")),
+                    None,
+                )
+                if not agent:
+                    continue
+                # 工具调用期间没有正文 token，给前端一个"正在调用工具"的进度
+                if agent in {"data_analysis", "data_develop"}:
+                    for tool_call in (getattr(chunk, "tool_call_chunks", None) or ()):
+                        name = (tool_call.get("name") if isinstance(tool_call, dict)
+                                else getattr(tool_call, "name", None))
+                        if not name or name == last_tool_by_agent.get(agent):
+                            continue
+                        last_tool_by_agent[agent] = name
+                        yield "status", {
+                            "thread_id": thread_id,
+                            "node": agent,
+                            "agent": agent,
+                            "text": f"正在调用工具：{name}",
+                        }
+                delta = chunk.text
+                if not delta:
+                    continue
+                if agent != last_agent:
                     yield "update", {
                         "thread_id": thread_id,
-                        "node": node,
-                        "ns": ns,
+                        "node": agent,
+                        "agent": agent,
+                        "ns": [],
                         "phase": "llm_start",
                     }
-                    async for delta in message.text:
-                        if delta:
-                            yield "token", {
-                                "thread_id": thread_id,
-                                "node": node,
-                                "ns": ns,
-                                "content": delta,
-                            }
-                interrupts = await stream.interrupts()
-                output = await stream.output() or {}
-            ctx["output"] = output
+                    last_agent = agent
+                yield "token", {
+                    "thread_id": thread_id,
+                    "node": agent,
+                    "agent": agent,
+                    "ns": [],
+                    "content": delta,
+                }
+            snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+            interrupts = list(snapshot.interrupts or ())
+            ctx["output"] = snapshot.values or {}
             ctx["interrupted"] = bool(interrupts)
             if interrupts:
                 ctx["interrupts"] = interrupts
@@ -230,8 +276,31 @@ async def _thread_owner(thread_id: str) -> int | None:
         )
 
 
+async def _ensure_thread(
+        thread_id: str, admin_id: int, thread_name: str,
+) -> tuple[ResultCode, str] | None:
+    """确保 admin_thread 有记录；失败返回 (错误码, 消息)，成功返回 None。"""
+    owner = await _thread_owner(thread_id)
+    if owner is not None:
+        if owner != admin_id:
+            return ResultCode.UNAUTHORIZED, "只能操作自己的会话"
+        return None
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(insert(AdminThread).values(
+                thread_id=thread_id,
+                thread_name=(thread_name or "新会话")[:10],
+                admin_id=admin_id,
+            ))
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"添加线程到 admin_thread 失败: {exc}")
+        return ResultCode.DB_ERROR, f"添加线程到 admin_thread 失败: {exc}"
+    return None
+
+
 @route.post("/chat/stream")
-async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse | RouteResponse:
+async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
     graph = getattr(request.app.state, "main_graph", None)
     if graph is None:
         raise HTTPException(status_code=503, detail="主图尚未初始化")
@@ -241,21 +310,10 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse |
     thread_id = req.thread_id or _new_thread_id(req.user_id)
     human_msg = req.message
 
-    owner = await _thread_owner(thread_id)
-    if owner is not None and owner != admin_id:
-        return RouteResponse.error(msg="只能操作自己的会话", code=ResultCode.UNAUTHORIZED)
-    if owner is None:
-        try:
-            async with AsyncSessionLocal() as session:
-                await session.execute(insert(AdminThread).values(
-                    thread_id=thread_id,
-                    thread_name=human_msg[:10],
-                    admin_id=admin_id,
-                ))
-                await session.commit()
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"添加线程到 admin_thread 失败: {exc}")
-            return RouteResponse.error(msg=f"添加线程到 admin_thread 失败: {exc}", code=ResultCode.DB_ERROR)
+    failure = await _ensure_thread(thread_id, admin_id, human_msg)
+    if failure:
+        code, msg = failure
+        return RouteResponse.error(msg=msg, code=code)
 
     async def event_stream():
         yield _sse("meta", {"thread_id": thread_id})
@@ -274,6 +332,14 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse |
         if metadata.get("thread_action") == "new_task":
             new_thread_id = _new_thread_id(req.user_id)
             request_text = metadata.get("request_text") or req.message
+            failure = await _ensure_thread(
+                new_thread_id, admin_id, metadata.get("thread_title") or request_text)
+            if failure:
+                code, msg = failure
+                yield _sse("error", {
+                    "thread_id": new_thread_id, "detail": msg, "status": code,
+                })
+                return
             yield _sse("thread_switch", {
                 "previous_thread_id": thread_id,
                 "thread_id": new_thread_id,
@@ -319,21 +385,10 @@ async def chat(req: ChatRequest, request: Request) -> RouteResponse:
     thread_id = req.thread_id or _new_thread_id(req.user_id)
     human_msg = req.message
 
-    owner = await _thread_owner(thread_id)
-    if owner is not None and owner != admin_id:
-        return RouteResponse.error(msg="只能操作自己的会话", code=ResultCode.UNAUTHORIZED)
-    if owner is None:
-        try:
-            async with AsyncSessionLocal() as session:
-                await session.execute(insert(AdminThread).values(
-                    thread_id=thread_id,
-                    thread_name=human_msg[:10],
-                    admin_id=admin_id,
-                ))
-                await session.commit()
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"添加线程到 admin_thread 失败: {exc}")
-            return RouteResponse.error(msg=f"添加线程到 admin_thread 失败: {exc}", code=ResultCode.DB_ERROR)
+    failure = await _ensure_thread(thread_id, admin_id, human_msg)
+    if failure:
+        code, msg = failure
+        return RouteResponse.error(msg=msg, code=code)
 
     result = await _run_user_turn(graph, thread_id, req.user_id, {"input_msg": human_msg})
     if _is_interrupted(result):
@@ -344,6 +399,11 @@ async def chat(req: ChatRequest, request: Request) -> RouteResponse:
         # 旧 thread 有未消费的后台任务：换新 thread，用用户原话重跑
         new_thread_id = _new_thread_id(req.user_id)
         request_text = metadata.get("request_text") or req.message
+        failure = await _ensure_thread(
+            new_thread_id, admin_id, metadata.get("thread_title") or request_text)
+        if failure:
+            code, msg = failure
+            return RouteResponse.error(msg=msg, code=code)
         new_result = await _run_user_turn(graph, new_thread_id, req.user_id, {"input_msg": request_text})
         return _response(
             new_result,
@@ -437,15 +497,30 @@ async def history(request: Request, thread_id: str = Query(..., description="只
     # 获取会话历史记录
     try:
         snapshot = await graph.aget_state({'configurable': {'thread_id': thread_id}})
-        messages = [
-            {"type": type(m).__name__, "content": str(m.content)}
-            for m in snapshot.values.get("messages", [])
-        ]
+        interrupts = list(snapshot.interrupts or ())
+        values = snapshot.values or {}
+        messages = []
+        for m in values.get("messages", []):
+            text = content_text(m.content)
+            # 调度的结构化 AIMessage 只有 tool call、没有正文，前端不展示
+            if isinstance(m, AIMessage) and not text.strip():
+                continue
+            messages.append({
+                "type": type(m).__name__,
+                "name": getattr(m, "name", None),
+                "content": text,
+            })
+        metadata = values.get('metadata') or {}
         return RouteResponse.ok(data={
             'thread_id': thread_id,
             'is_archive': is_archive,
-            'manual_intervention': snapshot.values.get('manual_intervention', False),
-            'project_dir': _project_dir(snapshot.values.get('metadata') or {}),
+            'manual_intervention': bool(interrupts),
+            'interrupted': bool(interrupts),
+            'interrupt': jsonable_encoder(interrupts),
+            'project_dir': _project_dir(metadata),
+            # 旧会话兜底；新会话最终正文已经在 messages 里，前端会去重
+            'output_msg': '' if interrupts else values.get('output_msg', ''),
+            'metadata': metadata,
             'messages': messages,
         })
     except Exception as exc:
@@ -468,7 +543,7 @@ async def get_thread(
     if not admin_id:
         return RouteResponse.error(msg="token 解析错误", code=ResultCode.INVALID_VALUE_ERROR)
     stmt = select(AdminThread.id, AdminThread.thread_id, AdminThread.is_archive, AdminThread.create_time,
-                  AdminThread.thread_name).where(
+                  AdminThread.thread_name, AdminThread.is_top).where(
         and_(
             AdminThread.admin_id == admin_id,
             AdminThread.is_archive == (false() if not is_archive else true()),
@@ -482,17 +557,108 @@ async def get_thread(
         stmt = stmt.where(AdminThread.create_time.between(start_time, end_time))
     try:
         async with AsyncSessionLocal() as session:
-            result = await session.execute(stmt).mappings().all()
+            result = (await session.execute(stmt)).mappings().all()
         if not result:
             payload['total'] = 0
             payload['records'] = []
             return RouteResponse.ok(data=payload)
         payload['total'] = len(result)
-        payload['records'] = result
+        payload['records'] = [dict(row) for row in result]
         return RouteResponse.ok(data=payload)
     except Exception as exc:
         logger.error(f"查询会话失败：{exc}")
         return RouteResponse.error(msg=f"查询会话失败：{exc}", code=ResultCode.DB_ERROR)
+
+
+@route.put("/thread/change")
+async def change_thread_name(request: Request, thread_info: ThreadRequest) -> RouteResponse:
+    thread_id = thread_info.thread_id.strip()
+    thread_name = thread_info.thread_name.strip()[:10]
+    if not thread_id or not thread_name:
+        return RouteResponse.error(msg="thread_id 或 thread_name 不能为空", code=ResultCode.INVALID_VALUE_ERROR)
+    try:
+        admin_id = int(request.state.info.get("id"))
+    except (TypeError, ValueError):
+        return RouteResponse.error(msg="token 解析错误", code=ResultCode.INVALID_VALUE_ERROR)
+    # 先看看还在不在
+    try:
+        async with AsyncSessionLocal() as session:
+            row = (await session.execute(
+                select(AdminThread.admin_id)
+                .where(and_(
+                    AdminThread.thread_id == thread_id,
+                    AdminThread.admin_id == admin_id,
+                ))
+            )).first()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"查询会话 {thread_id} 归属失败：{exc}")
+        return RouteResponse.error(msg=f"查询会话归属失败：{exc}", code=ResultCode.DB_ERROR)
+    if row is None:
+        return RouteResponse.error(msg="会话不存在", code=ResultCode.NOT_FOUND)
+    # 正式修改
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(AdminThread)
+                .where(and_(
+                    AdminThread.thread_id == thread_id,
+                    AdminThread.admin_id == admin_id,
+                ))
+                .values(thread_name=thread_name, update_time=func.now())
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"修改会话 {thread_id} 名称失败：{exc}")
+        return RouteResponse.error(msg=f"修改会话 {thread_id} 名称失败：{exc}", code=ResultCode.DB_ERROR)
+    return RouteResponse.ok(msg="会话名称修改成功")
+
+
+@route.put("/thread/top")
+async def top_thread(request: Request, thread_info: ThreadRequest) -> RouteResponse:
+    thread_id = thread_info.thread_id.strip()
+    thread_id_top = thread_info.is_top
+    if not thread_id:
+        return RouteResponse.error(msg="thread_id 或 is_top 不能为空", code=ResultCode.INVALID_VALUE_ERROR)
+    try:
+        admin_id = int(request.state.info.get("id"))
+    except (TypeError, ValueError):
+        return RouteResponse.error(msg="token 解析错误", code=ResultCode.INVALID_VALUE_ERROR)
+        # 先看看还在不在
+    try:
+        async with AsyncSessionLocal() as session:
+            row = (await session.execute(
+                select(AdminThread.admin_id, AdminThread.is_top)
+                .where(and_(
+                    AdminThread.thread_id == thread_id,
+                    AdminThread.admin_id == admin_id,
+                ))
+            )).first()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"查询会话 {thread_id} 归属失败：{exc}")
+        return RouteResponse.error(msg=f"查询会话归属失败：{exc}", code=ResultCode.DB_ERROR)
+    if row is None:
+        return RouteResponse.error(msg="会话不存在", code=ResultCode.NOT_FOUND)
+    owner, is_top = row
+    if owner != admin_id:
+        return RouteResponse.error(msg="只能置顶自己的会话", code=ResultCode.UNAUTHORIZED)
+    if is_top == thread_id_top:
+        return RouteResponse.ok(msg=f"会话已经处于{'置顶' if thread_id_top else '未置顶'}状态，无需重复操作")
+    # 正式修改
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(AdminThread)
+                .where(and_(
+                    AdminThread.thread_id == thread_id,
+                    AdminThread.admin_id == admin_id,
+                ))
+                .values(is_top=thread_id_top, update_time=func.now())
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"修改会话 {thread_id} 名称失败：{exc}")
+        return RouteResponse.error(msg=f"修改会话 {thread_id} 状态失败：{exc}", code=ResultCode.DB_ERROR)
+    return RouteResponse.ok(msg=f"会话状态修改成功，当前状态为{'置顶' if thread_id_top else '未置顶'}")
 
 
 @route.put("/thread/archive")
@@ -746,31 +912,88 @@ async def list_background(
     return RouteResponse.ok(data=jsonable_encoder([asdict(record) for record in records]))
 
 
+def _generate_temp_key() -> str:
+    raw_key = os.urandom(32)
+    base64_key = base64.b64encode(raw_key).decode('utf-8')
+    return base64_key
+
+
+@route.post("/background/verify")
+async def background_verify(request: Request) -> RouteResponse:
+    """将token放于这里进行校验，返回一个短暂的 Ticket 用于后续的 WebSocket 连接"""
+    token_info = request.state.info
+    if not token_info or not isinstance(token_info, dict):
+        return RouteResponse.error(msg="token 校验失败, 请重新登录", code=ResultCode.INVALID_VALUE_ERROR)
+    user_id = str(token_info.get("id"))
+    disabled = token_info.get("disabled", False)
+    try:
+        payload = {
+            "user_id": user_id,
+            "disabled": disabled,
+            # 只允许 20秒的时限（必须带时区，否则 PyJWT 按 UTC 解释 naive 时间）
+            "exp": datetime.now(timezone.utc) + timedelta(seconds=20),
+            "iat": datetime.now(timezone.utc),
+        }
+        tmp_key = _generate_temp_key()
+        # 存储临时key到Redis
+        redis_con.hset("jwt_key", f"background:temp-{user_id}", tmp_key)
+        ticket = jwt.encode(payload, tmp_key, algorithm="HS256")
+        code = secrets.token_urlsafe(16)
+        redis_con.hset("temp_code", code, f"background:{user_id}:{ticket}")
+        return RouteResponse.ok(data={"ticket": code})
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"生成 Ticket 失败：{exc}")
+        return RouteResponse.error(msg=f"生成 Ticket 失败：{exc}", code=ResultCode.SERVER_ERROR)
+
+
 @route.websocket("/ws/background")
-async def background_ws(websocket: WebSocket, token: str = Query(default="")):
-    """后台任务实时推送；WS 不经过 HTTP 中间件，所以这里自己校验 token"""
-    verify = getattr(websocket.app.state, "verify_token", None)
-    prefix = getattr(websocket.app.state, "auth_prefix", "Bearer token ")
-    if verify is None or not token:
+async def background_ws(websocket: WebSocket, ticket: str = Query(default="")):
+    """后台任务实时推送；WS 不经过 HTTP 中间件，这里验证来自 background_verify 的 Ticket"""
+    raw = redis_con.hget("temp_code", ticket)
+    if not raw:
         await websocket.close(code=1008)
         return
-    token_data, _ = await run_in_threadpool(verify, prefix + token)
-    if token_data is None:
+
+    try:
+        short_code, user_id, jwt_token = raw.decode("utf-8").split(":", 2)
+    except ValueError:
+        redis_con.hdel("temp_code", ticket)
         await websocket.close(code=1008)
         return
-    user_id = str(token_data.id)
+
+    # Ticket 一次性：不论校验成败都先消费掉，避免重放
+    tmp_key = redis_con.hget("jwt_key", f"background:temp-{user_id}")
+    redis_con.hdel("temp_code", short_code)
+    redis_con.hdel("jwt_key", f"background:temp-{user_id}")
+
+    try:
+        payload = jwt.decode(jwt_token, tmp_key, algorithms=["HS256"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Ticket 校验失败：{exc}")
+        await websocket.close(code=4008)
+        return
+
+    user_id = payload.get("user_id")
+    disabled = payload.get("disabled")
+    if not user_id or disabled:
+        await websocket.close(code=4008)
+        return
 
     await websocket.accept()
+    await register_ws(user_id, websocket)
     queue = background_registry.subscribe()
     try:
-        snapshot = [asdict(record) for record in background_registry.list_for_user(user_id)]
-        await websocket.send_json({"type": "snapshot", "records": jsonable_encoder(snapshot)})
+        records = [asdict(record) for record in background_registry.list_for_user(user_id)]
+        # 快照只发给刚连上的这一个连接
+        await websocket.send_json({"type": "snapshot", "records": jsonable_encoder(records)})
         while True:
             record = await queue.get()
             if record.user_id != user_id:
                 continue
+            # 每个连接各自订阅 queue，所以只发给自己；多窗口不会互相收到重复消息
             await websocket.send_json({"type": "update", "record": jsonable_encoder(asdict(record))})
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
         background_registry.unsubscribe(queue)
+        await unregister_ws(user_id, websocket)
