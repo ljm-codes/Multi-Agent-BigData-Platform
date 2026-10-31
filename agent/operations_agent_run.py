@@ -58,7 +58,10 @@ def get_error_app_id():
     判断 Redis 的 指定集合 是否有元素
     """
     try:
-        return _zpopmin(keys=[key])
+        value = _zpopmin(keys=[key])
+        if value is None:
+            return None
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
     except Exception as e:
         logger.error(f"在尝试从Redis中获取错误应用ID时出错 {type(e).__name__}: {e}")
         return None
