@@ -99,8 +99,8 @@ docker/
 - xgboost、catboost、jieba
 - pytest（原 conda freeze 里没有，但 CVA 会执行 `python -m pytest`，这里补上）
 
-镜像基于官方 `python:3.8-slim-bullseye` + pip（清华 PyPI 源），不依赖 conda 源。
-首次 `sandbox-init` 会把镜像里的 Python 3.8 运行时复制到卷内
+镜像基于官方 `python:3.8-slim-bookworm` + pip（清华 PyPI 源），不依赖 conda 源。
+运行时使用 Debian 12 的 libffi8/OpenSSL3，和 app/node 容器一致；首次 `sandbox-init` 会把镜像里的 Python 3.8 运行时复制到卷内
 `/export/server/miniconda3/envs/spark_study`，并生成带 `PYTHONHOME` / `LD_LIBRARY_PATH`
 的 `bin/python3` 包装器；app 和 node 共用这个卷。
 
