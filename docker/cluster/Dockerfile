@@ -1,15 +1,13 @@
-FROM eclipse-temurin:8-jdk-jammy
-
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server curl ca-certificates wget tar gzip zip procps \
-        netcat-openbsd git hostname iproute2 libgomp1 passwd util-linux \
-    && rm -rf /var/lib/apt/lists/*
+FROM eclipse-temurin:8-jdk-jammy AS builder
 
 ARG HADOOP_VERSION=3.3.6
 ARG SPARK_VERSION=3.1.3
 ARG FLINK_VERSION=1.18.1
 ARG FLINK_SCALA=2.12
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates tar gzip \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY vendor/ /tmp/vendor/
 RUN set -eux; \
@@ -35,6 +33,18 @@ RUN set -eux; \
             | tar -xz -C /opt; \
     fi; \
     mv "/opt/flink-${FLINK_VERSION}" /opt/flink
+
+FROM eclipse-temurin:8-jdk-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server curl ca-certificates wget tar gzip zip procps \
+        netcat-openbsd git hostname iproute2 libgomp1 passwd util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/hadoop /opt/hadoop
+COPY --from=builder /export/server /export/server
+COPY --from=builder /opt/flink /opt/flink
 
 RUN useradd -m -s /bin/bash hadoop \
     && echo 'hadoop:hadoop' | chpasswd \
