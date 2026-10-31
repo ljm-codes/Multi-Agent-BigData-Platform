@@ -1,5 +1,9 @@
 # Docker 部署
 
+> **建议：不要用 Docker 部署生产大数据集群。** 本方案用于快速验证（UI/SSE 对话、Python 3.8 沙箱、
+> Spark/Flink 提交信号、YARN/HDFS 基础链路）；Hadoop/Spark/Flink 是单节点伪分布式，资源受限，
+> 不具备生产可用性。生产请使用独立虚拟机/物理机集群。
+
 一套 compose 拉起：API + Postgres/Redis + 单节点 Hadoop/YARN + Spark/Flink 客户端 + Python 3.8 沙箱。
 默认是**单节点伪分布式**，省内存；第二 worker 和巡检/运维进程用 profile 按需开启。
 
@@ -28,6 +32,9 @@ lite 用 `config/config.apponly.yaml`（`connect_to_cluster: false`）；另外�
 
 配置模板里的 MySQL、Elasticsearch、Milvus、RabbitMQ 当前代码并没有使用，这里不启动；
 需要时再按实际接入的模块单独加服务。
+
+> checker/ops 默认不启用，仅作为验证用途。当前 Fair Scheduler 下队列资源检查会误报；
+> ops 可能从 checker 队列取到空 `app_id` 后报 `character varying = bytea`，需在 checker/队列侧修正。
 
 沙箱环境路径固定为 `/export/server/miniconda3/envs/spark_study`，通过命名卷
 `sandbox_env` 同时挂到 `app`、`node1`（以及可选的 `node2`）。这样：

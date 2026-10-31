@@ -192,6 +192,9 @@ python run.py     # 默认 0.0.0.0:8000
 Hadoop + Spark + Flink 集群、Python 3.8 沙箱、Postgres/Redis 和 API/巡检/运维进程都在
 [docker/README.md](docker/README.md) 里，用 `docker compose` 启动。
 
+> 仅用于快速验证（UI/SSE、沙箱、Spark/Flink 提交信号）；**不要用 Docker 部署生产大数据集群**，
+> 生产请使用独立虚拟机/物理机集群。
+
 ### 只想看界面、不连数据库
 
 ```bash
@@ -233,6 +236,7 @@ SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_swit
 4. MCP 目前只用于 Maven 依赖查询，还没做通用 MCP / Skill 接入。
 5. LangGraph 的 `store` 与 `cache` 已编译进图，但还没有节点声明 `cache_policy`，实际未启用。
 6. Mermaid 的后端校验只覆盖 CVA 产出的 `mermaid_flowgraph`；聊天中模型自发写的其它 Mermaid 图仍只靠前端修复，复杂/非法图可能显示源码和错误。
+7. Docker 部署是单节点伪分布式的验证环境，不作为生产大数据集群方案；生产请用独立虚拟机/物理机集群。
 
 ## 项目的未来方向
 
