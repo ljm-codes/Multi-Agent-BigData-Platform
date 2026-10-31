@@ -1,0 +1,5 @@
+*.sh text eol=lf
+docker/cluster/bin/* text eol=lf
+docker/app/Dockerfile text eol=lf
+docker/cluster/Dockerfile text eol=lf
+docker/sandbox/Dockerfile text eol=lf
