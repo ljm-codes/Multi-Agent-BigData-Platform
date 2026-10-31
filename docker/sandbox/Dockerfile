@@ -1,12 +1,6 @@
-FROM python:3.8-slim-bullseye
+FROM python:3.8-slim-bookworm
 
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ENV PIP_DEFAULT_TIMEOUT=120
-
-COPY requirements.txt /opt/sandbox/requirements.txt
-RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -r /opt/sandbox/requirements.txt
-
+COPY --from=multiagent-sandbox:old /usr/local/lib/python3.8/site-packages /usr/local/lib/python3.8/site-packages
 COPY init-sandbox.sh /usr/local/bin/init-sandbox.sh
 RUN chmod +x /usr/local/bin/init-sandbox.sh
 
