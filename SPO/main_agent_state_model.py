@@ -169,6 +169,7 @@ class CodeVerifyAgentMainState(MessagesState):
     fail_num: NotRequired[int]
     repair_num: NotRequired[int]
     is_repair: NotRequired[bool]
+    mermaid_retry_num: NotRequired[int]
 
 
 # 结束状态

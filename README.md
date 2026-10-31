@@ -74,10 +74,10 @@ YARN 运行中的应用
 
 - **Markdown / Mermaid**：`markdown-it` 负责解析，原始 HTML 关闭；Mermaid 代码块由 Mermaid 懒加载渲染。
   Mermaid 只在消息流式结束后渲染，避免每个 token 重建 SVG；人工确认面板里的“流程图”同样生效。
-  模型常见的 Mermaid 写法问题（标签里括号没加引号、多条语句挤一行）会在前端做一次保守修复，修不好则保留源码并标红。
-- **打字机**：后端只负责把 Agent token / 最终 `output_msg` 作为数据送达；前端用队列按固定节拍逐字显示，
-  不依赖 SSE 的到达节奏。相关参数在 `static/source/src/views/ChatView.vue` 的
-  `TYPE_CHARS_PER_TICK` / `TYPE_TICK_MS`；纯逐字可改成 `1 / 20`。
+  人工确认前，后端用 `merman` 校验 CVA 产出的 `mermaid_flowgraph` 并做确定性修复；修不好回模型重修一次，
+  仍失败则省略图并提示。前端保留一次保守修复作为其它来源的兜底，修不好则保留源码并标红。
+- **打字机**：后端把最终 `output_msg` 按 6 字/30ms 分帧推送（`routers/ai_chat.py::_final_frames`），
+  前端收到即追加；改节奏调 `_final_frames` 的 `chars` / `delay`。
 - **长任务状态**：等待模型或工具执行时，气泡会显示 `正在生成… Ns`；分析/开发 Agent 发出工具调用时显示
   `正在调用工具：xxx`，避免看起来像卡死。
 - **会话历史**：root `messages` 就是用户可见的对话记录；分析和开发 Agent 的最终输出、`work_end` 的最终回复都会写回
@@ -159,12 +159,8 @@ LangGraph 的 `checkpoints` / `store` 表由程序启动时自动建。
 
 ### 3. 安装 Python 依赖
 
-目前还没有 `requirements.txt`，核心依赖：
-
 ```bash
-pip install fastapi uvicorn sqlalchemy "psycopg[binary]" redis bcrypt pyjwt apscheduler \
-            "langgraph>=1.2" "langchain>=1.4" langchain-deepseek langchain-mcp-adapters \
-            hdfs yarn-api-client pydantic python-dotenv pyyaml
+pip install -r requirements.txt
 ```
 
 ### 4. 初始化第一个管理员
@@ -190,6 +186,11 @@ python run.py     # 默认 0.0.0.0:8000
 ```
 
 打开 `http://127.0.0.1:8000/`，用上一步的邮箱密码登录。
+
+### 7. Docker 一键部署
+
+Hadoop + Spark + Flink 集群、Python 3.8 沙箱、Postgres/Redis 和 API/巡检/运维进程都在
+[docker/README.md](docker/README.md) 里，用 `docker compose` 启动。
 
 ### 只想看界面、不连数据库
 
@@ -226,16 +227,12 @@ SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_swit
 
 ## 项目的不足
 
-1. 仍是 Demo，Python 侧缺少 `requirements.txt`；前端已有 `pnpm-lock.yaml`。
+1. 仍是 Demo，Python 侧只有 `requirements.txt`、没有 lockfile；前端已有 `pnpm-lock.yaml`。
 2. **运维链路还没接入 HTTP 层**，只有后台进程，前端暂时看不到巡检结果。
-3. 运维取队列用的是 `ZPOPMIN`，需要 Redis ≥ 5.0；低于这个版本的异常会被吞掉，表现为「队列永远是空的」。
-4. 运维 Agent 只能通过 SSH 拉代码，且相同代码每次都要重新做 AST 解析。
-5. MCP 目前只用于 Maven 依赖查询，还没做通用 MCP / Skill 接入。
-6. LangGraph 的 `store` 与 `cache` 已编译进图，但还没有节点声明 `cache_policy`，实际未启用。
-7. 会话标题取首条用户消息前 10 字，重命名和置顶只存在浏览器本地。
-8. 旧会话在历史修复前没有把助手正文写进 `messages`，刷新后只能显示最后一条 `output_msg`，无法回填。
-9. Mermaid 语法仍由模型生成，前端只做常见写法修复；复杂/非法图仍可能显示源码和错误。
-10. 并行产生多个 pending interrupt 时，`/ai/resume` 仍按单个 answer 恢复，暂未处理多 interrupt 选择。
+3. 运维 Agent 只能通过 SSH 拉代码，且相同代码每次都要重新做 AST 解析。
+4. MCP 目前只用于 Maven 依赖查询，还没做通用 MCP / Skill 接入。
+5. LangGraph 的 `store` 与 `cache` 已编译进图，但还没有节点声明 `cache_policy`，实际未启用。
+6. Mermaid 的后端校验只覆盖 CVA 产出的 `mermaid_flowgraph`；聊天中模型自发写的其它 Mermaid 图仍只靠前端修复，复杂/非法图可能显示源码和错误。
 
 ## 项目的未来方向
 

@@ -179,6 +179,20 @@ def _done_payload(
     }
 
 
+async def _final_frames(text: str, thread_id: str, *, chars: int = 6, delay: float = 0.03):
+    """把最终答案按 chars 字/帧、间隔 delay 秒推送，前端收到即追加"""
+    text = text or ""
+    for index in range(0, len(text), chars):
+        yield "token", {
+            "thread_id": thread_id,
+            "node": "final",
+            "agent": "",
+            "ns": [],
+            "content": text[index:index + chars],
+        }
+        await asyncio.sleep(delay)
+
+
 async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: Any, ctx: dict):
     """一次流式图运行（astream messages）；负责该 thread 的 occupancy 释放"""
     async with _lock_for(thread_id):
@@ -353,6 +367,9 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
                     return
             if ctx2["interrupted"]:
                 return
+            async for event, data in _final_frames(
+                    (ctx2["output"] or {}).get("output_msg", ""), new_thread_id):
+                yield _sse(event, data)
             yield _sse("done", _done_payload(
                 ctx2["output"], new_thread_id,
                 thread_action="new_task",
@@ -361,6 +378,8 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
             ))
             return
 
+        async for event, data in _final_frames(output.get("output_msg", ""), thread_id):
+            yield _sse(event, data)
         yield _sse("done", _done_payload(output, thread_id))
 
     return StreamingResponse(

@@ -39,6 +39,7 @@ from Tools.registry import get_tools
 from Tools.run_command import arun_mvn_command, arun_python_command, run_mvn_command
 from Tools.share_check_tool import redis_con, manager
 from Tools.struct_analy import parse_route_message
+from Tools.mermaid_check import check_and_repair_mermaid
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.code_verify_agent_middleware import PerceptionBackground
 from middleware.compose import chain_model_call_wrappers, ComposedModelResult, run_before_model, \
@@ -419,6 +420,10 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
             break
     if not jar_file:
         return {"type": "error", "msg": f"未找到 {target_path} 下的 jar 包", "app_type": app_type}
+    if not CONNECT_TO_CLUSTER:
+        return {"type": "info",
+                "msg": f"集群被禁用，未上传/提交 jar：{jar_file}",
+                "app_type": app_type}
     # 提交 jar 包到指定的hdfs:///app/{app_type}/jar
     target_dir = f"/app/{app_type}/jar"
     cmd_dir = f"/app/{app_type}/cmd"
@@ -679,7 +684,8 @@ def _splicing_doc(doc_info: dict) -> dict:
                 "app_type": app_type}
     res_lines = []
     data_result = doc_info.get("data_result")
-    mermaid_flowgraph = doc_info.get("mermaid_flowgraph")
+    raw_mermaid = doc_info.get("mermaid_flowgraph") or ""
+    mermaid_flowgraph, mermaid_error = check_and_repair_mermaid(raw_mermaid)
     snippets = doc_info.get("snippets", [])
 
     # 代码片段里的 file_path 是项目相对路径；IDE 链接要补上真实项目根目录
@@ -694,7 +700,12 @@ def _splicing_doc(doc_info: dict) -> dict:
     res_lines.append("## 数据结果\n")
     res_lines.append(data_result or "无" + "\n")
     res_lines.append("## 流程图\n")
-    res_lines.append(f"```mermaid\n{mermaid_flowgraph}\n```\n" if mermaid_flowgraph else "无结果\n")
+    if mermaid_flowgraph:
+        res_lines.append(f"```mermaid\n{mermaid_flowgraph}\n```\n")
+    elif raw_mermaid:
+        res_lines.append("流程图生成失败（已省略）\n")
+    else:
+        res_lines.append("无结果\n")
     if snippets:
         res_lines.append("## 核心代码片段（按优先级）\n")
         for snippet in snippets:
@@ -723,7 +734,12 @@ def _splicing_doc(doc_info: dict) -> dict:
                 res_lines.append(
                     f"[在 IDE 中查看](IDE://{target_url}"
                     f"#L{start_line}-L{end_line})\n")
-    return {"type": "info", "msg": "\n".join(res_lines), "app_type": app_type}
+    return {
+        "type": "info",
+        "msg": "\n".join(res_lines),
+        "app_type": app_type,
+        "mermaid_error": mermaid_error,
+    }
 
 
 def _error_dict_to_str(error_dict: dict) -> dict:
@@ -765,6 +781,7 @@ def _verify_input_handler(state: CodeVerifyAgentInputState) -> CodeVerifyAgentMa
         app_type=app_type,
         source=code_source,
         original_task_list=state.get("original_task_list") or [],
+        mermaid_retry_num=0,  # 每次质检只允许重修一次流程图
     )
     if background_msg:
         # 后台回流是一次全新判断：清掉上一轮 handed_off 留下的结果和失败计数
@@ -1012,6 +1029,7 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
             "deep_timeout": hard_timeout,
             "date": date,
             "project_name": p_name,
+            "mermaid_retry_num": state.get("mermaid_retry_num") or 0,
         }
         if repair_num := state.get("repair_num"):
             code_summary["repair_num"] = repair_num
@@ -1109,6 +1127,23 @@ def _verify_manual(code_summary: dict, runtime: Runtime) -> Command:
         to_manual_dict = _error_dict_to_str(code_summary)
     else:
         to_manual_dict = _splicing_doc(code_summary)
+    mermaid_error = to_manual_dict.pop("mermaid_error", "")
+    retry_num = code_summary.get("mermaid_retry_num") or 0
+    if mermaid_error and retry_num < 1:
+        # 流程图修不好时先回模型重修一次；错误信息必须一并带给模型
+        logger.warning(f"Mermaid 校验失败，回退重修一次：{mermaid_error}")
+        return Command(
+            goto="ver_chat",
+            update={
+                "messages": [HumanMessage(content=(
+                    "上一次输出的 mermaid_flowgraph 未通过 Mermaid 语法校验，请修正后重新调用 "
+                    "VerifyAgentOutClass（goto=user），其它字段保持不变。\n"
+                    f"校验错误：{mermaid_error}\n"
+                    f"原始流程图：\n{code_summary.get('mermaid_flowgraph') or ''}"
+                ))],
+                "mermaid_retry_num": retry_num + 1,
+            },
+        )
     date = code_summary.get("date")
     p_name = code_summary.get("project_name")
     app_type = code_summary.get("app_type")

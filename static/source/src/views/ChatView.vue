@@ -240,7 +240,7 @@ async function scrollToBottom() {
   listRef.value?.scrollToBottom?.()
 }
 
-// 最终答案在前端本地逐字显示：SSE 只负责把完整 output_msg 送到，不再按 6 字分帧
+// 未启用：前端本地打字机（当前由后端 _final_frames 分帧，前端收到即追加）
 const TYPE_CHARS_PER_TICK = 2
 const TYPE_TICK_MS = 16
 let typeTimer = null
@@ -337,6 +337,8 @@ async function send() {
   const bubbleMap = new Map()
   let pendingBubble = { id: uid(), role: 'assistant', content: '', streaming: true, agent: '', tools: [] }
   messages.value.push(pendingBubble)
+  // 必须拿数组里的响应式代理再改，直接改 push 进去的原始对象不会触发渲染
+  pendingBubble = messages.value[messages.value.length - 1]
   const isNewThread = !currentThreadId.value
   sending.value = true
   await scrollToBottom()
@@ -350,6 +352,7 @@ async function send() {
     } else {
       bubble = { id: uid(), role: 'assistant', content: '', streaming: true, agent: '', tools: [] }
       messages.value.push(bubble)
+      bubble = messages.value[messages.value.length - 1]
     }
     bubble.agent = normalizeAgent(agent)
     bubbleMap.set(key, bubble)
@@ -390,14 +393,15 @@ async function send() {
         },
         onToken: (data) => {
           if (!data?.content) return
-          // 最终答案改由 onDone 的 output_msg 在本地逐字显示，忽略旧后端的 final 分帧
-          if (data.node === 'final') return
           // 旧后端会把 handler 回传的 HumanMessage 当成 token 发出来
           if (!data.agent && data.node === 'handler') return
-          const key = data.agent || data.node || 'assistant'
-          const bubble = ensureBubble(data.agent || data.node || '', key)
+          // 最终答案由后端 node=final 分帧，token 到达即追加
+          const isFinal = data.node === 'final'
+          const key = isFinal ? 'final' : data.agent || data.node || 'assistant'
+          const bubble = ensureBubble(isFinal ? '' : data.agent || data.node || '', key)
           bubble.status = ''
-          enqueueTyping(bubble, data.content)
+          bubble.content += data.content
+          scrollToBottom()
         },
         onThreadSwitch: (data) => {
           if (!data?.thread_id) return
@@ -411,6 +415,7 @@ async function send() {
           bubbleMap.clear()
           pendingBubble = { id: uid(), role: 'assistant', content: '', streaming: true, agent: '', tools: [] }
           messages.value.push(pendingBubble)
+          pendingBubble = messages.value[messages.value.length - 1]
           if (data.thread_title) threadStore.rename(data.thread_id, data.thread_title)
         },
         onInterrupt: (data) => {
@@ -419,8 +424,19 @@ async function send() {
           interrupt.value = extractInterrupt(data?.interrupt)
         },
         onDone: (data) => {
-          // 最终答案不再由后端分帧，改成前端本地逐字
-          startFinalTyping(data)
+          // 最终答案已由 node=final 的 token 追加，这里只收尾
+          const finalBubble = bubbleMap.get('final')
+          if (finalBubble) finalBubble.agent = normalizeAgent(data?.metadata?.from_)
+          else if (String(data?.output_msg || '').trim()) {
+            messages.value.push({
+              id: uid(),
+              role: 'assistant',
+              content: String(data.output_msg),
+              agent: normalizeAgent(data?.metadata?.from_),
+              tools: [],
+            })
+          }
+          stopStreaming(true)
           if (data?.project_dir) projectDir.value = data.project_dir
           if (data?.thread_title && currentThreadId.value) {
             threadStore.rename(currentThreadId.value, data.thread_title)
@@ -433,6 +449,7 @@ async function send() {
           if (!bubble) {
             bubble = { id: uid(), role: 'assistant', content: '', streaming: false, agent: '', tools: [] }
             messages.value.push(bubble)
+            bubble = messages.value[messages.value.length - 1]
           }
           bubble.streaming = false
           bubble.error = true
@@ -447,6 +464,7 @@ async function send() {
     if (!bubble) {
       bubble = { id: uid(), role: 'assistant', content: '', streaming: false, agent: '', tools: [] }
       messages.value.push(bubble)
+      bubble = messages.value[messages.value.length - 1]
     }
     bubble.streaming = false
     bubble.error = true
