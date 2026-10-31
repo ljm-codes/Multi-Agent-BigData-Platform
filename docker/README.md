@@ -99,6 +99,11 @@ docker/
 - xgboost、catboost、jieba
 - pytest（原 conda freeze 里没有，但 CVA 会执行 `python -m pytest`，这里补上）
 
+镜像基于官方 `python:3.8-slim-bullseye` + pip（清华 PyPI 源），不依赖 conda 源。
+首次 `sandbox-init` 会把镜像里的 Python 3.8 运行时复制到卷内
+`/export/server/miniconda3/envs/spark_study`，并生成带 `PYTHONHOME` / `LD_LIBRARY_PATH`
+的 `bin/python3` 包装器；app 和 node 共用这个卷。
+
 加包：编辑 `docker/sandbox/requirements.txt`，然后重建并清掉旧卷（卷不会自动刷新）：
 
 ```bash
@@ -142,6 +147,8 @@ agent:
 - 守护进程堆已压到 NameNode/RM 384m、DataNode/NM 256m、Proxy 128m（`conf/hadoop-env.sh`）
 - 首启 `init-hdfs.sh` 会自动建 `/user/hadoop`、`/app/spark/cmd`、`/app/flink/cmd`、`/tmp/logs`，
   并把 Spark jars 打成 `spark-libs.zip` 上传到 HDFS
+- 如果部署机访问 archive.apache.org 不稳定，把三个 tarball 放到 `docker/cluster/vendor/`
+  （文件名见 `cluster/Dockerfile` 的 ARG），构建会优先用本地包
 
 验证：
 

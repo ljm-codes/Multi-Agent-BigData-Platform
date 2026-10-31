@@ -52,3 +52,7 @@ model/hfl/
 # ---------- maven+mcp源代码 ----------
 Maven/mvn-3.9.9/
 Maven/mcp/maven_mcp_source_code.js
+
+# Docker 部署用离线安装包（构建时可选，不入库）
+docker/cluster/vendor/*.tar.gz
+docker/cluster/vendor/*.tgz

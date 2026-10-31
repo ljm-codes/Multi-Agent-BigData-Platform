@@ -6,7 +6,8 @@ FROM node:20-bullseye-slim AS node
 
 FROM node:20-bullseye-slim AS web
 WORKDIR /src
-RUN corepack enable && corepack prepare pnpm@10.33.0 --activate
+RUN corepack enable && corepack prepare pnpm@10.33.0 --activate \
+    && pnpm config set registry https://registry.npmmirror.com
 COPY static/source/package.json static/source/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY static/source/ ./
@@ -25,10 +26,13 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && npm config set registry https://registry.npmmirror.com \
     && (npm install -g mcp-maven-deps || true)
 
 ENV JAVA_HOME=/opt/java/openjdk
 ENV PATH=/usr/share/maven/bin:/opt/java/openjdk/bin:/usr/local/bin:$PATH
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_DEFAULT_TIMEOUT=120
 
 WORKDIR /app
 COPY requirements.txt .

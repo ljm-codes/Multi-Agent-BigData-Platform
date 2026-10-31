@@ -11,16 +11,29 @@ ARG SPARK_VERSION=3.1.3
 ARG FLINK_VERSION=1.18.1
 ARG FLINK_SCALA=2.12
 
+COPY vendor/ /tmp/vendor/
 RUN set -eux; \
     mkdir -p /opt /export/server; \
-    curl -fSL --retry 3 "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" \
-        | tar -xz -C /opt; \
+    if [ -f "/tmp/vendor/hadoop-${HADOOP_VERSION}.tar.gz" ]; then \
+        tar -xzf "/tmp/vendor/hadoop-${HADOOP_VERSION}.tar.gz" -C /opt; \
+    else \
+        curl -fSL --retry 3 "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" \
+            | tar -xz -C /opt; \
+    fi; \
     mv "/opt/hadoop-${HADOOP_VERSION}" /opt/hadoop; \
-    curl -fSL --retry 3 "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.2.tgz" \
-        | tar -xz -C /export/server; \
+    if [ -f "/tmp/vendor/spark-${SPARK_VERSION}-bin-hadoop3.2.tgz" ]; then \
+        tar -xzf "/tmp/vendor/spark-${SPARK_VERSION}-bin-hadoop3.2.tgz" -C /export/server; \
+    else \
+        curl -fSL --retry 3 "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.2.tgz" \
+            | tar -xz -C /export/server; \
+    fi; \
     mv "/export/server/spark-${SPARK_VERSION}-bin-hadoop3.2" /export/server/spark3; \
-    curl -fSL --retry 3 "https://archive.apache.org/dist/flink/flink-${FLINK_VERSION}/flink-${FLINK_VERSION}-bin-scala_${FLINK_SCALA}.tgz" \
-        | tar -xz -C /opt; \
+    if [ -f "/tmp/vendor/flink-${FLINK_VERSION}-bin-scala_${FLINK_SCALA}.tgz" ]; then \
+        tar -xzf "/tmp/vendor/flink-${FLINK_VERSION}-bin-scala_${FLINK_SCALA}.tgz" -C /opt; \
+    else \
+        curl -fSL --retry 3 "https://archive.apache.org/dist/flink/flink-${FLINK_VERSION}/flink-${FLINK_VERSION}-bin-scala_${FLINK_SCALA}.tgz" \
+            | tar -xz -C /opt; \
+    fi; \
     mv "/opt/flink-${FLINK_VERSION}" /opt/flink
 
 RUN useradd -m -s /bin/bash hadoop \
