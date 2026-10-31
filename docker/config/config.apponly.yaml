@@ -1,0 +1,113 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+
+app:
+  connect_to_cluster: false
+
+logging:
+  level: INFO
+  file_path: ./log
+  formatter: '%(asctime)s [%(threadName)s - %(thread)d] %(levelname)s %(filename)s [%(funcName)s/%(lineno)d] %(message)s'
+  create_file: true
+  max_bytes: 5MB
+  backup_count: 2
+
+redis:
+  host: redis
+  port: 6379
+  password: 'multiagent'
+  db: 0
+  max_connections: 20
+
+hadoop:
+  checker:
+    error_queue:
+      error_app_redis_key: error_app_queue
+      mode: number
+      value:
+        - 50
+        - 100
+        - 150
+  yarn:
+    manager: node1:8088
+    proxy: node1:8089
+    poll_interval: 30
+    nm_log_dirs: /data/yarn/log
+    remote_app_log_dir: /tmp/logs
+    log_user: hadoop
+    startup_cmd_dir: /app
+    spark:
+      skew_warning_ratio: 5.0
+      skew_error_ratio: 10.0
+      node_mem_suspect_ratio: 85.0
+      node_mem_sample_interval: 5
+      node_mem_lookback_seconds: 90
+      node_mem_max_samples: 240
+      submit_bin: /usr/local/bin/spark-submit
+      python: /export/server/miniconda3/envs/spark_study/bin/python3
+      archive: hdfs://node1:8020/user/hadoop/spark-libs.zip
+    max_job_timeout: 1800
+  hdfs:
+    webhdfs:
+      url: node1:9870
+      user: hadoop
+
+ssh:
+  user: hadoop
+  port: 22
+  timeout: 15
+
+model:
+  name: deepseek-flash
+  params:
+    temperature: 0.8
+    thinking:
+      type: disabled
+  vocation:
+    name: customer service
+  summary:
+    name: deepseek-flash
+    kwargs:
+      temperature: 1.3
+      extra_body:
+        thinking:
+          type: disabled
+      profile:
+        max_input_tokens: 12800
+    pattern: fraction
+    trigger_threshold: 0.8
+
+agent:
+  OM:
+    n_workers: 3
+  DDA:
+    java_maven_lib_dir: /root/.m2/repository
+  DAA:
+    python_lib_dir: /export/server/miniconda3/envs/spark_study/lib/python3.8/site-packages
+    test_python: /export/server/miniconda3/envs/spark_study/bin/python3
+    spark_test_master: 'local[1]'
+
+databases:
+  postgres:
+    enabled: true
+    host: postgres
+    port: 5432
+    user: multiagent
+    password: 'multiagent'
+    db: multiagentbigdataplatform
+
+email:
+  smtp: smtp.qq.com
+  port: 465
+  sender: ''
+  sender_name: ''
+  receiver: []
+
+mcp:
+  maven:
+    mcpServers:
+      maven-deps-server:
+        command: npx
+        args:
+          - mcp-maven-deps
