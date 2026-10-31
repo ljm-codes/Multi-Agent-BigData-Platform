@@ -143,7 +143,7 @@ agent:
     - `flink run-application -t yarn-application`
 - HDFS：`hdfs://node1:8020`，WebHDFS/UI `node1:9870`
 - YARN：RM `node1:8088`，WebAppProxy `node1:8089`
-- NodeManager：`yarn.nodemanager.resource.memory-mb=1536`；`node1` 容器 4g
+- NodeManager：`yarn.nodemanager.resource.memory-mb=2048`；`node1` 容器 4g
 - 守护进程堆已压到 NameNode/RM 384m、DataNode/NM 256m、Proxy 128m（`conf/hadoop-env.sh`）
 - 首启 `init-hdfs.sh` 会自动建 `/user/hadoop`、`/app/spark/cmd`、`/app/flink/cmd`、`/tmp/logs`，
   并把 Spark jars 打成 `spark-libs.zip` 上传到 HDFS
