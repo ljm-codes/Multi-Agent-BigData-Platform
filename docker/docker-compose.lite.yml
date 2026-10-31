@@ -37,6 +37,7 @@ services:
     image: multiagent-sandbox:local
     volumes:
       - sandbox_env:/export/server/miniconda3
+      - ./sandbox/init-sandbox.sh:/usr/local/bin/init-sandbox.sh:ro
     restart: "no"
 
   app:
