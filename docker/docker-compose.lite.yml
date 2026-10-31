@@ -51,6 +51,7 @@ services:
       - .env
     environment:
       TZ: Asia/Shanghai
+      PYTHONPATH: /app
     volumes:
       - ./config/config.apponly.yaml:/app/config.yaml:ro
       - ../tmp_code:/app/tmp_code

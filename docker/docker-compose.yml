@@ -107,6 +107,7 @@ services:
       - .env
     environment:
       TZ: Asia/Shanghai
+      PYTHONPATH: /app
     volumes:
       - ./config/config.docker.yaml:/app/config.yaml:ro
       - ../tmp_code:/app/tmp_code
@@ -144,6 +145,7 @@ services:
       - .env
     environment:
       TZ: Asia/Shanghai
+      PYTHONPATH: /app
     volumes:
       - ./config/config.docker.yaml:/app/config.yaml:ro
       - ../log:/app/log
@@ -167,6 +169,7 @@ services:
       - .env
     environment:
       TZ: Asia/Shanghai
+      PYTHONPATH: /app
     volumes:
       - ./config/config.docker.yaml:/app/config.yaml:ro
       - ../log:/app/log
