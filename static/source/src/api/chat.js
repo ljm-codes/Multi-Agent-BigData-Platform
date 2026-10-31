@@ -28,6 +28,9 @@ function dispatch({ event, data }, handlers) {
     case 'update':
       handlers.onUpdate?.(data)
       break
+    case 'status':
+      handlers.onStatus?.(data)
+      break
     case 'token':
       handlers.onToken?.(data)
       break

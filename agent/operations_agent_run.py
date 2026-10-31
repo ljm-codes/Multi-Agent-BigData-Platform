@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import insert
 from SPO.operations_agent_state_model import OperationsAndReconcileInputState, OperationsAndReconcileContext, \
     OperationsAndReconcileCheckInfo
 from SPO.postgresql_model import app_lease, CheckLog
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.alarm_sender import send_warning_msg
 from Tools.db import SessionLocal
 from Tools.share_check_tool import redis_con
@@ -33,13 +33,35 @@ RUNNING = True
 
 logger = LogSetting.create(__name__)
 
+# 本机上redis < 5.0版本，不支持 zpopmin 命令
+# 这里使用Lua脚本时限类似 zpopmin 的功能
+# Lua
+_ZPOPMIN_LUA = """
+-- KEYS[1] 是有序集合的键名
+local key = KEYS[1]
+-- 获取分数最小的第一个成员
+local result = redis.call('ZRANGE', key, 0, 0)
+local member = result[1]
+if member then
+    -- 如果存在，则删除该成员
+    redis.call('ZREM', key, member)
+    return member
+else
+    return nil
+end
+"""
+_zpopmin = redis_con.register_script(_ZPOPMIN_LUA)
+
 
 def get_error_app_id():
     """
     判断 Redis 的 指定集合 是否有元素
     """
     try:
-        return redis_con.zpopmin(key)
+        value = _zpopmin(keys=[key])
+        if value is None:
+            return None
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
     except Exception as e:
         logger.error(f"在尝试从Redis中获取错误应用ID时出错 {type(e).__name__}: {e}")
         return None

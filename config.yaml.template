@@ -3,6 +3,11 @@ server:
   host: 0.0.0.0
   port: 8000
 
+app:
+  # 设置一个是否连接集群的选项 -> 取消重依赖
+  # 启动这个之后，将无法启动运行Agent，以及部分工具将无法使用
+  connect_to_cluster: false
+
 logging:
   level: 'DEBUG'
   file_path: './log'

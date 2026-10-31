@@ -80,6 +80,7 @@ create table admin_thread
     thread_name varchar(20)         not null,
     admin_id    bigint references admin_info (id),
     is_archive  boolean     default false,
+    is_top      boolean     default false, -- 是否置顶
     create_time timestamptz default now(),
     update_time timestamptz default now()
 );

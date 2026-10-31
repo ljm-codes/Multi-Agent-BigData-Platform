@@ -1,11 +1,12 @@
-import logging
 import re
 from typing import TypeVar
 
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
+from Tools.log_settings import LogSetting
+
+logger = LogSetting.create(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 

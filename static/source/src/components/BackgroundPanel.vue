@@ -1,74 +1,144 @@
 <script setup>
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { listBackground } from '@/api/background'
+import { createTicket, openBackgroundSocket } from '@/api/background'
 
 const props = defineProps({
   threadId: { type: String, default: '' },
 })
 
 const records = ref([])
-const loading = ref(false)
+const status = ref('idle') // idle | connecting | open | retry
 const error = ref('')
-let timer = null
 
-const STATUS_TEXT = {
-  registered: '已登记',
-  running: '运行中',
-  completed: '已完成',
-  interrupted: '已中断',
-  failed: '失败',
+let socket = null
+let retryTimer = null
+let retries = 0
+let closedByUs = false
+
+function keepThread(record) {
+  return !props.threadId || record.main_thread_id === props.threadId
 }
 
-async function load() {
+function upsert(record) {
+  if (!record || !keepThread(record)) return
+  const index = records.value.findIndex((item) => item.task_id === record.task_id)
+  if (index >= 0) records.value[index] = record
+  else records.value = [record, ...records.value]
+}
+
+function scheduleReconnect() {
+  if (closedByUs) return
+  status.value = 'retry'
+  const delay = Math.min(1000 * 2 ** retries, 10000)
+  retries += 1
+  retryTimer = setTimeout(connect, delay)
+}
+
+function closeSocket() {
+  if (!socket) return
+  closedByUs = true
+  socket.onclose = null
+  socket.onmessage = null
+  socket.close()
+  socket = null
+}
+
+function cleanup() {
+  if (retryTimer) {
+    clearTimeout(retryTimer)
+    retryTimer = null
+  }
+  closeSocket()
+}
+
+async function connect() {
+  cleanup()
+  closedByUs = false
+
   if (!props.threadId) {
+    status.value = 'idle'
     records.value = []
     return
   }
-  loading.value = true
+
+  status.value = 'connecting'
   error.value = ''
+
+  let ticket = ''
   try {
-    records.value = (await listBackground(props.threadId)) || []
+    const data = await createTicket()
+    ticket = data?.ticket || ''
   } catch (e) {
-    error.value = e?.message || '加载后台任务失败'
-  } finally {
-    loading.value = false
+    error.value = e?.message || '获取连接凭证失败'
+    scheduleReconnect()
+    return
+  }
+  if (!ticket) {
+    error.value = '未拿到连接凭证'
+    scheduleReconnect()
+    return
+  }
+
+  socket = openBackgroundSocket(ticket)
+  socket.onopen = () => {
+    status.value = 'open'
+    retries = 0
+    error.value = ''
+  }
+  socket.onmessage = (event) => {
+    let message
+    try {
+      message = JSON.parse(event.data)
+    } catch {
+      return
+    }
+    if (message.type === 'snapshot') {
+      records.value = (message.records || []).filter(keepThread)
+    } else if (message.type === 'update') {
+      upsert(message.record)
+    }
+  }
+  socket.onclose = () => {
+    if (!closedByUs) scheduleReconnect()
+  }
+  socket.onerror = () => {
+    // 交给 onclose 触发重连
   }
 }
 
-function start() {
-  stop()
-  load()
-  // 深测动辄几分钟，5 秒一轮足够，也顺带每次请求都过一遍鉴权
-  timer = setInterval(load, 5000)
-}
-
-function stop() {
-  if (timer) {
-    clearInterval(timer)
-    timer = null
+watch(
+  () => props.threadId,
+  () => {
+    retries = 0
+    records.value = []
+    connect()
   }
-}
+)
 
-watch(() => props.threadId, start)
-onMounted(start)
-onBeforeUnmount(stop)
+onMounted(connect)
+onBeforeUnmount(() => {
+  closedByUs = true
+  cleanup()
+})
 </script>
 
 <template>
   <aside class="panel">
     <header class="head">
       <span>后台任务</span>
-      <button class="ghost small" :disabled="loading" @click="load">刷新</button>
+      <span class="state" :class="status">
+        {{ { idle: '未连接', connecting: '连接中…', open: '已连接', retry: '重连中…' }[status] }}
+      </span>
     </header>
 
     <p v-if="!threadId" class="hint">先选择一个会话</p>
     <p v-else-if="error" class="hint error">{{ error }}</p>
-    <p v-else-if="!records.length" class="hint">{{ loading ? '加载中…' : '暂无后台任务' }}</p>
+    <p v-else-if="!records.length" class="hint">暂无后台任务</p>
 
     <div v-else class="list">
       <article v-for="item in records" :key="item.task_id" class="card">
         <div class="row">
-          <span class="status" :class="item.status">{{ STATUS_TEXT[item.status] || item.status }}</span>
+          <span class="badge" :class="item.status">{{ item.status }}</span>
           <span class="time">{{ item.updated_at }}</span>
         </div>
         <p class="summary">{{ item.summary || '（无摘要）' }}</p>
@@ -98,9 +168,16 @@ onBeforeUnmount(stop)
   font-weight: 600;
   border-bottom: 1px solid var(--border);
 }
-.ghost.small {
-  padding: 4px 9px;
-  font-size: 12px;
+.state {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+.state.open {
+  color: var(--primary);
+}
+.state.retry {
+  color: var(--danger);
 }
 .hint {
   margin: 16px 14px;
@@ -130,18 +207,18 @@ onBeforeUnmount(stop)
   justify-content: space-between;
   gap: 8px;
 }
-.status {
+.badge {
   padding: 2px 8px;
   font-size: 11px;
   color: var(--text-muted);
   background: var(--bg);
   border-radius: 999px;
 }
-.status.running,
-.status.registered {
+.badge.running,
+.badge.registered {
   color: var(--primary);
 }
-.status.failed {
+.badge.failed {
   color: var(--danger);
 }
 .time {
@@ -151,7 +228,6 @@ onBeforeUnmount(stop)
 .summary {
   margin: 8px 0 0;
   font-size: 12px;
-  color: var(--text);
   line-height: 1.5;
 }
 .result {

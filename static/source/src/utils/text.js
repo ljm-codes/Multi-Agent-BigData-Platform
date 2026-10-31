@@ -1,3 +1,5 @@
+import MarkdownIt from 'markdown-it'
+
 const TITLE_KEY = 'thread_titles'
 
 /** 标题规则按需求：首个用户消息的前 10 个字符 */
@@ -38,6 +40,17 @@ export function roleOf(type) {
   return String(type || '').includes('Human') ? 'user' : 'assistant'
 }
 
+/** 把后端的 from_/name 归一成节点名，用于气泡上的 Agent 标签 */
+export function normalizeAgent(name) {
+  const raw = String(name || '').trim()
+  if (!raw) return ''
+  if (raw === 'code_verify' || raw === 'verify_agent' || raw.startsWith('ver_')) return 'code_verify'
+  if (raw === 'data_analysis' || raw === 'data_analysis_agent') return 'data_analysis'
+  if (raw === 'data_develop' || raw === 'data_develop_agent') return 'data_develop'
+  if (['work_end', 'dis_chat', 'handler', 'distribute_task_to_agent'].includes(raw)) return 'dis_chat'
+  return raw
+}
+
 export function escapeHtml(text) {
   return String(text ?? '')
     .replace(/&/g, '&amp;')
@@ -46,32 +59,54 @@ export function escapeHtml(text) {
     .replace(/"/g, '&quot;')
 }
 
+const md = new MarkdownIt({
+  html: false,
+  linkify: true,
+  breaks: true,
+})
+
+// 模型偶尔把 "## 完成情况" 接在句子里；markdown-it 只认行首标题，这里先拆行
+function normalizeInlineHeadings(text) {
+  return String(text || '').replace(/([^\n`])\s+(#{2,6})\s+/g, '$1\n\n$2 ')
+}
+
+const defaultFence = md.renderer.rules.fence
+md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+  const token = tokens[idx]
+  const info = (token.info || '').trim().split(/\s+/)[0].toLowerCase()
+  // 空代码块不渲染，避免出现空灰框
+  if (!token.content.trim()) return ''
+  // mermaid 交给前端 mermaid.run 处理
+  if (info === 'mermaid') {
+    return `<pre class="mermaid">${escapeHtml(token.content)}</pre>`
+  }
+  return defaultFence
+    ? defaultFence(tokens, idx, options, env, self)
+    : `<pre><code>${escapeHtml(token.content)}</code></pre>`
+}
+
+const defaultLinkOpen = md.renderer.rules.link_open
+  || ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options))
+md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  tokens[idx].attrSet('target', '_blank')
+  tokens[idx].attrSet('rel', 'noreferrer')
+  return defaultLinkOpen(tokens, idx, options, env, self)
+}
+
+// 宽表格放在可横向滚动的容器里
+const defaultTableOpen = md.renderer.rules.table_open
+  || ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options))
+const defaultTableClose = md.renderer.rules.table_close
+  || ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options))
+md.renderer.rules.table_open = (tokens, idx, options, env, self) =>
+  `<div class="md-table-wrap">${defaultTableOpen(tokens, idx, options, env, self)}`
+md.renderer.rules.table_close = (tokens, idx, options, env, self) =>
+  `${defaultTableClose(tokens, idx, options, env, self)}</div>`
+
 /**
- * 极简 markdown：代码块、行内代码、标题、粗体、链接（含 IDE:// 链接）、换行。
- * 只用 v-html 渲染这里生成的内容，所有文本都先 escape。
+ * 用 markdown-it 渲染；代码块中的 mermaid 由 MarkdownContent 之后调用 mermaid.run。
+ * 所有原始 HTML 关闭（html:false），链接走 markdown-it 的协议校验。
  */
 export function renderMarkdownLite(text) {
-  const escaped = escapeHtml(text)
-  const blocks = []
-
-  // 先抽出代码块，避免内部内容被后续规则破坏
-  let rest = escaped.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    const index = blocks.push(`<pre class="code"><code>${code}</code></pre>`) - 1
-    return `\u0000BLOCK${index}\u0000`
-  })
-
-  rest = rest
-    .replace(/^### (.*)$/gm, '<h4>$1</h4>')
-    .replace(/^## (.*)$/gm, '<h3>$1</h3>')
-    .replace(/^# (.*)$/gm, '<h3>$1</h3>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
-    .replace(/^&gt; (.*)$/gm, '<blockquote>$1</blockquote>')
-    .replace(/\n{2,}/g, '</p><p>')
-    .replace(/\n/g, '<br>')
-
-  rest = `<p>${rest}</p>`
-  rest = rest.replace(/\u0000BLOCK(\d+)\u0000/g, (_, i) => blocks[Number(i)] || '')
-  return rest
+  return md.render(normalizeInlineHeadings(text))
 }

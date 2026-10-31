@@ -1,0 +1,194 @@
+name: multiagent-bigdata
+
+x-app-build: &app-build
+  context: ..
+  dockerfile: docker/app/Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-multiagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-multiagent}
+      POSTGRES_DB: ${POSTGRES_DB:-multiagentbigdataplatform}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../sql/postgresql.sql:/sql/postgresql.sql:ro
+      - ./postgres/init/01-schema.sh:/docker-entrypoint-initdb.d/01-schema.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-multiagent} -d ${POSTGRES_DB:-multiagentbigdataplatform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    mem_limit: 256m
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-multiagent}"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-multiagent} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    mem_limit: 128m
+
+  sandbox-init:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    image: multiagent-sandbox:local
+    command: ["/bin/sh", "/usr/local/bin/init-sandbox.sh"]
+    volumes:
+      - sandbox_env:/export/server/miniconda3
+      - ./sandbox/init-sandbox.sh:/usr/local/bin/init-sandbox.sh:ro
+    restart: "no"
+
+  node1:
+    build:
+      context: ./cluster
+      dockerfile: Dockerfile
+    image: multiagent-cluster:local
+    hostname: node1
+    environment:
+      ROLE: all
+      SSH_PASSWORD: ${SSH_PASSWORD:-multiagent}
+    volumes:
+      - hdfs_data_node1:/data
+      - sandbox_env:/export/server/miniconda3:ro
+    ports:
+      - "8088:8088"
+      - "9870:9870"
+    depends_on:
+      sandbox-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://node1:9870/ >/dev/null && curl -fsS http://node1:8088/ >/dev/null && curl -fsS http://node1:8042/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 4g
+
+  node2:
+    profiles: ["full"]
+    build:
+      context: ./cluster
+      dockerfile: Dockerfile
+    image: multiagent-cluster:local
+    hostname: node2
+    environment:
+      ROLE: worker
+      SSH_PASSWORD: ${SSH_PASSWORD:-multiagent}
+    volumes:
+      - hdfs_data_node2:/data
+      - sandbox_env:/export/server/miniconda3:ro
+    depends_on:
+      sandbox-init:
+        condition: service_completed_successfully
+      node1:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8042/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: 3g
+
+  app:
+    build: *app-build
+    image: multiagent-app:local
+    hostname: app
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONPATH: /app
+    volumes:
+      - ./config/config.docker.yaml:/app/config.yaml:ro
+      - ../tmp_code:/app/tmp_code
+      - ../log:/app/log
+      - app_cache:/app/cache
+      - app_tmp:/app/tmp
+      - m2:/root/.m2
+      - sandbox_env:/export/server/miniconda3
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sandbox-init:
+        condition: service_completed_successfully
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 2g
+
+  checker:
+    profiles: ["workers"]
+    build: *app-build
+    image: multiagent-app:local
+    command: ["python", "-c", "from Tools.main_check_tool import main_check; main_check()"]
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONPATH: /app
+    volumes:
+      - ./config/config.docker.yaml:/app/config.yaml:ro
+      - ../log:/app/log
+      - app_tmp:/app/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      node1:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 256m
+
+  ops:
+    profiles: ["workers"]
+    build: *app-build
+    image: multiagent-app:local
+    command: ["python", "agent/operations_agent_run.py"]
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONPATH: /app
+    volumes:
+      - ./config/config.docker.yaml:/app/config.yaml:ro
+      - ../log:/app/log
+      - app_tmp:/app/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      node1:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 512m
+
+volumes:
+  pg_data:
+  sandbox_env:
+  hdfs_data_node1:
+  hdfs_data_node2:
+  app_cache:
+  app_tmp:
+  m2:

@@ -25,7 +25,7 @@ from Tasks.background_broker import (
     background_registry,
     outcome_notice,
 )
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 
 logger = LogSetting.create(__name__)
 

@@ -1,21 +1,25 @@
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 from typing import Any
 
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from load_config.config import ROOT_BASE_DIR_PATH
 
 logger = LogSetting.create(__name__)
-# 检查 mvn 是否在环境变量中
-result = subprocess.run("where mvn", shell=True, capture_output=True, text=True)
+# 检查 mvn 是否在环境变量中（Linux 没有 where，用 shutil.which 跨平台）
+_project_mvn = (
+    ROOT_BASE_DIR_PATH / "Maven" / "mvn-3.9.9" / "bin"
+    / ("mvn.cmd" if os.name == "nt" else "mvn")
+)
 is_use_project_mvn = False
-if result.returncode != 0:
-    logger.warning(f"mvn 不在环境变量中: {result.stderr}，尝试使用项目默认的mvn包")
+if shutil.which("mvn") is None:
+    logger.warning("mvn 不在环境变量中，尝试使用项目默认的mvn包")
     mvn_result = subprocess.run(
-        [ROOT_BASE_DIR_PATH / "Maven" / "mvn-3.9.9" / "bin" / "mvn.cmd", "-v"],
-        shell=True,
+        [str(_project_mvn), "-v"],
+        shell=(os.name == "nt"),
         capture_output=True,
         text=True
     )
@@ -74,14 +78,14 @@ def run_mvn_command(command: str, path: str) -> tuple[int, str]:
 
     cmd_list = [cmd for cmd in cmd_list if cmd != "mvn"]
     if is_use_project_mvn:
-        command_list = [ROOT_BASE_DIR_PATH / "Maven" / "mvn-3.9.9" / "bin" / "mvn.cmd", *cmd_list]
+        command_list = [_project_mvn, *cmd_list]
     else:
         command_list = ["mvn", *cmd_list]
     try:
         res = subprocess.run(
             command_list,
             cwd=path,
-            shell=True,
+            shell=(os.name == "nt"),
             capture_output=True,
             text=True,
             encoding="utf-8",  # 显式指定编码, 避免 Windows 默认 cp936
@@ -121,7 +125,7 @@ async def arun_mvn_command(
 
     cmd_list = [cmd for cmd in cmd_list if cmd != "mvn"]
     if is_use_project_mvn:
-        command_list = [ROOT_BASE_DIR_PATH / "Maven" / "mvn-3.9.9" / "bin" / "mvn.cmd", *cmd_list]
+        command_list = [_project_mvn, *cmd_list]
     else:
         command_list = ["mvn", *cmd_list]
     # create_subprocess_shell 只接收一条命令字符串；传 *command_list 会把第二个参数当成 stdin

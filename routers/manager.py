@@ -15,9 +15,10 @@ from sqlalchemy.dialects.postgresql import insert
 
 from SPO.postgresql_model import AdminInfo, RecommendApprovalTable
 from SPO.route_results import RouteResponse, ResultCode
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.share_check_tool import redis_con
+from Tools.ws_registry import close_user_sockets
 
 route = APIRouter()
 email_re = r"\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*"
@@ -109,7 +110,10 @@ async def build_recommend_link(request: Request, recommend_info: RecommendInfo) 
         return RouteResponse.error(msg="推荐人权限等级不足，不能进行推荐", code=ResultCode.PERMISSION_ERROR)
     if permission < recommend_info.recommended_person_level:
         return RouteResponse.error(msg="不允许出现被推荐人的权限等级高于自己", code=ResultCode.PERMISSION_ERROR)
-    recommend_id = token_info.get("id")
+    try:
+        recommend_id = int(token_info.get("id"))
+    except (TypeError, ValueError):
+        return RouteResponse.error(msg="token 信息错误，请重新登录", code=ResultCode.UNAUTHORIZED)
     if recommend_id != recommend_info.recommend_id or token_info.get(
             "username") != recommend_info.recommend_name:
         return RouteResponse.error(msg="推荐人信息与token不匹配", code=ResultCode.UNAUTHORIZED)
@@ -132,7 +136,6 @@ async def build_recommend_link(request: Request, recommend_info: RecommendInfo) 
     try:
         async with AsyncSessionLocal() as session:
             stmt = insert(RecommendApprovalTable).values(
-                id=recommend_id,
                 recommend_id=recommend_id,
                 reason=recommend_info.recommend_reason,
                 level=permission,
@@ -261,6 +264,11 @@ async def set_account_status(request: Request, body: AccountStatusInfo) -> Route
                                    code=ResultCode.PERMISSION_ERROR)
     if str(token_info.get("id")) == str(body.id):
         return RouteResponse.error(msg="不能修改自己的账号状态", code=ResultCode.PERMISSION_ERROR)
+    # 先踢下线（best-effort：即使关连接失败也要把状态改掉，中间件下次请求会拦住）
+    try:
+        await close_user_sockets(str(body.id))
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"踢下线管理员 {body.id} 失败：{e}")
     try:
         with SessionLocal() as session:
             exists = session.scalar(select(func.count(AdminInfo.id)).where(AdminInfo.id == body.id)) or 0
@@ -390,7 +398,7 @@ async def get_log_info(
             payload["log_data"] = []
             payload["total"] = 0
             return RouteResponse.ok(msg="获取审批日志成功", data=payload)
-        payload["log_data"] = result
+        payload["log_data"] = [dict(row) for row in result]
         payload["total"] = len(result)
         return RouteResponse.ok(msg="获取审批日志成功", data=payload)
     except Exception as e:
@@ -508,7 +516,7 @@ async def login(admin_info: AdminInputInfo) -> RouteResponse:
         # 无需手动设置过期时间，因为密钥会轮训更新
         token = jwt.encode(
             payload,
-            key=redis_con.hget('jwt_key', 'new').encode('utf-8'),
+            key=redis_con.hget('jwt_key', 'new'),
             algorithm='HS256'
         )
         return RouteResponse.ok(msg="登录成功", data={
@@ -529,7 +537,7 @@ async def update_token(request: Request, email: str, old_token: str) -> RouteRes
     # 优先验证 old_token 是否真的过期
     try:
         # 若确实过期了，那么将会理应来说，会成功解析到 old_key
-        old_key = redis_con.hget('jwt_key', 'old').encode('utf-8')
+        old_key = redis_con.hget('jwt_key', 'old')
         jwt.decode(old_token, old_key, algorithms=['HS256'])
     except jwt.InvalidTokenError:
         logger.warning(f"token无效，或者该token还没过期，不用更新：{old_token}")
@@ -558,7 +566,7 @@ async def update_token(request: Request, email: str, old_token: str) -> RouteRes
         # 无需手动设置过期时间，因为密钥会轮训更新
         token = jwt.encode(
             payload,
-            key=redis_con.hget('jwt_key', 'new').encode('utf-8'),
+            key=redis_con.hget('jwt_key', 'new'),
             algorithm='HS256'
         )
         return RouteResponse.ok(msg="token更新成功", data={

@@ -40,7 +40,7 @@ from sqlalchemy import select, func
 
 from SPO.check_result import CheckOutcome
 from SPO.postgresql_model import CheckLog
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.db import SessionLocal
 from Tools.alarm_sender import send_error_email
 from Tools.scheduler import run_cycle

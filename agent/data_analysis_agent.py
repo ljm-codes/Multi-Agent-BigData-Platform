@@ -7,18 +7,18 @@
 import tokenize
 from datetime import datetime
 from pathlib import Path
-from typing import cast, NotRequired
+from typing import Any, cast, NotRequired
 from uuid import uuid4
 
 from langchain.agents import create_agent, AgentState
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Send
 
 from SPO.main_agent_state_model import AgentDevelopInputState, MainStateContext, CodeVerifyAgentInputState, \
-    DevelopGraphErrorState, WorkEndState
-from Tools import LogSetting
+    DevelopGraphErrorState, WorkEndState, content_text
+from Tools.log_settings import LogSetting
 from Tools.data_analysis_agent_tools import AGENT_NAME as ANALYSIS_AGENT, analysis_business_files
 from Tools.registry import get_tools
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
@@ -46,7 +46,7 @@ class CodeAnalysisState(AgentState):
 async def big_data_analysis_code_agent(
         state: AgentDevelopInputState,
         runtime: Runtime
-) -> CodeVerifyAgentInputState | DevelopGraphErrorState:
+) -> DevelopGraphErrorState | dict[str, Any] | CodeVerifyAgentInputState:
     task_list = state.get("task_list") or []
     task_num = state.get("task_num")
 
@@ -106,7 +106,10 @@ async def big_data_analysis_code_agent(
             "InputT",
             in_state
         ),
-        config={"configurable": {"thread_id": runtime.context.thread_id}},
+        config={
+            "configurable": {"thread_id": runtime.context.thread_id},
+            "tags": ["agent:data_analysis"],
+        },
         context=cast(
             "ContextT",
             MainStateContext(
@@ -117,10 +120,17 @@ async def big_data_analysis_code_agent(
             )
         ),
     )
-    logger.info(f"数据分析Agent的完整回复为：{result}")
+    # logger.info(f"数据分析Agent的完整回复为：{result}")
+    final_text = ""
+    for message in reversed(result.get("messages", [])):
+        if isinstance(message, AIMessage):
+            text = content_text(message.content)
+            if text.strip():
+                final_text = text
+                break
     code_verify_in_state = CodeVerifyAgentInputState(
         source='data_analysis_agent',
-        source_msg=result["messages"][-1].content,
+        source_msg=final_text or content_text(result["messages"][-1].content),
         app_type="spark",
         project_name=result.get("project_name"),
         date=date,
@@ -129,6 +139,12 @@ async def big_data_analysis_code_agent(
     )
     if repair_num:
         code_verify_in_state["repair_num"] = repair_num
+    if final_text.strip():
+        # 把用户可见的最终回复写回父图 messages；Send 的临时输入不受影响
+        return {
+            **code_verify_in_state,
+            "messages": [AIMessage(content=final_text, name="data_analysis")],
+        }
     return code_verify_in_state
 
 

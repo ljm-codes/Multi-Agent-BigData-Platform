@@ -179,6 +179,9 @@ class AdminThread(Base):
     is_archive: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    is_top: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     create_time: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=text("now()"),

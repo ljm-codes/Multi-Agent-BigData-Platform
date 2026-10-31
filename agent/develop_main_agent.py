@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import cast, List, Literal
+from typing import Any, cast, List, Literal
 
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.chat_models import init_chat_model
@@ -12,9 +12,10 @@ from langgraph.types import Command, Send
 from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import DevelopAgentMainState, DevelopAgentOutputState, DevelopAgentInputState, \
-    DevelopGraphErrorState, AgentDevelopInputState, WorkEndState, MainStateContext, CodeVerifyAgentInputState
+    DevelopGraphErrorState, AgentDevelopInputState, WorkEndState, MainStateContext, CodeVerifyAgentInputState, \
+    agent_label
 from Tasks.background_broker import background_registry
-from Tools import LogSetting
+from Tools.log_settings import LogSetting
 from Tools.struct_analy import parse_route_message
 from agent.code_verify_agent import verify_agent
 from agent.data_analysis_agent import big_data_analysis_code_agent, preliminary_verify as preliminary_analysis_verify
@@ -191,7 +192,7 @@ async def dispatch_chat(state: DevelopAgentMainState, runtime: Runtime) -> List[
         tool_choice = dis_req.tool_choice or ("any" if not dis_req.tools else None)
         model_ = dis_req.model.bind_tools(tools, tool_choice=tool_choice)
 
-        dis_res = await model_.ainvoke(mags)
+        dis_res = await model_.ainvoke(mags, config={"tags": ["agent:dis_chat"]})
         route = _parse_route_message(dis_res)
         if route is None:
             if isinstance(dis_res, AIMessage) and dis_res.tool_calls:
@@ -342,8 +343,8 @@ def distribute_task_to_agent(state: DevelopAgentMainState, runtime: Runtime) -> 
     return send_list
 
 
-def work_end(state: WorkEndState) -> DevelopAgentOutputState:
-    desc_msg = state.get("desc", "")
+def work_end(state: WorkEndState) -> dict[str, Any]:
+    desc_msg = state.get("desc") or ""
     metadata_dict = {
         "type": state.get("type"),
         "from_": state.get("from_"),
@@ -361,11 +362,17 @@ def work_end(state: WorkEndState) -> DevelopAgentOutputState:
         metadata_dict["thread_title"] = thread_title
     if request_text := state.get("request_text"):
         metadata_dict["request_text"] = request_text
-    return DevelopAgentOutputState(
-        output_msg=desc_msg,
-        out_time=datetime.now(),
-        metadata=metadata_dict,
-    )
+    result = {
+        "output_msg": desc_msg,
+        "out_time": datetime.now(),
+        "metadata": metadata_dict,
+    }
+    if desc_msg.strip():
+        # 用户可见的最终回复写回父图 messages；output_schema 只影响 ainvoke 的返回值
+        result["messages"] = [
+            AIMessage(content=desc_msg, name=agent_label(state.get("from_"))),
+        ]
+    return result
 
 
 builder = StateGraph(

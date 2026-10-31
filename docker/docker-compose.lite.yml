@@ -1,0 +1,86 @@
+name: multiagent-lite
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-multiagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-multiagent}
+      POSTGRES_DB: ${POSTGRES_DB:-multiagentbigdataplatform}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../sql/postgresql.sql:/sql/postgresql.sql:ro
+      - ./postgres/init/01-schema.sh:/docker-entrypoint-initdb.d/01-schema.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-multiagent} -d ${POSTGRES_DB:-multiagentbigdataplatform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    mem_limit: 256m
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-multiagent}"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-multiagent} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    mem_limit: 128m
+
+  sandbox-init:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    image: multiagent-sandbox:local
+    command: ["/bin/sh", "/usr/local/bin/init-sandbox.sh"]
+    volumes:
+      - sandbox_env:/export/server/miniconda3
+      - ./sandbox/init-sandbox.sh:/usr/local/bin/init-sandbox.sh:ro
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/app/Dockerfile
+    image: multiagent-app:local
+    hostname: app
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONPATH: /app
+    volumes:
+      - ./config/config.apponly.yaml:/app/config.yaml:ro
+      - ../tmp_code:/app/tmp_code
+      - ../log:/app/log
+      - app_cache:/app/cache
+      - app_tmp:/app/tmp
+      - m2:/root/.m2
+      - sandbox_env:/export/server/miniconda3
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sandbox-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 2g
+
+volumes:
+  pg_data:
+  sandbox_env:
+  app_cache:
+  app_tmp:
+  m2:

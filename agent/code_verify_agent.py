@@ -13,7 +13,7 @@ import zipfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast, TypedDict, NotRequired, Literal, Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
 from hdfs import InsecureClient
@@ -31,13 +31,15 @@ from SPO.main_agent_state_model import CodeVerifyAgentInputState, CodeVerifyAgen
     DevelopGraphErrorState, MainStateContext
 from Tasks.background_broker import background_broker, background_registry, background_thread_id
 from Tasks.build_run_custom_tasks import TaskSupervisor
-from Tools import LogSetting, node_ssh
+from Tools import node_ssh
+from Tools.log_settings import LogSetting
 from Tools.code_verify_agent_tools import AGENT_NAME as CVA
 from Tools.data_analysis_agent_tools import analysis_business_files, submit_redis_key
 from Tools.registry import get_tools
 from Tools.run_command import arun_mvn_command, arun_python_command, run_mvn_command
 from Tools.share_check_tool import redis_con, manager
 from Tools.struct_analy import parse_route_message
+from Tools.mermaid_check import check_and_repair_mermaid
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.code_verify_agent_middleware import PerceptionBackground
 from middleware.compose import chain_model_call_wrappers, ComposedModelResult, run_before_model, \
@@ -79,7 +81,9 @@ logger = LogSetting.create(__name__)
 with open(Path(__file__).parent / "prompt" / "code_verify_agent.md", "r", encoding="utf-8") as f:
     _verify_system_prompt = f.read()
 
-_hdfs_client = InsecureClient(_hdfs_webhdfs_url, user=_hdfs_webhdfs_user)
+# 集群开关：false 时禁用 HDFS/ssh 等集群依赖（HDFS 客户端置 None）
+CONNECT_TO_CLUSTER = bool((config.get("app") or {}).get("connect_to_cluster", True))
+_hdfs_client = None if not CONNECT_TO_CLUSTER else InsecureClient(_hdfs_webhdfs_url, user=_hdfs_webhdfs_user)
 
 code_verify_agent_tools = get_tools(CVA)
 verify_agent_middleware = [PerceptionBackground(background_broker)]
@@ -124,7 +128,12 @@ class CodeSnippet(BaseModel):
 
 class CodeSummary(BaseModel):
     data_result: str = Field(default="", description="数据验证结果，轻量、突出异常值")
-    mermaid_flowgraph: str = Field(default="", description="Mermaid 语法的文字版流程图")
+    mermaid_flowgraph: str = Field(
+        default="",
+        description="Mermaid 语法的文字版流程图；第一行 graph TD/flowchart TD；"
+                    "一行只写一个节点/一条边；标签含空格、括号、加号时用双引号，"
+                    "如 A[\"transformDataFrame S + lit(P)\"]；不要代码围栏",
+    )
     snippets: list[CodeSnippet] = Field(default_factory=list, description="按优先级从高到低排序的代码片段")
 
 
@@ -411,6 +420,10 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
             break
     if not jar_file:
         return {"type": "error", "msg": f"未找到 {target_path} 下的 jar 包", "app_type": app_type}
+    if not CONNECT_TO_CLUSTER:
+        return {"type": "info",
+                "msg": f"集群被禁用，未上传/提交 jar：{jar_file}",
+                "app_type": app_type}
     # 提交 jar 包到指定的hdfs:///app/{app_type}/jar
     target_dir = f"/app/{app_type}/jar"
     cmd_dir = f"/app/{app_type}/cmd"
@@ -462,6 +475,11 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     # 上传至 hdfs
     _hdfs_client.upload(cmd_dir, app_path / f"{app_name}.cmd", overwrite=True)
     # 运行
+    if not CONNECT_TO_CLUSTER:
+        return {"type": "info",
+                "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群并运行，可参考命令：{complete_command}"
+                        f"\n项目在于：{app_path}"),
+                "app_type": app_type}
     from urllib.parse import urlparse
     host = urlparse(manager).hostname or ""
     res = node_ssh.run(host, complete_command, timeout=120)
@@ -478,6 +496,8 @@ def _hdfs_uri(path: str) -> str:
 
 
 def _hdfs_ensure_dir(path: str) -> None:
+    if _hdfs_client is None:  # 集群禁用：不触碰 HDFS
+        return
     # status 存在时返回 dict（可能是空 dict），不存在时返回 None —— 不能用真假判断
     if _hdfs_client.status(path, strict=False) is None:
         _hdfs_client.makedirs(path)
@@ -485,6 +505,8 @@ def _hdfs_ensure_dir(path: str) -> None:
 
 def _hdfs_upload_file(target: str, local: str | Path) -> str:
     """上传单个文件到 HDFS 的完整目标路径，已存在时覆盖"""
+    if _hdfs_client is None:  # 集群禁用：只返回约定路径，不真上传
+        return target
     parent = target.rsplit("/", 1)[0]
     if parent:
         _hdfs_ensure_dir(parent)
@@ -494,7 +516,7 @@ def _hdfs_upload_file(target: str, local: str | Path) -> str:
 
 def _spark_archive_conf() -> str | None:
     """预上传的 spark jars 归档；HDFS 上不存在就不加，免得 spark-submit 起不来"""
-    if not SPARK_ARCHIVE:
+    if _hdfs_client is None or not SPARK_ARCHIVE:  # 集群禁用：不加载归档
         return None
     archive_path = urlparse(SPARK_ARCHIVE).path if "://" in SPARK_ARCHIVE else SPARK_ARCHIVE
     if not archive_path:
@@ -628,6 +650,11 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
         cmd_local.write_text(complete_command, encoding="utf-8")
         cmd_hdfs = _hdfs_upload_file(f"{cmd_dir}/{app_name}.cmd", cmd_local)
 
+        if not CONNECT_TO_CLUSTER:
+            return {"type": "info",
+                    "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群，并运行，可参考命令：{complete_command}"
+                            f"\n项目在于：{app_path}"),
+                    "app_type": app_type}
         host = urlparse(manager).hostname or ""
         res = node_ssh.run(host, complete_command, timeout=60)
         # node_ssh 的 ok 只代表 ssh 执行完了；命令本身失败要看 rc
@@ -657,26 +684,62 @@ def _splicing_doc(doc_info: dict) -> dict:
                 "app_type": app_type}
     res_lines = []
     data_result = doc_info.get("data_result")
-    mermaid_flowgraph = doc_info.get("mermaid_flowgraph")
+    raw_mermaid = doc_info.get("mermaid_flowgraph") or ""
+    mermaid_flowgraph, mermaid_error = check_and_repair_mermaid(raw_mermaid)
     snippets = doc_info.get("snippets", [])
+
+    # 代码片段里的 file_path 是项目相对路径；IDE 链接要补上真实项目根目录
+    date = doc_info.get("date")
+    project_name = doc_info.get("project_name")
+    project_dir = None
+    if date and project_name:
+        project_dir = (
+            ROOT_BASE_DIR_PATH / "tmp_code" / str(app_type) / str(date) / str(project_name)
+        ).resolve()
 
     res_lines.append("## 数据结果\n")
     res_lines.append(data_result or "无" + "\n")
     res_lines.append("## 流程图\n")
-    res_lines.append(f"```mermaid\n{mermaid_flowgraph}\n```\n" if mermaid_flowgraph else "无结果\n")
+    if mermaid_flowgraph:
+        res_lines.append(f"```mermaid\n{mermaid_flowgraph}\n```\n")
+    elif raw_mermaid:
+        res_lines.append("流程图生成失败（已省略）\n")
+    else:
+        res_lines.append("无结果\n")
     if snippets:
         res_lines.append("## 核心代码片段（按优先级）\n")
         for snippet in snippets:
-            res_lines.append(
-                f"### {snippet.get('file_path')} : {snippet.get('start_line')}-{snippet.get('end_line')}\n")
+            file_path = (snippet.get("file_path") or "").strip()
+            start_line = snippet.get("start_line")
+            end_line = snippet.get("end_line")
+            snippet_text = (snippet.get("snippet") or "").strip()
+
+            if file_path:
+                res_lines.append(f"### {file_path} : {start_line}-{end_line}\n")
             res_lines.append(f"**优先级**：{snippet.get('priority')}")
-            res_lines.append(f"```{'java' if app_type == 'flink' else 'python'}\n{snippet.get('snippet')}\n```\n")
+            # 模型没给片段内容（或只有空白）时不输出空 ``` 围栏
+            if snippet_text:
+                lang = "java" if app_type == "flink" else "python"
+                res_lines.append(f"```{lang}\n{snippet_text}\n```\n")
             if note := snippet.get("note"):
                 res_lines.append(f"> {note}\n")
-            res_lines.append(
-                f"[在 IDE 中查看](IDE://{snippet.get('file_path')}"
-                f"#L{snippet.get('start_line')}-L{snippet.get('end_line')})\n")
-    return {"type": "info", "msg": "\n".join(res_lines), "app_type": app_type}
+            if file_path:
+                if project_dir:
+                    target = (project_dir / file_path).resolve()
+                    target_url = quote(target.as_posix(), safe="/:")
+                else:
+                    # 缺 date/project_name 时保持相对路径，交给前端用 projectDir 拼
+                    target_url = quote(file_path, safe="/:")
+                # 路径里有空格（如 “pycharm study”），必须编码；# 只留给行号锚点
+                res_lines.append(
+                    f"[在 IDE 中查看](IDE://{target_url}"
+                    f"#L{start_line}-L{end_line})\n")
+    return {
+        "type": "info",
+        "msg": "\n".join(res_lines),
+        "app_type": app_type,
+        "mermaid_error": mermaid_error,
+    }
 
 
 def _error_dict_to_str(error_dict: dict) -> dict:
@@ -718,6 +781,7 @@ def _verify_input_handler(state: CodeVerifyAgentInputState) -> CodeVerifyAgentMa
         app_type=app_type,
         source=code_source,
         original_task_list=state.get("original_task_list") or [],
+        mermaid_retry_num=0,  # 每次质检只允许重修一次流程图
     )
     if background_msg:
         # 后台回流是一次全新判断：清掉上一轮 handed_off 留下的结果和失败计数
@@ -965,6 +1029,7 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
             "deep_timeout": hard_timeout,
             "date": date,
             "project_name": p_name,
+            "mermaid_retry_num": state.get("mermaid_retry_num") or 0,
         }
         if repair_num := state.get("repair_num"):
             code_summary["repair_num"] = repair_num
@@ -1062,6 +1127,23 @@ def _verify_manual(code_summary: dict, runtime: Runtime) -> Command:
         to_manual_dict = _error_dict_to_str(code_summary)
     else:
         to_manual_dict = _splicing_doc(code_summary)
+    mermaid_error = to_manual_dict.pop("mermaid_error", "")
+    retry_num = code_summary.get("mermaid_retry_num") or 0
+    if mermaid_error and retry_num < 1:
+        # 流程图修不好时先回模型重修一次；错误信息必须一并带给模型
+        logger.warning(f"Mermaid 校验失败，回退重修一次：{mermaid_error}")
+        return Command(
+            goto="ver_chat",
+            update={
+                "messages": [HumanMessage(content=(
+                    "上一次输出的 mermaid_flowgraph 未通过 Mermaid 语法校验，请修正后重新调用 "
+                    "VerifyAgentOutClass（goto=user），其它字段保持不变。\n"
+                    f"校验错误：{mermaid_error}\n"
+                    f"原始流程图：\n{code_summary.get('mermaid_flowgraph') or ''}"
+                ))],
+                "mermaid_retry_num": retry_num + 1,
+            },
+        )
     date = code_summary.get("date")
     p_name = code_summary.get("project_name")
     app_type = code_summary.get("app_type")

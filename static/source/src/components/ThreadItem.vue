@@ -73,7 +73,7 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick))
       ref="inputRef"
       v-model="draft"
       class="rename-input"
-      maxlength="30"
+      maxlength="10"
       @click.stop
       @keydown.enter.prevent="commitRename"
       @keydown.esc.prevent="cancelRename"
