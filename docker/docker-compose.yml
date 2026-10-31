@@ -39,6 +39,7 @@ services:
       context: ./sandbox
       dockerfile: Dockerfile
     image: multiagent-sandbox:local
+    command: ["/bin/sh", "/usr/local/bin/init-sandbox.sh"]
     volumes:
       - sandbox_env:/export/server/miniconda3
       - ./sandbox/init-sandbox.sh:/usr/local/bin/init-sandbox.sh:ro
