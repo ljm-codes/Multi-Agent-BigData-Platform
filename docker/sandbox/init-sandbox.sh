@@ -3,6 +3,11 @@ set -e
 
 ENV=/export/server/miniconda3/envs/spark_study
 
+# 卷里可能是上次中断留下的坏环境（例如 python3.8 被覆盖成包装脚本）
+if [ -e "$ENV" ] && ! "$ENV/bin/python3.8" --version >/dev/null 2>&1; then
+    rm -rf "$ENV"
+fi
+
 if [ ! -x "$ENV/bin/python3.8" ]; then
     mkdir -p "$ENV"
     cp -a /usr/local/. "$ENV/"
