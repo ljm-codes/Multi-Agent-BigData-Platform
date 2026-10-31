@@ -2,10 +2,7 @@ FROM python:3.8-slim-bullseye
 
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV PIP_DEFAULT_TIMEOUT=120
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+ENV PIP_ONLY_BINARY=:all:
 
 COPY requirements.txt /opt/sandbox/requirements.txt
 RUN python -m pip install --no-cache-dir --upgrade pip \
