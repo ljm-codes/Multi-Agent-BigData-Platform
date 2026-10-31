@@ -6,6 +6,8 @@ ENV=/export/server/miniconda3/envs/spark_study
 if [ ! -x "$ENV/bin/python3.8" ]; then
     mkdir -p "$ENV"
     cp -a /usr/local/. "$ENV/"
+    # /usr/local/bin/python3 原本指向 python3.8，直接写会覆盖二进制
+    rm -f "$ENV/bin/python3"
     cat > "$ENV/bin/python3" <<'EOF'
 #!/bin/sh
 export PYTHONHOME=/export/server/miniconda3/envs/spark_study
