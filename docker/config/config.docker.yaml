@@ -33,6 +33,7 @@ hadoop:
     manager: node1:8088
     proxy: node1:8089
     poll_interval: 30
+    scheduler_type: fair
     nm_log_dirs: /data/yarn/log
     remote_app_log_dir: /tmp/logs
     log_user: hadoop

@@ -1,15 +1,22 @@
 import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, List, TypedDict, NotRequired
+from typing import Literal, List, TypedDict, NotRequired, Optional
 
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolCall, RemoveMessage, BaseMessage, \
     ToolMessage
+from langgraph.cache.sqlite import SqliteCache
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command, Send
+from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.postgres import AsyncPostgresStore
+from langgraph.types import Command, Send, Checkpointer
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
@@ -27,16 +34,19 @@ from Tools.alarm_sender import send_warning_msg
 from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.registry import get_tools, get_priority_tools
 from Tools.struct_analy import parse_route_message
-from load_config.config import config
+from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.compose import run_before_model, chain_model_call_wrappers, ComposedModelResult, run_after_model, \
     chain_tool_call_wrappers
 from middleware.fail_tool_middleware import ToolFailMarkMiddleware, fail_situation
 
 model_config = config.get("model")
+_postgres_conf = (config.get('databases') or {}).get('postgres') or {}
+_postgres_url = f"postgresql://{_postgres_conf.get('user')}:{_postgres_conf.get('password')}@{_postgres_conf.get('host')}:{_postgres_conf.get('port')}/{_postgres_conf.get('db')}?sslmode=disable"
+_pg_enabled = bool(_postgres_conf.get('enabled', True)) if _postgres_conf else False
 
 model = init_chat_model(
     model=model_config.get("name"),
-    **model_config.get("params")
+    **get_model_params(),
 )
 
 operations_middleware = [ToolFailMarkMiddleware()]
@@ -322,12 +332,12 @@ def app_summary(state: SummaryMsgModel) -> dict | None:
                     CheckLog.app_id == app_id
                 )
             )
-            check_logs = session.execute(stmt).fetchall()
-            for check_log in check_logs:
+            # 要用 scalars：execute(...).fetchall() 拿到的是 Row，不是 ORM 对象，
+            # 给 Row 赋属性会 AttributeError: can't set attribute
+            for check_log in session.scalars(stmt).all():
                 check_log.is_solved = True
                 check_log.status = "DONE"
                 check_log.update_time = datetime.now(timezone.utc)
-
             session.commit()
         return None
     except Exception as e:
@@ -489,6 +499,8 @@ async def chat_end(
                 )
             )
             await session.execute(stmt)
+            # AsyncSession 的上下文管理不会自动 commit；不提交 = delete 回滚，锁永远不释放
+            await session.commit()
     except Exception as e:
         logger.exception(f"在尝试解锁应用占用锁时出错 {type(e).__name__}: {e}")
         return OperationsAndReconcileOutputState(
@@ -544,10 +556,69 @@ _builder.add_edge("summary", "chat_end")
 _builder.add_edge("handover", "chat_end")
 _builder.add_edge("chat_end", END)
 
-operations_agent = _builder.compile()
+operations_agent = None
+
+
+async def create_ops_graph(
+        graph_build: StateGraph,
+        store: Optional[BaseStore] = None,
+        check: Optional[Checkpointer] = None
+):
+    """
+    当 store 与 check 均为None时，默认使用InMemoryStore和InMemorySaver
+    """
+    global operations_agent
+    if store is None:
+        store = InMemoryStore()
+    if check is None:
+        check = InMemorySaver()
+    if hasattr(check, 'setup'):
+        await check.setup()
+    if hasattr(store, 'setup'):
+        await store.setup()
+    operations_agent = graph_build.compile(
+        checkpointer=check,
+        store=store,
+        cache=SqliteCache(path=ROOT_BASE_DIR_PATH / 'cache/ops_agent_cache.db')
+    )
+
+
+@asynccontextmanager
+async def ops_graph_scope():
+    """
+    和 main.py 的 _graph_scope 同款: 连接要活到 lifespan 结束
+
+    不能像旧 get_ops_agent 那样在 async with 里建完就退出 ——
+    退出时 saver/store 的连接会关闭, 编译出的图之后一用就失败。
+    """
+    global operations_agent
+    try:
+        if _pg_enabled:
+            async with AsyncPostgresSaver.from_conn_string(_postgres_url) as check, \
+                    AsyncPostgresStore.from_conn_string(_postgres_url) as store:
+                await create_ops_graph(_builder, store=store, check=check)
+                yield
+        else:
+            logger.warning("不建议未使用 PostgreSQL 时创建操作代理，因为这会导致数据丢失")
+            await create_ops_graph(_builder)
+            yield
+    finally:
+        # 连接已关, 不能再把这张图交出去
+        operations_agent = None
+
+
+def get_ops_agent():
+    """取已编译的图; 未初始化时直接抛错, 不把 None 传下去"""
+    if operations_agent is None:
+        raise RuntimeError(
+            "operations_agent 尚未初始化（应在 lifespan 的 ops_graph_scope 内启动）"
+        )
+    return operations_agent
+
 
 if __name__ == "__main__":
-    graph_png = operations_agent.get_graph(xray=True).draw_mermaid_png()
-    # print(graph_png)
-    with open("graph.png", "wb") as f:
-        f.write(graph_png)
+    # graph_png = get_ops_agent.get_graph(xray=True).draw_mermaid_png()
+    # # print(graph_png)
+    # with open("graph.png", "wb") as f:
+    #     f.write(graph_png)
+    pass

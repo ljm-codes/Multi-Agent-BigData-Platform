@@ -18,7 +18,7 @@ from SPO.route_results import RouteResponse, ResultCode
 from Tools.log_settings import LogSetting
 from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.share_check_tool import redis_con
-from Tools.ws_registry import close_user_sockets
+from Tools.ws_registry import close_user_sockets, update_ws_permission
 
 route = APIRouter()
 email_re = r"\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*"
@@ -356,6 +356,10 @@ async def update_account(request: Request, body: AccountUpdateInfo) -> RouteResp
         logger.error(f"修改管理员 {body.id} 资料失败：{exc}")
         return RouteResponse.error(msg=f"修改账号失败：{exc}", code=ResultCode.DB_ERROR)
 
+    if "permission" in values:
+        # 已有 WS 连接不在 HTTP 中间件里；同步注册表，下一次 ops 广播立即按新权限过滤
+        await update_ws_permission(str(body.id), updated.permission)
+
     logger.info(f"修改账号：target={body.id}, fields={sorted(values)}, operator={token_info.get('id')}")
     return RouteResponse.ok(msg="账号已更新", data=data)
 
@@ -384,22 +388,27 @@ async def get_log_info(
         "name": admin_name,
         "permission": permission,
     }
-    stmt = select(RecommendApprovalTable).limit(limit).offset(offset)
+    filters = []
     if log_id:
-        stmt = stmt.where(RecommendApprovalTable.id == log_id)
+        filters.append(RecommendApprovalTable.id == log_id)
     if recommend_id:
-        stmt = stmt.where(RecommendApprovalTable.recommend_id == recommend_id)
+        filters.append(RecommendApprovalTable.recommend_id == recommend_id)
     if start_time and end_time:
-        stmt = stmt.where(RecommendApprovalTable.create_time.between(start_time, end_time))
+        filters.append(RecommendApprovalTable.create_time.between(start_time, end_time))
+    stmt = select(RecommendApprovalTable)
+    count_stmt = select(func.count()).select_from(RecommendApprovalTable)
+    if filters:
+        stmt = stmt.where(*filters)
+        count_stmt = count_stmt.where(*filters)
+    stmt = stmt.limit(limit).offset(offset)
     try:
         with SessionLocal() as session:
             result = session.execute(stmt).mappings().all()
-        if not result:
-            payload["log_data"] = []
-            payload["total"] = 0
-            return RouteResponse.ok(msg="获取审批日志成功", data=payload)
+            total = session.execute(count_stmt).scalar_one()
+        # total = 当前页条数；total_count = 全量匹配数
         payload["log_data"] = [dict(row) for row in result]
         payload["total"] = len(result)
+        payload["total_count"] = int(total or 0)
         return RouteResponse.ok(msg="获取审批日志成功", data=payload)
     except Exception as e:
         logger.error(f"获取审批日志失败：{e}")
@@ -432,6 +441,12 @@ async def get_admin_info(
         "offset": offset,
         "disabled": disabled,
     }
+    filters = [
+        AdminInfo.disabled == (false() if not disabled else true()),
+        AdminInfo.permission <= s_permission,
+    ]
+    if a_id:
+        filters.append(AdminInfo.id == a_id)
     stmt = select(
         AdminInfo.id,
         AdminInfo.username,
@@ -439,21 +454,12 @@ async def get_admin_info(
         AdminInfo.disabled,
         AdminInfo.email,
         AdminInfo.create_time,
-    ).limit(limit).offset(offset).where(
-        and_(
-            AdminInfo.disabled == (false() if not disabled else true()),
-            AdminInfo.permission <= s_permission,
-        )
-    )
-    if a_id:
-        stmt = stmt.where(AdminInfo.id == a_id)
+    ).where(*filters).limit(limit).offset(offset)
+    count_stmt = select(func.count()).select_from(AdminInfo).where(*filters)
     try:
         with SessionLocal() as session:
             result = session.execute(stmt).mappings().all()
-        if not result:
-            payload["admin_data"] = []
-            payload["total"] = 0
-            return RouteResponse.ok(msg="获取管理员信息成功", data=payload)
+            total = session.execute(count_stmt).scalar_one()
         # 对 email 进行脱敏
         mutable_results = [dict(row) for row in result]
         for item in mutable_results:
@@ -471,8 +477,10 @@ async def get_admin_info(
             else:
                 masked_local = local[:2] + '*' * (len(local) - 2)
             item["email"] = masked_local + '@' + domain
+        # total = 当前页条数；total_count = 全量匹配数
         payload["admin_data"] = mutable_results
         payload["total"] = len(mutable_results)
+        payload["total_count"] = int(total or 0)
         return RouteResponse.ok(msg="获取管理员信息成功", data=payload)
     except Exception as e:
         logger.error(f"获取管理员信息失败：{e}")

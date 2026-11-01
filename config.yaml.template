@@ -97,6 +97,7 @@ hadoop:
     manager: node1:8088            # ResourceManager 地址
     proxy: node1:8089              # WebAppProxy 地址(checker 走它取应用数据)
     poll_interval: 30              # 轮询间隔, 单位秒
+    scheduler_type: auto           # auto | capacity | fair; auto 按 schedulerInfo.type 判断
     max_job_timeout: 1800          # 作业最大运行时间, 单位秒, 超过判定为超时
     spark:
       # 数据倾斜判定阈值: 取 shuffle 读记录数的 max/median

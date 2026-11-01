@@ -37,6 +37,7 @@ from Tools.log_settings import LogSetting
 from Tools.registry import register_tool
 from Tools.share_check_tool import (get_flink_rest_base, get_stage_summary,
                                     manager, proxy)
+from Tools.yarn_queue import leaf_queues, scheduler_root
 from load_config.config import config
 
 logger = LogSetting.create(__name__)
@@ -1106,35 +1107,6 @@ def cluster_get_metrics() -> str:
     }, cost_ms=cost))
 
 
-def _leaf_queues(node: dict) -> list:
-    """
-    递归摊平出叶子队列 —— 判据是节点自己的 `type`，不靠层数
-
-    和 check_resource_abnormal.get_all_queue_info 同一个思路（按 type 认叶子），
-    但那边只认 `capacitySchedulerLeafQueueInfo`、且从 `queues.queue` 起步，
-    **在本集群（fairScheduler）会一条都取不到**：叶子是 `fairSchedulerLeafQueueInfo`，
-    根在 `schedulerInfo.rootQueue`，子节点在 `childQueues.queue`（也是 dict 包一层）。
-    这里两种调度器都认，判据统一成「type 以 LeafQueueInfo 结尾」。
-    """
-    kids = (((node or {}).get("queues") or {}).get("queue")
-            or ((node or {}).get("childQueues") or {}).get("queue")
-            or [])
-    if str((node or {}).get("type", "")).endswith("LeafQueueInfo"):
-        return [node]
-    if not kids:
-        # 既没有 type 又没有子节点：当叶子兜底，总比整棵树都丢掉好
-        return [node] if (node or {}).get("queueName") else []
-    out = []
-    for child in kids:
-        out.extend(_leaf_queues(child))
-    return out
-
-
-def _scheduler_root(info: dict) -> dict:
-    """容量调度器的根就是 schedulerInfo 自己，公平调度器的根在 rootQueue 里"""
-    return (info or {}).get("rootQueue") or info or {}
-
-
 @register_tool(AGENT_NAME, 1)
 @tool("cluster__get_queue")
 def cluster_get_queue(queue: str = "") -> str:
@@ -1165,7 +1137,7 @@ def cluster_get_queue(queue: str = "") -> str:
     if not info:
         return _dump(empty("RM 没返回调度器信息", cost_ms=cost))
 
-    leaves = _leaf_queues(_scheduler_root(info))
+    leaves = leaf_queues(scheduler_root(info))
     if queue.strip():
         want = queue.strip().rstrip(".")
         leaves = [q for q in leaves if (q.get("queueName") or "").rstrip(".") == want]

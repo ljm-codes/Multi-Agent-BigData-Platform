@@ -715,6 +715,14 @@ function logout() {
       </div>
 
       <div v-else class="sidebar-foot">
+        <button
+          v-if="Number(user.permission ?? 0) >= 1"
+          class="ghost"
+          :title="collapsed ? '运维看板' : ''"
+          @click="router.push('/ops')"
+        >
+          {{ collapsed ? '🛠' : '运维看板' }}
+        </button>
         <button class="ghost" :title="collapsed ? '用户管理' : ''" @click="router.push('/admin')">
           {{ collapsed ? '⚙' : '用户管理' }}
         </button>

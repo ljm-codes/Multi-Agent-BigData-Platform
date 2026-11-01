@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AI
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
-from langgraph.types import Command, Send
+from langgraph.types import Command, Send, CachePolicy
 from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import DevelopAgentMainState, DevelopAgentOutputState, DevelopAgentInputState, \
@@ -36,7 +36,6 @@ _dispatch_model = init_chat_model(
 
 dispatch_middleware = []
 dispatch_model_chain = chain_model_call_wrappers(dispatch_middleware)
-
 
 # Agent 与 app_type 的硬约束：data_develop 只做 Java Flink，data_analysis 只做 Python Spark
 _AGENT_APP_TYPE = {"data_develop": "flink", "data_analysis": "spark"}
@@ -383,11 +382,20 @@ builder = StateGraph(
 )
 
 builder.add_node("handler", cast("StateNode", develop_msg_handler))
-builder.add_node("dis_chat", cast("StateNode", dispatch_chat))
-builder.add_node("data_develop", cast("StateNode", big_data_develop_code_agent))
-builder.add_node("data_analysis", cast("StateNode", big_data_analysis_code_agent))
+# 添加缓存策略，缓存2小时
+builder.add_node("dis_chat", cast("StateNode", dispatch_chat), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
+builder.add_node("data_develop", cast("StateNode", big_data_develop_code_agent), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
+builder.add_node("data_analysis", cast("StateNode", big_data_analysis_code_agent), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
 # 直接挂编译好的 CVA 子图：子图里的 Command(graph=PARENT) / interrupt 才会生效
-builder.add_node("code_verify", cast("StateNode", verify_agent))
+builder.add_node("code_verify", cast("StateNode", verify_agent), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
 builder.add_node("work_end", cast("StateNode", work_end))
 
 builder.add_edge(START, "handler")

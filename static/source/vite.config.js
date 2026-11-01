@@ -20,6 +20,10 @@ export default defineConfig({
     proxy: {
       // ws: true 是给 /ai/ws/background 用的，否则 dev 下 WebSocket 连不上
       '/ai': { target: backend, changeOrigin: true, ws: true },
+      // 只代理 ops 的接口；/ops 页面本身留给 Vite，避免刷新页面被代理到后端
+      '/ops/checker': backend,
+      '/ops/agent': backend,
+      '/ops/ws': { target: backend, changeOrigin: true, ws: true },
       '/auth/admin': backend,
       '/open/app': backend,
     },

@@ -49,9 +49,16 @@ NODE_MEM_SAMPLE_INTERVAL = float(_oom_conf.get('node_mem_sample_interval', 5))
 # 回看窗口(秒): 从 executor 的 removeTime 往前找多久内的样本
 NODE_MEM_LOOKBACK_SECONDS = float(_oom_conf.get('node_mem_lookback_seconds', 90))
 
-# 每个节点保留多少个样本(5 秒一个 -> 240 个约 20 分钟)
+# 每个节点保留多少个样本：实际只需要覆盖回看窗口，240 只是极端上限
 NODE_MEM_MAX_SAMPLES = int(_oom_conf.get('node_mem_max_samples', 240))
-_NODE_MEM_TTL = 3600  # 1 小时过期
+_NODE_MEM_KEEP = min(
+    NODE_MEM_MAX_SAMPLES,
+    max(10, int(NODE_MEM_LOOKBACK_SECONDS / NODE_MEM_SAMPLE_INTERVAL) + 10),
+)
+# 没有 check 调用超过这个时间，认为 Spark 应用都结束了：清理 node-mem:* 并退出采样线程
+_NODE_MEM_IDLE_SECONDS = max(120, int(NODE_MEM_LOOKBACK_SECONDS * 2))
+_NODE_MEM_TTL = _NODE_MEM_IDLE_SECONDS + 60
+_node_mem_last_check = time.time()
 
 # 执行内存峰值低于执行池的这个比例, 就当**没采到**(不是"用得太少")。
 # 取 1% 的实测依据(短任务应用的采样是 0.015%, 真采到的 spill 是 0.94~1.00)见 README。
@@ -90,14 +97,31 @@ def _node_mem_sample_once() -> None:
         key = f"node-mem:{host}"
         try:
             redis_con.lpush(key, json.dumps(sample))
-            redis_con.ltrim(key, 0, NODE_MEM_MAX_SAMPLES - 1)
+            redis_con.ltrim(key, 0, _NODE_MEM_KEEP - 1)
             redis_con.expire(key, _NODE_MEM_TTL)
         except Exception as e:
             logger.error(f"节点内存样本写 redis 失败: {type(e).__name__}: {e}")
 
 
+def _cleanup_node_mem_keys() -> None:
+    try:
+        keys = list(redis_con.scan_iter("node-mem:*"))
+        if keys:
+            redis_con.delete(*keys)
+            logger.info(f"节点内存采样空闲，清理了 {len(keys)} 个 node-mem 键")
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"清理 node-mem 缓存失败: {type(e).__name__}: {e}")
+
+
 def _node_mem_sampler_loop() -> None:
+    global _node_mem_sampler_started
     while True:
+        if time.time() - _node_mem_last_check > _NODE_MEM_IDLE_SECONDS:
+            _cleanup_node_mem_keys()
+            with _node_mem_sampler_lock:
+                _node_mem_sampler_started = False
+            logger.info("节点内存采样线程空闲，已退出")
+            return
         _node_mem_sample_once()
         time.sleep(NODE_MEM_SAMPLE_INTERVAL)
 
@@ -108,8 +132,10 @@ _node_mem_sampler_lock = threading.Lock()
 
 def ensure_node_mem_sampler() -> None:
     """确保后台采样线程在跑(每个进程只起一次)"""
-    global _node_mem_sampler_started
+    global _node_mem_sampler_started, _node_mem_last_check
     with _node_mem_sampler_lock:
+        # 每次 checker 调用都续命；空闲超过窗口后线程会清理并退出
+        _node_mem_last_check = time.time()
         if _node_mem_sampler_started:
             return
         threading.Thread(target=_node_mem_sampler_loop, daemon=True,

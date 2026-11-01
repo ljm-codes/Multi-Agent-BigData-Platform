@@ -24,7 +24,7 @@ class ExecutorMetrics(TypedDict):
     stderr_log: str
 
 
-class UsersSchedulerLeafQueuePartInfo(TypedDict):
+class UsersSchedulerLeafQueuePartInfo(BaseModel):
     username: str
     num_pending_applications: int
 
@@ -41,6 +41,25 @@ class CapacitySchedulerLeafQueuePartInfo(BaseModel):
     max_active_applications: int
     num_active_applications: int
     users: Optional[List[UsersSchedulerLeafQueuePartInfo]] = None
+
+
+class FairSchedulerLeafQueuePartInfo(BaseModel):
+    """
+    公平调度器的叶子队列部分信息(非全部)
+
+    公平调度器不报 state / 绝对容量占比; 应用数在 numActiveApps/numPendingApps,
+    资源在 usedResources.memory / maxResources.memory, 容器在 pendingContainers。
+    取不到的字段给 0 —— 公平调度器的根没有 *Apps 字段。
+    """
+    queue_name: str
+    state: Optional[str] = None
+    num_pending_apps: int = 0
+    num_active_apps: int = 0
+    max_apps: int = 0
+    pending_containers: int = 0
+    allocated_containers: int = 0
+    used_memory_mb: int = 0
+    max_memory_mb: int = 0
 
 
 class FlinkCheckpointAbnormalInfo(TypedDict):

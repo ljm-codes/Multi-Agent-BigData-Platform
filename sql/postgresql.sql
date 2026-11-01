@@ -51,6 +51,26 @@ create table app_leases
     heartbeat_at timestamptz default now()  -- 最后一次心跳的时间
 );
 
+-- 运维 Agent 运行历史：app_leases 是锁表（会删除），这张表负责归档
+create table if not exists log.agent_runs
+(
+    id          bigserial primary key,
+    app_id      varchar(255) not null,
+    session_id  varchar(255) not null unique,
+    app_type    varchar(20),
+    status      varchar(20) not null default 'RUNNING',
+    error_count int         not null default 0,
+    started_at  timestamptz not null default now(),
+    finished_at timestamptz,
+    out_msg     text,
+    error       text,
+    constraint agent_run_status_check
+        check (status in ('RUNNING', 'DONE', 'ERROR', 'ABANDONED'))
+);
+
+create index if not exists idx_agent_runs_app_time on log.agent_runs (app_id, started_at desc);
+create index if not exists idx_agent_runs_status_time on log.agent_runs (status, started_at desc);
+
 drop table if exists admin_info;
 
 create table admin_info

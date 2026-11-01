@@ -24,7 +24,7 @@ from langgraph.constants import START
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
-from langgraph.types import Command, Send, interrupt
+from langgraph.types import Command, Send, interrupt, CachePolicy
 from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import CodeVerifyAgentInputState, CodeVerifyAgentMainState, DevelopAgentMainState, \
@@ -1430,15 +1430,21 @@ _verify_builder = StateGraph(
     output_schema=cast("OutputT", DevelopAgentMainState),
 )
 _verify_builder.add_node("ver_handler", cast("StateNode", _verify_input_handler))
-_verify_builder.add_node("ver_chat", cast("StateNode", _verify_agent_chat))
+_verify_builder.add_node("ver_chat", cast("StateNode", _verify_agent_chat), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
 _verify_builder.add_node("ver_error", cast("StateNode", _verify_error_node))
-_verify_builder.add_node("ver_com_exec", cast("StateNode", _verify_shallow_execute))
+_verify_builder.add_node("ver_com_exec", cast("StateNode", _verify_shallow_execute), cache_policy=CachePolicy(
+    ttl=1 * 60 * 60
+))
 _verify_builder.add_node("ver_manual", cast("StateNode", _verify_manual))
 _verify_builder.add_node("ver_deep_exec", cast("StateNode", _verify_deep_execute))
 _verify_builder.add_node("ver_submit", cast("StateNode", _verify_submit))
 _verify_builder.add_node("tools", ToolNode(
     tools=code_verify_agent_tools,
     awrap_tool_call=chain_tool_call_wrappers(verify_agent_middleware)
+), cache_policy=CachePolicy(
+    ttl=3 * 60 * 60
 ))
 
 _verify_builder.add_edge(START, "ver_handler")

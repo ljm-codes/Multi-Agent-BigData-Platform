@@ -88,6 +88,31 @@ class AppLease(Base):
     )
 
 
+class AgentRun(Base):
+    """运维 Agent 的一次运行记录（app_lease 只负责锁，删锁不影响历史）"""
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('RUNNING', 'DONE', 'ERROR', 'ABANDONED')",
+            name="agent_run_status_check",
+        ),
+        {"schema": "log"},
+    )
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    app_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    app_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'RUNNING'"))
+    error_count: Mapped[int] = mapped_column(INTEGER, nullable=False, server_default=text("0"))
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    out_msg: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+
+
 class AdminInfo(Base):
     __tablename__ = "admin_info"
     __table_args__ = (
