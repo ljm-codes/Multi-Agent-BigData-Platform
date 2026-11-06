@@ -93,7 +93,7 @@ class AgentRun(Base):
     __tablename__ = "agent_runs"
     __table_args__ = (
         CheckConstraint(
-            "status in ('RUNNING', 'DONE', 'ERROR', 'ABANDONED')",
+            "status in ('RUNNING', 'PAUSED', 'DONE', 'ERROR', 'ABANDONED')",
             name="agent_run_status_check",
         ),
         {"schema": "log"},
@@ -207,6 +207,35 @@ class AdminThread(Base):
     is_top: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    create_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+    update_time: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("now()"),
+    )
+
+
+class AppFileIndex(Base):
+    __tablename__ = "app_file_idx"
+    __table_args__ = (
+        CheckConstraint(
+            "app_type in ('SPARK', 'FLINK')",
+            name="app_type_check_constraint",
+        ),
+        CheckConstraint(
+            "source_type in ('hdfs', 'local', 'git', 'ssh')",
+            name="source_type_check_constraint",
+        ),
+        {"schema": "code"},
+    )
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True,)
+    app_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    app_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    source_dir: Mapped[str] = mapped_column(TEXT, nullable=False)
+    commit_cmd: Mapped[str] = mapped_column(TEXT, nullable=False)
     create_time: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=text("now()"),

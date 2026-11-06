@@ -72,12 +72,17 @@ _operations_system_prompt = f"""
 """
 
 
-class HandoverMsgModel(TypedDict):
+class CodeErrorInfo(BaseModel):
+    """辅助于 HandoverMsgModel 类"""
+    pass
+
+
+class HandoverMsgModel(BaseModel):
     """当出现代码错误时，或者需要调优代码时，需要填写的参数"""
     # 错误详细描述
-    error_describe: str
+    error_describe: str = Field(description="错误详细描述")
     # 建议
-    suggest: str
+    suggest: str = Field(description="建议")
 
 
 class SummaryMsgModel(TypedDict):

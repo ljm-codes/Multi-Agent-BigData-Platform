@@ -3,12 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import JsonView from '@/components/JsonView.vue'
+import JobRestartReview from '@/components/JobRestartReview.vue'
 import {
   createTicket,
   getAgentHistory,
   listAgentRuns,
   listCheckerErrors,
   openPerceptionSocket,
+  resumeAgent,
 } from '@/api/ops'
 
 const router = useRouter()
@@ -55,6 +57,10 @@ const historyOpen = ref(false)
 const historyLoading = ref(false)
 const historyError = ref('')
 const historyData = ref(null)
+const review = ref(null)
+const reviewBusy = ref(false)
+const reviewError = ref('')
+const reviewNotice = ref('')
 
 const ERROR_COLUMNS = [
   { key: 'id', label: 'ID', width: 56 },
@@ -312,18 +318,54 @@ async function connectWs() {
   }
 }
 
+function extractReview(payload) {
+  const list = Array.isArray(payload) ? payload : payload ? [payload] : []
+  const first = list[0]
+  const value = first?.value ?? first
+  if (!value || typeof value !== 'object') return null
+  if (value.kind !== 'job_restart' || typeof value.command !== 'string') return null
+  return value
+}
+
 async function openHistory(sessionId) {
   if (!sessionId) return
   historyOpen.value = true
   historyLoading.value = true
   historyError.value = ''
   historyData.value = null
+  review.value = null
+  reviewError.value = ''
+  reviewNotice.value = ''
   try {
-    historyData.value = await getAgentHistory(sessionId)
+    const data = await getAgentHistory(sessionId)
+    historyData.value = data
+    review.value = extractReview(data?.interrupt)
   } catch (e) {
     historyError.value = e?.message || '加载历史失败'
   } finally {
     historyLoading.value = false
+  }
+}
+
+async function submitReview(answer) {
+  const sid = historyData.value?.thread_id
+  if (!sid || reviewBusy.value) return
+  reviewBusy.value = true
+  reviewError.value = ''
+  try {
+    const data = await resumeAgent({ sessionId: sid, answer })
+    const ignored = Array.isArray(data?.ignored_values) ? data.ignored_values : []
+    await openHistory(sid)
+    await loadRuns()
+    if (ignored.length) {
+      reviewNotice.value = '以下值不合法，已保留原值：' + ignored
+        .map((item) => `${item.flag || item.key || ''} ${item.value || ''}（${item.reason || '不合法'}）`)
+        .join('；')
+    }
+  } catch (e) {
+    reviewError.value = e?.message || '提交审阅结果失败'
+  } finally {
+    reviewBusy.value = false
   }
 }
 
@@ -569,6 +611,7 @@ onBeforeUnmount(() => {
               <select v-model="runStatus">
                 <option value="ALL">全部</option>
                 <option value="RUNNING">RUNNING</option>
+                <option value="PAUSED">PAUSED</option>
                 <option value="DONE">DONE</option>
                 <option value="ERROR">ERROR</option>
                 <option value="ABANDONED">ABANDONED</option>
@@ -708,6 +751,17 @@ onBeforeUnmount(() => {
         <template v-else-if="historyData">
           <p v-if="historyData.out_msg" class="out-msg">{{ historyData.out_msg }}</p>
           <p v-if="historyData.error_desc_text" class="error">{{ historyData.error_desc_text }}</p>
+          <p v-if="reviewNotice" class="bar notice">{{ reviewNotice }}</p>
+          <JobRestartReview
+            v-if="review"
+            :review="review"
+            :busy="reviewBusy"
+            :error="reviewError"
+            @submit="submitReview"
+          />
+          <p v-else-if="historyData.interrupted" class="error bar">
+            有待确认的中断，但当前看板不支持该类型；请回到发起该任务的会话处理。
+          </p>
           <div v-if="!historyData.messages.length" class="muted">没有消息</div>
           <div class="messages">
             <article
@@ -976,6 +1030,10 @@ h1 {
   color: #d97706;
 }
 
+.run-status.PAUSED {
+  color: #7c3aed;
+}
+
 .run-status.DONE {
   color: #16a34a;
 }
@@ -998,6 +1056,10 @@ h1 {
   padding: 8px 10px;
   background: var(--bg-soft);
   border-radius: 7px;
+}
+
+.bar.notice {
+  color: #b45309;
 }
 
 .pager {

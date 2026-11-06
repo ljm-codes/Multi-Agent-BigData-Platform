@@ -19,7 +19,7 @@
   * 导入 agent._operations_agent 期间给 builtins.open 装垫片 —— 该模块用
     open("./prompt/operations_agent.md") 这种 CWD 相对路径读手册（缺陷, 见 t1 输出）。
   * 导入之后替换 大模型 / SessionLocal / AsyncSessionLocal / send_warning_msg,
-    并把 22 个工具的 .func 换成桩 —— 图里 chat_end 会删 app_lease、app_summary 会改
+    并把 23 个工具的 .func 换成桩 —— 图里 chat_end 会删 app_lease、app_summary 会改
     CheckLog, 所以桩必须**先于任何 invoke** 装好。
 """
 import asyncio
@@ -374,7 +374,7 @@ def t0_wiring():
     section("[0] 注册表 -> 图的接线")
     prio = get_priority_tools("OM")
     count = sum(len(v) for v in prio.values())
-    check("22 个工具全部登记进优先级表", count == 22, f"实际 {count} 个: {sorted(prio)}")
+    check("23 个工具全部登记进优先级表", count == 23, f"实际 {count} 个: {sorted(prio)}")
     check("工具全在 tool_to_category 里（没有掉进 -1 的）",
           len(OA.tool_to_category) == count,
           f"tool_to_category={len(OA.tool_to_category)} / 注册表={count}")
@@ -506,7 +506,7 @@ def t3_skip_level_rejected():
     section("[3] 越级调用被拒（网关）")
     out, err, model = run_case(
         steps=[
-            tool_ai("code__appearance", {"app_id": "application_1"}, "c1"),
+            tool_ai("code__appearance", {"module_path": "main.py"}, "c1"),
             summary_route([101], "application_1"),
         ])
 
@@ -529,7 +529,7 @@ def t4_downgrade_allowed():
         steps=[
             tool_ai("yarn__get_app", {"app_id": "application_1"}, "c1"),
             tool_ai("log__list", {"host": "node1", "container_id": "container_1"}, "c2"),
-            tool_ai("code__appearance", {"app_id": "application_1"}, "c3"),
+            tool_ai("code__appearance", {"module_path": "main.py"}, "c3"),
             tool_ai("yarn__get_app", {"app_id": "application_1"}, "c4"),
             summary_route([101], "application_1"),
         ])

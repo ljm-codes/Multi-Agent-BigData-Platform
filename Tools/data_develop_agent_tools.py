@@ -22,6 +22,7 @@ from langgraph.types import Command
 from langgraph.prebuilt import ToolRuntime
 from lxml import etree
 
+from Tools.jar.parse_jar import check_jar_class, check_java_api_roughly_info, check_java_code
 from Tools.log_settings import LogSetting
 from Tools.registry import register_tool
 from Tools.run_command import run_mvn_command, run_java_command
@@ -569,90 +570,15 @@ def view_java_api_code(
     # 先进行检查对应的 tmp 目录有没有反编译的类文件
     class_path = class_name.replace(".", "/") + ".class"
     class_absolute_path = ROOT_BASE_DIR_PATH / "tmp" / class_path
-
-    def _filter_code(java_code: str) -> str:
-        """用于处理传入的 method_name 与 ignore_case 参数，返回过滤后的代码"""
-        if not method_name:
-            return java_code
-
-        def match(text: str, target: str) -> bool:
-            return target.lower() in text.lower() if ignore_case else target in text
-
-        class_stack: list[tuple[str, int]] = []  # (类名, 进入类体后的括号深度)
-        brace_depth = 0  # 当前大括号嵌套深度
-        in_method = False
-        method_close_depth = 0  # 方法体闭合时要回落到的深度
-        method_lines: list[str] = []
-        blocks: list[str] = []
-
-        class_pattern = re.compile(r'\b(?:class|interface|enum)\s+(\w+)')
-        for raw_line in java_code.splitlines():
-            line = raw_line.strip()
-            open_count = line.count("{")
-            close_count = line.count("}")
-            new_depth = brace_depth + open_count - close_count
-
-            if in_method:
-                # 这一行会让深度回落到方法外层 -> 它是方法的结束花括号
-                if new_depth <= method_close_depth:
-                    method_lines.append(line)  # 结束花括号不加 tab
-                    blocks.append("\n".join(method_lines))
-                    method_lines = []
-                    in_method = False
-                else:
-                    method_lines.append("\t" + line)
-            else:
-                # 检测类 / 接口 / 枚举声明
-                cls_match = class_pattern.search(line)
-                if cls_match and open_count > 0:
-                    # 记录类名 + 进入类体后的深度
-                    class_stack.append((cls_match.group(1), new_depth))
-                elif "(" in line:
-                    # 只取方法名之前的部分做匹配, 避免参数名误命中
-                    sig = line.rsplit("(", 1)[0]
-                    if match(sig, method_name):
-                        qualifier = ".".join(name for name, _ in class_stack)
-                        header = (
-                            f"// {qualifier}.{method_name}"
-                            if qualifier else f"// {method_name}"
-                        )
-                        method_lines = [header, line]
-                        in_method = True
-                        method_close_depth = brace_depth
-                        # 注意: 这里不更新 brace_depth, 让后面统一处理
-
-            # 统一更新括号深度
-            brace_depth = new_depth
-
-            # 弹出已闭合的类
-            while class_stack and brace_depth < class_stack[-1][1]:
-                class_stack.pop()
-
-        if not blocks:
-            return f"未在 {class_name} 中找到方法: {method_name}"
-        return "\r\n".join(blocks)
-
-    if class_absolute_path.exists() and class_absolute_path.is_file():
-        with open(class_absolute_path, "r", encoding="utf-8") as f:
-            code = f.read()
-        return _filter_code(code)
-    # 没有的话，进行反编译
+    _out_dir = ROOT_BASE_DIR_PATH / "tmp"
     jar_absolute_path = java_maven_path / jar_path
     if not (jar_absolute_path.exists() or jar_absolute_path.is_file()):
         return f"jar包路径不存在: {jar_path}"
-    # 构建命令
-    class_name = class_name.replace(".", "\\.")
-    command = (f'java -jar "{ROOT_BASE_DIR_PATH / "Tools" / "jar" / "cfr-0.152.jar"}" '
-               f'{jar_absolute_path.name} --jarfilter ^{class_name}$ '
-               f'--outputdir "{ROOT_BASE_DIR_PATH / "tmp"}"')
-    # 执行命令
-    return_code, stderr = run_java_command(command, path=str(jar_absolute_path.parent))
-    if return_code != 0:
-        return f"查看类大致代码失败，错误信息: {stderr}"
-    # 清洗代码
-    with open(class_absolute_path, "r", encoding="utf-8") as f:
-        code = f.read()
-    return _filter_code(code)
+
+    return check_java_code(
+        jar_absolute_path, class_name, class_absolute_path,
+        method_name=method_name, ignore_case=ignore_case, out_path=str(_out_dir)
+    )
 
 
 @register_tool(AGENT_NAME)
@@ -685,68 +611,10 @@ def view_java_api_roughly_info(
     jar_absolute_path = java_maven_path / jar_path
     if not (jar_absolute_path.exists() or jar_absolute_path.is_file()):
         return f"jar包路径不存在: {jar_path}"
-    # 构建命令
-    command = f"javap -classpath {jar_absolute_path.name} -p {class_name}"
-    return_code, javap_out_str = run_java_command(command, path=str(jar_absolute_path.parent))
-    if return_code != 0:
-        return f"查看类大致信息失败，错误信息: {javap_out_str}"
-    # 清洗
-    raw_lines = [ln.rstrip() for ln in javap_out_str.splitlines()]
-    lines = [ln.strip() for ln in raw_lines if ln.strip()]
-    if lines and lines[0].startswith("Compiled from"):
-        lines = lines[1:]
-    if not lines:
-        return "解析失败：javap 输出为空"
-    # 类声明行（末尾可能带 '{'，去掉）
-    class_decl = lines[0].rstrip("{").strip()
-    member_lines = lines[1:]
-
-    # 逐行提取
-    members: list[str] = []
-    brace_depth = 0
-    for ln in member_lines:
-        brace_depth += ln.count("{") - ln.count("}")
-        # 跳过内部类声明 -> 虽然说实测没有
-        if brace_depth > 0:
-            continue
-        if ln == "}" or ln.startswith("static {"):
-            continue
-        if ln.endswith(";"):
-            members.append(ln[:-1].strip())
-
-    # 提取成员名
-    def _member_name(decl: str) -> str | None:
-        if "(" in decl:  # 方法/构造器
-            before = decl[: decl.index("(")]
-            m = re.search(r"([A-Za-z_$][\w$]*)\s*$", before)
-            return m.group(1) if m else None
-        # 字段：取最后一个词（泛型里不会带空格，最后一个 token 就是字段名）
-        parts = decl.split()
-        return parts[-1] if parts else None
-
-    # 按需过滤
-    def _keep(decl: str) -> bool:
-        is_method = "(" in decl
-        if exclude_type == "method" and is_method:
-            return False
-        if exclude_type == "variable" and not is_method:
-            return False
-        if method_name:
-            name = _member_name(decl)
-            if name is None:
-                return False
-            if ignore_case:
-                return name.lower() in method_name.lower()
-            else:
-                return name in method_name
-        return True
-
-    filtered = [m for m in members if _keep(m)]
-    # 组装
-    out_lines = [f"{class_decl}:"]
-    for ln in filtered:
-        out_lines.append(f"\t{ln};")
-    return "\n".join(out_lines)
+    return check_java_api_roughly_info(
+        jar_absolute_path, class_name,
+        method_name=method_name, ignore_case=ignore_case, exclude_type=exclude_type
+    )
 
 
 @register_tool(AGENT_NAME)
@@ -771,24 +639,10 @@ def view_java_class_by_jar(
     jar_absolute_path = java_maven_path / jar_path
     if not (jar_absolute_path.exists() or jar_absolute_path.is_file()):
         return f"jar包路径不存在: {jar_path}"
-    return_code, jar_class_out_str = run_java_command(f"jar tf {jar_absolute_path}")
-    if return_code != 0:
-        return f"查看jar包类名失败，错误信息: {jar_class_out_str}"
-    default_reg = rf"{'(?<![\w$/])([\w/]+)' if not inner_class else '.*?'}\.class"
-    try:
-        jar_class_str_list = re.findall(default_reg, jar_class_out_str, flags=re.IGNORECASE if ignore_case else 0)
-        if keyword:
-            if ignore_case:
-                comp_fun = lambda name: keyword.lower() in name.lower()
-            else:
-                comp_fun = lambda name: keyword in name
-            jar_class_str_list = [c.replace("/", ".") for c in jar_class_str_list if comp_fun(c.rsplit("/", 1)[-1])]
-        if not jar_class_str_list:
-            return f"指定jar包下未找到相关的任何类名"
-        return f"指定jar包下的类名为: {','.join(jar_class_str_list)}"
-    except Exception as e:
-        logger.error(f"查看jar包类名失败{type(e).__name__}: {e}")
-        return f"查看jar包类名失败{type(e).__name__}: {e}"
+    success, jar_class_str = check_jar_class(jar_absolute_path, keyword, ignore_case, inner_class)
+    if not success:
+        return f"解析时引发了异常：{jar_class_str}"
+    return jar_class_str
 
 
 @register_tool(AGENT_NAME)

@@ -185,7 +185,7 @@ pnpm build        # 产物输出到 static/dist
 python run.py     # 默认 0.0.0.0:8000
 ```
 
-打开 `http://127.0.0.1:8000/`，用上一步的邮箱密码登录。
+打开 `http://127.0.0.1:8000`，用上一步的邮箱密码登录。
 
 ### 7. Docker 一键部署
 
@@ -231,7 +231,7 @@ SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_swit
 ## 项目的不足
 
 1. 仍是 Demo，Python 侧只有 `requirements.txt`、没有 lockfile；前端已有 `pnpm-lock.yaml`。
-2. **运维链路还没接入 HTTP 层**，只有后台进程，前端暂时看不到巡检结果。
+2. ~~**运维链路还没接入 HTTP 层**，只有后台进程，前端暂时看不到巡检结果。~~ 人工无法介入ops-agent的进行，只能看着。且对于对应的thread_id没有删除的操作，因此会占用大量的数据库空间。
 3. 运维 Agent 只能通过 SSH 拉代码，且相同代码每次都要重新做 AST 解析。
 4. MCP 目前只用于 Maven 依赖查询，还没做通用 MCP / Skill 接入。
 5. LangGraph 的 `store` 与 `cache` 已编译进图，但还没有节点声明 `cache_policy`，实际未启用。
@@ -240,10 +240,10 @@ SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_swit
 
 ## 项目的未来方向
 
-1. 代码解析结果本地落库，避免反复 AST 解析。
-2. 运维链路 API 化，前端补上巡检与告警面板。
-3. 补依赖清单与一键部署脚本。
-4. 扩充评测集，把「能跑通」变成「可衡量」。
+1. 代码解析结果本地落库，避免反复 AST 解析。 -> 同时对 ops-agent 获取代码的路线进行更换，支持三种方式：远程服务器（建议非集群）、本地的tmp_code目录、远程github私有仓库
+~~2. 运维链路 API 化，前端补上巡检与告警面板。~~
+~~3. 补依赖清单与一键部署脚本。~~
+2. 扩充评测集，把「能跑通」变成「可衡量」。
 
 ## License
 

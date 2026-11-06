@@ -19,6 +19,7 @@ ERR_AUTH = "auth"                # 凭据不对
 ERR_PERMISSION = "permission"    # 连上了但没权限
 ERR_PARSE = "parse"              # 拿到了但解析不了（多半是代理回落的 HTML）
 ERR_UNSUPPORTED = "unsupported"  # 本环境这条路不成立
+ERR_WRITE_FAILED = "write_failed"  # 写操作失败；不确定是否已执行，禁止自动重试
 ERR_UNKNOWN = "unknown"
 
 # 只有这几个类别值得重试

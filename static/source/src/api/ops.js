@@ -18,7 +18,7 @@ export function listCheckerErrors(params = {}) {
   return request(`/ops/checker/app/error${buildQuery(params)}`)
 }
 
-/** 运维 Agent 运行记录（历史归档；status 可传 ALL/RUNNING/DONE/ERROR/ABANDONED） */
+/** 运维 Agent 运行记录（历史归档；status 可传 ALL/RUNNING/PAUSED/DONE/ERROR/ABANDONED） */
 export function listAgentRuns(params = {}) {
   return request(`/ops/agent/info${buildQuery(params)}`)
 }
@@ -26,6 +26,14 @@ export function listAgentRuns(params = {}) {
 /** 某个 session_id 对应的 ops-Agent 对话历史 */
 export function getAgentHistory(sessionId) {
   return request(`/ops/agent/history${buildQuery({ session_id: sessionId })}`)
+}
+
+/** 回复停在人工审核的 ops-Agent 会话 */
+export function resumeAgent({ sessionId, answer }) {
+  return request('/ops/agent/resume', {
+    method: 'POST',
+    body: { session_id: sessionId, answer },
+  })
 }
 
 /** 感知 WebSocket：先换一次性 ticket，再连 /ops/ws/perception/error */

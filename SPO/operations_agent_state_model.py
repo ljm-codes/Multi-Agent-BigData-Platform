@@ -20,6 +20,14 @@ class OperationsAndReconcileMainState(MessagesState):
     remaining_tool_calls: NotRequired[List[Dict]]
     # 在网关执行时 临时添加的 AI 消息 -> 到时候将会在转 Agent 节点时，进行去除
     temp_ai_ids: NotRequired[List[str]]
+    # 应用ID
+    app_id: NotRequired[str]
+    # 应用类型
+    app_type: NotRequired[Literal["SPARK", "FLINK", "CLUSTER"]]
+    # 是否为集群
+    is_cluster: NotRequired[bool]
+    # 源码项目根目录（tmp/target/{app_type}/{date}/{app_name}）  集群不填
+    app_file_path: NotRequired[str]
 
 
 class OperationsAndReconcileCheckInfo(TypedDict):
@@ -44,6 +52,8 @@ class OperationsAndReconcileInputState(TypedDict):
     app_id: NotRequired[str]
     # 应用类型
     app_type: NotRequired[Literal["SPARK", "FLINK", "CLUSTER"]]
+    # 源码项目根目录（tmp/target/{app_type}/{date}/{app_name}）  集群不填
+    app_file_path: NotRequired[str]
 
 
 class OperationsAndReconcileOutputState(TypedDict):

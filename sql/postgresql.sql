@@ -58,15 +58,20 @@ create table if not exists log.agent_runs
     app_id      varchar(255) not null,
     session_id  varchar(255) not null unique,
     app_type    varchar(20),
-    status      varchar(20) not null default 'RUNNING',
-    error_count int         not null default 0,
-    started_at  timestamptz not null default now(),
+    status      varchar(20)  not null default 'RUNNING',
+    error_count int          not null default 0,
+    started_at  timestamptz  not null default now(),
     finished_at timestamptz,
     out_msg     text,
     error       text,
     constraint agent_run_status_check
-        check (status in ('RUNNING', 'DONE', 'ERROR', 'ABANDONED'))
+        check (status in ('RUNNING', 'PAUSED', 'DONE', 'ERROR', 'ABANDONED'))
 );
+
+-- 已有库不会因为 create table if not exists 更新约束，单独迁移一次
+alter table log.agent_runs drop constraint if exists agent_run_status_check;
+alter table log.agent_runs add constraint agent_run_status_check
+    check (status in ('RUNNING', 'PAUSED', 'DONE', 'ERROR', 'ABANDONED'));
 
 create index if not exists idx_agent_runs_app_time on log.agent_runs (app_id, started_at desc);
 create index if not exists idx_agent_runs_status_time on log.agent_runs (status, started_at desc);
@@ -87,7 +92,8 @@ create table admin_info
     update_time timestamptz default now()
 );
 
-alter table admin_info alter column email set not null ;
+alter table admin_info
+    alter column email set not null;
 
 create index idx_name_email on admin_info (username, email) where disabled = false;
 
@@ -119,15 +125,21 @@ create table log.recommend_approval_log
     update_time       timestamptz      default now()                                     -- 更新这个记录的时间
 );
 
+create table code.app_file_idx
+(
+    id          bigserial primary key,
+    app_type    varchar(20) check ( app_type in ('SPARK', 'FLINK'))                  not null,
+    app_name    varchar(255)                                                         not null,
+    source_type varchar(10) check ( source_type in ('hdfs', 'local', 'git', 'ssh') ) not null,
+    source_dir  text                                                                 not null,
+    commit_cmd  text                                                                 not null,
+    create_time timestamptz                                                          not null default now(),
+    update_time timestamptz                                                          not null default now()
+); -- 提交作业时，指向 打包好的应用 映射表 -> 用于 快速定位到应用文件路径（ops-Agent用）
+
+create unique index uk_app_file_app on code.app_file_idx (app_type, app_name);
 
 -- 以下 SQL 均为 未开发 完整
-create table code.ast
-(
-    id       bigserial primary key,
-    language varchar(20) not null
-);
-
-
 create table log.AIOps_log
 (
 

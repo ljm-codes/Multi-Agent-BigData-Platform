@@ -67,6 +67,7 @@ class DevelopAgentInputState(TypedDict):
     # 后台续跑时由感知层带入，用于中间件按任务取结果
     deep_task_id: NotRequired[str]
     is_background: NotRequired[bool]
+    is_ops: NotRequired[Literal[True]]
     source: NotRequired[str]
 
 

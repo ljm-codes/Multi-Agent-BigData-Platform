@@ -624,6 +624,11 @@ def _auto_answer(interrupts: list[Any], args: argparse.Namespace) -> Any:
     if isinstance(value, dict) and value.get("type") == "error":
         # 浅层/深层连续失败后转人工：自动终止，避免 manual -> deep 死循环
         return {"pass": False, "msg": "auto-terminated by metrics test", "force_terminate": True}
+    if isinstance(value, dict) and (
+            value.get("kind") == "job_restart"
+            or ("command" in value and "app_name" in value)):
+        # ops job__restart 的人工审核：新契约是 {"type":"yes"}，回 pass 会被判格式错
+        return {"type": "yes", "base_command": value.get("command", "")}
     # CVA 人工确认：回 dict
     return {"pass": True, "msg": "auto-passed by metrics test"}
 

@@ -6,17 +6,22 @@ import ast
 import asyncio
 import json
 import os
+import posixpath
 import shlex
+import shutil
 import tempfile
+import threading
 import uuid
 import zipfile
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast, TypedDict, NotRequired, Literal, Any
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
 from hdfs import InsecureClient
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
@@ -29,12 +34,14 @@ from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import CodeVerifyAgentInputState, CodeVerifyAgentMainState, DevelopAgentMainState, \
     DevelopGraphErrorState, MainStateContext
+from SPO.postgresql_model import AppFileIndex
 from Tasks.background_broker import background_broker, background_registry, background_thread_id
 from Tasks.build_run_custom_tasks import TaskSupervisor
-from Tools import node_ssh
+from Tools import code_commit, node_ssh
 from Tools.log_settings import LogSetting
 from Tools.code_verify_agent_tools import AGENT_NAME as CVA
 from Tools.data_analysis_agent_tools import analysis_business_files, submit_redis_key
+from Tools.db import AsyncSessionLocal
 from Tools.registry import get_tools
 from Tools.run_command import arun_mvn_command, arun_python_command, run_mvn_command
 from Tools.share_check_tool import redis_con, manager
@@ -405,6 +412,228 @@ async def _run_spark_test_command(commands: list[dict], path: str | Path, buffer
     return results
 
 
+_CODE_COMMIT_CONF = ((config.get("code") or {}).get("commit") or {})
+_COMMIT_TASKS: set[asyncio.Task] = set()
+
+
+def _commit_source_conf() -> tuple[str, str]:
+    """读取 code.commit，返回 (source_type, root)；缺配置时抛错"""
+    source_type = str(_CODE_COMMIT_CONF.get("type") or "").strip().lower()
+    if source_type not in ("hdfs", "local", "ssh", "git"):
+        raise ValueError(f"code.commit.type 只能是 hdfs/local/ssh/git，当前是 {source_type!r}")
+    root = str(_CODE_COMMIT_CONF.get("path") or "").strip()
+    if not root:
+        raise ValueError("code.commit.path 未配置")
+    if source_type in ("local", "ssh") and "://" in root:
+        raise ValueError(f"code.commit.type={source_type} 时 path 必须是目录，不能是 URI: {root!r}")
+    if source_type == "hdfs" and "://" in root and not root.startswith("hdfs://"):
+        raise ValueError(f"code.commit.type=hdfs 时 path 必须是 HDFS 路径: {root!r}")
+    if source_type == "ssh" and not str((_CODE_COMMIT_CONF.get("ssh") or {}).get("ip") or "").strip():
+        raise ValueError("code.commit.ssh.ip 未配置")
+    if source_type == "git":
+        if not str((_CODE_COMMIT_CONF.get("git") or {}).get("git_repo") or "").strip():
+            raise ValueError("code.commit.git.git_repo 未配置")
+        if not os.getenv("GIT_API", "").strip():
+            raise ValueError("GIT_API 未配置")
+    return source_type, root
+
+
+def _commit_rel_dir(app_type: str, date: str, app_name: str) -> str:
+    return f"{app_type}/{date}/{app_name}"
+
+
+def _commit_public_dir(source_type: str, root: str, rel: str) -> str:
+    """落库用的目录：hdfs 保留 URI，local 转绝对路径，ssh 保留远端路径"""
+    if source_type == "hdfs":
+        return f"{root.rstrip('/')}/{rel}"
+    if source_type == "local":
+        root_path = Path(root).expanduser()
+        if not root_path.is_absolute():
+            root_path = ROOT_BASE_DIR_PATH / root_path
+        return str(root_path / Path(rel))
+    if source_type == "ssh":
+        return posixpath.join(root.rstrip("/"), rel)
+    return f"/{rel.lstrip('/')}"
+
+
+def _upload_commit_hdfs(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    if _hdfs_client is None:
+        raise RuntimeError("CONNECT_TO_CLUSTER=false，HDFS 提交存储不可用")
+    root_path = urlparse(root).path if "://" in root else root
+    if not root_path:
+        raise ValueError(f"无法从 code.commit.path 解析出 HDFS 路径: {root!r}")
+    remote_dir = posixpath.join(root_path.rstrip("/"), rel)
+    _hdfs_ensure_dir(remote_dir)
+    for local, sub in files:
+        dest = posixpath.join(remote_dir, sub)
+        parent = posixpath.dirname(dest)
+        if parent:
+            _hdfs_ensure_dir(parent)
+        _hdfs_client.upload(dest, str(local), overwrite=True)
+    return f"{root.rstrip('/')}/{rel}"
+
+
+def _upload_commit_local(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    root_path = Path(root).expanduser()
+    if not root_path.is_absolute():
+        root_path = ROOT_BASE_DIR_PATH / root_path
+    target = root_path / Path(rel)
+    target.mkdir(parents=True, exist_ok=True)
+    for local, sub in files:
+        dest = target / Path(sub)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local, dest)
+    return str(target)
+
+
+def _upload_commit_ssh(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    host, user, port, password = code_commit.ssh_endpoint()
+    remote_dir = posixpath.join(root.rstrip("/"), rel)
+    # 复用 node_ssh 的连接池：SFTP 通道用完就关，ssh 连接一直留着
+    with node_ssh.sftp(host, user=user, port=port, password=password) as sftp:
+        node_ssh.ensure_remote_dirs(sftp, remote_dir)
+        for local, sub in files:
+            dest = posixpath.join(remote_dir, sub)
+            node_ssh.ensure_remote_dirs(sftp, posixpath.dirname(dest))
+            sftp.put(str(local), dest)
+    return remote_dir
+
+
+def _upload_commit_git(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    return code_commit.upload(f"/{rel.lstrip('/')}", files, f"submit {rel}")
+
+
+async def _save_app_file_idx(
+        *, app_name: str, app_type: Literal["spark", "flink"],
+        source_type: str, source_dir: str, commit_cmd: str,
+) -> None:
+    """upsert code.app_file_idx；更新时刷新 update_time"""
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        stmt = pg_insert(AppFileIndex).values(
+            app_type=app_type.upper(),
+            app_name=app_name,
+            source_type=source_type,
+            source_dir=source_dir,
+            commit_cmd=commit_cmd,
+            create_time=now,
+            update_time=now,
+        ).on_conflict_do_update(
+            index_elements=["app_type", "app_name"],
+            set_={
+                "source_type": source_type,
+                "source_dir": source_dir,
+                "commit_cmd": commit_cmd,
+                "update_time": now,
+            },
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+# 源码目录不传打包/编译产物：运维侧读的、改的都是源码
+_SOURCE_SKIP_DIRS = {"target", "__pycache__", ".git", ".idea", ".venv", "venv",
+                     "node_modules", "logs"}
+_SOURCE_SKIP_SUFFIX = {".class", ".jar", ".pyc", ".pyo", ".log", ".bak", ".cmd"}
+
+
+def _source_manifest(project_dir: Path) -> list[tuple[Path, str]]:
+    """项目目录 -> [(本地文件, 项目内相对路径)]，跳过 target/__pycache__ 等产物"""
+    root = Path(project_dir)
+    files: list[tuple[Path, str]] = []
+    for f in sorted(root.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(root)
+        if any(p in _SOURCE_SKIP_DIRS or p.startswith(".") for p in rel.parts[:-1]):
+            continue
+        if f.name.startswith(".") or f.name == "TIME":
+            continue
+        if f.suffix.lower() in _SOURCE_SKIP_SUFFIX:
+            continue
+        files.append((f, rel.as_posix()))
+    return files
+
+
+async def _submit_target_code(
+        app_name: str, app_type: Literal["spark", "flink"],
+        commit_cmd: str, project_dir: Path,
+) -> None:
+    """
+    将项目源码传到 code.commit.path/{app_type}/{date}/{app_name}，
+    并把定位信息 upsert 到 code.app_file_idx。
+
+    上传和落库互不影响：上传失败也落库；落库失败不影响已经上传的文件。
+    但 CONNECT_TO_CLUSTER=false 时不落库 —— 运维 Agent 不会启动，这条记录没有消费者。
+    """
+    create_time = datetime.now(timezone.utc)
+    date = create_time.date().isoformat()
+    try:
+        source_type, root = _commit_source_conf()
+    except Exception as exc:
+        logger.error(f"读取 code.commit 配置失败，跳过代码提交登记: {exc}")
+        return
+
+    rel = _commit_rel_dir(app_type, date, app_name)
+    source_dir = _commit_public_dir(source_type, root, rel)
+
+    try:
+        manifest = _source_manifest(Path(project_dir))
+        if not manifest:
+            logger.error(f"{project_dir} 里没有可上传的源码文件，跳过代码提交")
+            return
+        if source_type == "hdfs":
+            source_dir = await asyncio.to_thread(_upload_commit_hdfs, root, rel, manifest)
+        elif source_type == "local":
+            source_dir = await asyncio.to_thread(_upload_commit_local, root, rel, manifest)
+        elif source_type == "ssh":
+            source_dir = await asyncio.to_thread(_upload_commit_ssh, root, rel, manifest)
+        else:
+            source_dir = await asyncio.to_thread(_upload_commit_git, root, rel, manifest)
+    except Exception as exc:
+        logger.error(f"提交源码到 {source_type} 失败（不影响落库）: {type(exc).__name__}: {exc}")
+
+    if not CONNECT_TO_CLUSTER:
+        logger.info("CONNECT_TO_CLUSTER=false，运维 Agent 不会运行，跳过 code.app_file_idx 落库")
+        return
+
+    try:
+        await _save_app_file_idx(
+            app_name=app_name, app_type=app_type,
+            source_type=source_type, source_dir=source_dir, commit_cmd=commit_cmd,
+        )
+    except Exception as exc:
+        logger.error(f"写入 code.app_file_idx 失败（不影响上传）: {type(exc).__name__}: {exc}")
+
+
+def _schedule_submit_target_code(*args, **kwargs) -> None:
+    """从同步打包函数里调度异步提交任务；没有事件循环时退到后台线程"""
+    coro = _submit_target_code(*args, **kwargs)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        def _runner():
+            try:
+                asyncio.run(coro)
+            except Exception as exc:
+                logger.error(f"后台提交代码任务失败: {type(exc).__name__}: {exc}")
+        threading.Thread(target=_runner, daemon=True).start()
+        return
+
+    task = loop.create_task(coro)
+    _COMMIT_TASKS.add(task)
+
+    def _done(t: asyncio.Task):
+        _COMMIT_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(f"后台提交代码任务失败: {t.exception()}")
+
+    task.add_done_callback(_done)
+
+
 def _package_submit_f_command(app_path: str | Path, project_name: str, app_type: str = "flink") -> dict:
     # 打包：CVA 已经跑过测试；提交阶段跳过测试，避免测试代码问题阻塞应用打包
     rc, out = run_mvn_command("mvn clean package -Dmaven.test.skip=true", path=app_path)
@@ -420,17 +649,10 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
             break
     if not jar_file:
         return {"type": "error", "msg": f"未找到 {target_path} 下的 jar 包", "app_type": app_type}
-    if not CONNECT_TO_CLUSTER:
-        return {"type": "info",
-                "msg": f"集群被禁用，未上传/提交 jar：{jar_file}",
-                "app_type": app_type}
+
     # 提交 jar 包到指定的hdfs:///app/{app_type}/jar
     target_dir = f"/app/{app_type}/jar"
     cmd_dir = f"/app/{app_type}/cmd"
-    _hdfs_ensure_dir(target_dir)
-    _hdfs_ensure_dir(cmd_dir)
-    # 上传 jar 包到 hdfs
-    _hdfs_client.upload(target_dir, jar_file, overwrite=True)
     prefix = "DDA" if app_type == "flink" else "DAA"
     # 获取注册表信息
     submit_command_str = redis_con.hget(f"{prefix}:{project_name}", "submit_command")
@@ -442,6 +664,10 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     if isinstance(submit_command_str, bytes):
         submit_command_str = submit_command_str.decode("utf-8")
     submit_command = json.loads(submit_command_str)
+    # ynm 会覆盖 YARN 应用名；表、cmd 文件名和 job__restart 都按 YARN 名对齐
+    yarn_app_name = str(submit_command.get("ynm") or app_name)
+    if yarn_app_name in (".", "..") or "/" in yarn_app_name or "\\" in yarn_app_name:
+        return {"type": "error", "msg": f"应用名不能作为目录名: {yarn_app_name!r}", "app_type": app_type}
     # Flink 1.18 run-application 只认 generic 选项 + -D；-yjm/-ytm/-yn/-ys 等短选项不适用
     command_list: list[str] = ["flink", "run-application", "-t", "yarn-application", "-d"]
     app_args: list[str] = []
@@ -466,21 +692,37 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
                 app_args += [str(p_k), str(p_v)]
         else:
             command_list += ["-D", f"{k}={v}"]
+    if not submit_command.get("ynm"):
+        # 固定 YARN 应用名，保证 code.app_file_idx 的 app_name 与 RM 里的 name 一致
+        command_list += ["-D", f"yarn.application.name={yarn_app_name}"]
     command_list += ["-D", f"yarn.provided.lib.dir=hdfs://{target_dir}"]
     command_list.append(f"hdfs://{target_dir}/{jar_file.name}")
     command_list += app_args
     complete_command = shlex.join(command_list)
-    with open(app_path / f"{app_name}.cmd", "w") as f:
-        f.write(complete_command)
-    # 上传至 hdfs
-    _hdfs_client.upload(cmd_dir, app_path / f"{app_name}.cmd", overwrite=True)
+    # 本地留一份 cmd，再按集群开关决定是否上传
+    cmd_local = Path(app_path) / f"{yarn_app_name}.cmd"
+    cmd_local.write_text(complete_command, encoding="utf-8")
+
+    # 源码登记到 code.commit + code.app_file_idx（与集群提交互不影响）
+    _schedule_submit_target_code(
+        app_name=yarn_app_name, app_type="flink", commit_cmd=complete_command,
+        project_dir=Path(app_path),
+    )
+    # 源码登记后，对Redis中的注册信息进行移除
+    redis_con.hdel(f"{prefix}:{project_name}")
+
     # 运行
     if not CONNECT_TO_CLUSTER:
         return {"type": "info",
                 "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群并运行，可参考命令：{complete_command}"
                         f"\n项目在于：{app_path}"),
                 "app_type": app_type}
-    from urllib.parse import urlparse
+
+    _hdfs_ensure_dir(target_dir)
+    _hdfs_ensure_dir(cmd_dir)
+    _hdfs_client.upload(target_dir, jar_file, overwrite=True)
+    _hdfs_client.upload(cmd_dir, cmd_local, overwrite=True)
+
     host = urlparse(manager).hostname or ""
     res = node_ssh.run(host, complete_command, timeout=120)
     if not res.ok or (getattr(res, "rc", 0) or 0) != 0:
@@ -650,6 +892,14 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
         cmd_local.write_text(complete_command, encoding="utf-8")
         cmd_hdfs = _hdfs_upload_file(f"{cmd_dir}/{app_name}.cmd", cmd_local)
 
+        # 源码登记到 code.commit + code.app_file_idx（与集群提交互不影响）
+        _schedule_submit_target_code(
+            app_name=app_name, app_type="spark", commit_cmd=complete_command,
+            project_dir=app_path,
+        )
+        # 源码登记后，对Redis中的注册信息进行移除，避免占用资源
+        redis_con.hdel(key)
+
         if not CONNECT_TO_CLUSTER:
             return {"type": "info",
                     "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群，并运行，可参考命令：{complete_command}"
@@ -694,7 +944,7 @@ def _splicing_doc(doc_info: dict) -> dict:
     project_dir = None
     if date and project_name:
         project_dir = (
-            ROOT_BASE_DIR_PATH / "tmp_code" / str(app_type) / str(date) / str(project_name)
+                ROOT_BASE_DIR_PATH / "tmp_code" / str(app_type) / str(date) / str(project_name)
         ).resolve()
 
     res_lines.append("## 数据结果\n")
