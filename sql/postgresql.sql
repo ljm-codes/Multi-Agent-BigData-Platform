@@ -135,7 +135,7 @@ create table code.app_file_idx
     commit_cmd  text                                                                 not null,
     create_time timestamptz                                                          not null default now(),
     update_time timestamptz                                                          not null default now()
-); -- 提交作业时，指向 打包好的应用 映射表 -> 用于 快速定位到应用文件路径（ops-Agent用）
+); -- 提交作业时，指向 源码 映射表 -> 用于 快速定位到应用文件路径（ops-Agent用）
 
 create unique index uk_app_file_app on code.app_file_idx (app_type, app_name);
 
