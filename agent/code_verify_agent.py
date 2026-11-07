@@ -6,17 +6,21 @@ import ast
 import asyncio
 import json
 import os
+import posixpath
 import shlex
+import shutil
 import tempfile
+import threading
 import uuid
 import zipfile
-from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast, TypedDict, NotRequired, Literal, Any
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
 from hdfs import InsecureClient
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
@@ -24,17 +28,19 @@ from langgraph.constants import START
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
-from langgraph.types import Command, Send, interrupt
+from langgraph.types import Command, Send, interrupt, CachePolicy
 from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import CodeVerifyAgentInputState, CodeVerifyAgentMainState, DevelopAgentMainState, \
     DevelopGraphErrorState, MainStateContext
+from SPO.postgresql_model import AppFileIndex
 from Tasks.background_broker import background_broker, background_registry, background_thread_id
 from Tasks.build_run_custom_tasks import TaskSupervisor
-from Tools import node_ssh
+from Tools import code_commit, node_ssh
 from Tools.log_settings import LogSetting
 from Tools.code_verify_agent_tools import AGENT_NAME as CVA
 from Tools.data_analysis_agent_tools import analysis_business_files, submit_redis_key
+from Tools.db import AsyncSessionLocal
 from Tools.registry import get_tools
 from Tools.run_command import arun_mvn_command, arun_python_command, run_mvn_command
 from Tools.share_check_tool import redis_con, manager
@@ -166,10 +172,11 @@ class SparkVerifyCommand(BaseModel):
 
 
 class VerifyAgentOutClass(BaseModel):
-    goto: Literal["execute", "user", "submit"] = Field(
-        default="execute", description="这个选项决定了系统下一步的操作。"
-                                       "若为 execute 则先执行浅层测试（验证结果会最终流向你），"
-                                       "若为 user 则进行人工检验，若为 submit 则提交代码到真实环境（注意：非测试环境）"
+    goto: Literal["shallow", "deep", "end"] = Field(
+        default="shallow", description="这个选项决定了系统下一步的操作。"
+                                       "若为 shallow 则先执行浅层测试（验证结果会最终流向你）；"
+                                       "若为 deep 则执行深层测试（验证结果会最终流向你）；"
+                                       "若为 end 则结束流程，并且你能将你说的话写到end_chat中，交于上游进行处理"
     )
     flink_command: FlinkVerifyCommand = Field(
         default_factory=FlinkVerifyCommand,
@@ -189,10 +196,11 @@ class VerifyAgentOutClass(BaseModel):
         description="深层命令的总超时时间（秒）；Flink/Spark 共用；不能超过 600"
     )
     code_summary: CodeSummary = Field(default_factory=CodeSummary,
-                                      description="代码质检结果，当 goto 为 user 时生效，第一次没有结果时不用填写")
-    submit_chat: str = Field(
+                                      description="代码质检结果，当 goto 为 deep 时生效，第一次没有结果时不用填写。"
+                                                  "该字段的含义在于将前面的浅层测试结果与对应的数据进行汇总，方便人工进行观看。他会先进行人工审核再进行深度测试")
+    end_chat: str = Field(
         default="",
-        description="提交代码到真实环境需要给人工说些什么（不用提问是否需要提交，系统会自动处理，你只要说明情况就行了），注意：当 goto 为 submit 时生效")
+        description="验证结束后，你想说些什么（不用提问是否需要提交，系统会自动处理，你只要说明情况就行了），注意：当 goto 为 end 时生效")
 
 
 class TextBuffer:
@@ -405,6 +413,229 @@ async def _run_spark_test_command(commands: list[dict], path: str | Path, buffer
     return results
 
 
+_CODE_COMMIT_CONF = ((config.get("code") or {}).get("commit") or {})
+_COMMIT_TASKS: set[asyncio.Task] = set()
+
+
+def _commit_source_conf() -> tuple[str, str]:
+    """读取 code.commit，返回 (source_type, root)；缺配置时抛错"""
+    source_type = str(_CODE_COMMIT_CONF.get("type") or "").strip().lower()
+    if source_type not in ("hdfs", "local", "ssh", "git"):
+        raise ValueError(f"code.commit.type 只能是 hdfs/local/ssh/git，当前是 {source_type!r}")
+    root = str(_CODE_COMMIT_CONF.get("path") or "").strip()
+    if not root:
+        raise ValueError("code.commit.path 未配置")
+    if source_type in ("local", "ssh") and "://" in root:
+        raise ValueError(f"code.commit.type={source_type} 时 path 必须是目录，不能是 URI: {root!r}")
+    if source_type == "hdfs" and "://" in root and not root.startswith("hdfs://"):
+        raise ValueError(f"code.commit.type=hdfs 时 path 必须是 HDFS 路径: {root!r}")
+    if source_type == "ssh" and not str((_CODE_COMMIT_CONF.get("ssh") or {}).get("ip") or "").strip():
+        raise ValueError("code.commit.ssh.ip 未配置")
+    if source_type == "git":
+        if not str((_CODE_COMMIT_CONF.get("git") or {}).get("git_repo") or "").strip():
+            raise ValueError("code.commit.git.git_repo 未配置")
+        if not os.getenv("GIT_API", "").strip():
+            raise ValueError("GIT_API 未配置")
+    return source_type, root
+
+
+def _commit_rel_dir(app_type: str, date: str, app_name: str) -> str:
+    return f"{app_type}/{date}/{app_name}"
+
+
+def _commit_public_dir(source_type: str, root: str, rel: str) -> str:
+    """落库用的目录：hdfs 保留 URI，local 转绝对路径，ssh 保留远端路径"""
+    if source_type == "hdfs":
+        return f"{root.rstrip('/')}/{rel}"
+    if source_type == "local":
+        root_path = Path(root).expanduser()
+        if not root_path.is_absolute():
+            root_path = ROOT_BASE_DIR_PATH / root_path
+        return str(root_path / Path(rel))
+    if source_type == "ssh":
+        return posixpath.join(root.rstrip("/"), rel)
+    return f"/{rel.lstrip('/')}"
+
+
+def _upload_commit_hdfs(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    if _hdfs_client is None:
+        raise RuntimeError("CONNECT_TO_CLUSTER=false，HDFS 提交存储不可用")
+    root_path = urlparse(root).path if "://" in root else root
+    if not root_path:
+        raise ValueError(f"无法从 code.commit.path 解析出 HDFS 路径: {root!r}")
+    remote_dir = posixpath.join(root_path.rstrip("/"), rel)
+    _hdfs_ensure_dir(remote_dir)
+    for local, sub in files:
+        dest = posixpath.join(remote_dir, sub)
+        parent = posixpath.dirname(dest)
+        if parent:
+            _hdfs_ensure_dir(parent)
+        _hdfs_client.upload(dest, str(local), overwrite=True)
+    return f"{root.rstrip('/')}/{rel}"
+
+
+def _upload_commit_local(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    root_path = Path(root).expanduser()
+    if not root_path.is_absolute():
+        root_path = ROOT_BASE_DIR_PATH / root_path
+    target = root_path / Path(rel)
+    target.mkdir(parents=True, exist_ok=True)
+    for local, sub in files:
+        dest = target / Path(sub)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local, dest)
+    return str(target)
+
+
+def _upload_commit_ssh(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    host, user, port, password = code_commit.ssh_endpoint()
+    remote_dir = posixpath.join(root.rstrip("/"), rel)
+    # 复用 node_ssh 的连接池：SFTP 通道用完就关，ssh 连接一直留着
+    with node_ssh.sftp(host, user=user, port=port, password=password) as sftp:
+        node_ssh.ensure_remote_dirs(sftp, remote_dir)
+        for local, sub in files:
+            dest = posixpath.join(remote_dir, sub)
+            node_ssh.ensure_remote_dirs(sftp, posixpath.dirname(dest))
+            sftp.put(str(local), dest)
+    return remote_dir
+
+
+def _upload_commit_git(root: str, rel: str, files: list[tuple[Path, str]]) -> str:
+    return code_commit.upload(f"/{rel.lstrip('/')}", files, f"submit {rel}")
+
+
+async def _save_app_file_idx(
+        *, app_name: str, app_type: Literal["spark", "flink"],
+        source_type: str, source_dir: str, commit_cmd: str,
+) -> None:
+    """upsert code.app_file_idx；更新时刷新 update_time"""
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        stmt = pg_insert(AppFileIndex).values(
+            app_type=app_type.upper(),
+            app_name=app_name,
+            source_type=source_type,
+            source_dir=source_dir,
+            commit_cmd=commit_cmd,
+            create_time=now,
+            update_time=now,
+        ).on_conflict_do_update(
+            index_elements=["app_type", "app_name"],
+            set_={
+                "source_type": source_type,
+                "source_dir": source_dir,
+                "commit_cmd": commit_cmd,
+                "update_time": now,
+            },
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+# 源码目录不传打包/编译产物：运维侧读的、改的都是源码
+_SOURCE_SKIP_DIRS = {"target", "__pycache__", ".git", ".idea", ".venv", "venv",
+                     "node_modules", "logs"}
+_SOURCE_SKIP_SUFFIX = {".class", ".jar", ".pyc", ".pyo", ".log", ".bak", ".cmd"}
+
+
+def _source_manifest(project_dir: Path) -> list[tuple[Path, str]]:
+    """项目目录 -> [(本地文件, 项目内相对路径)]，跳过 target/__pycache__ 等产物"""
+    root = Path(project_dir)
+    files: list[tuple[Path, str]] = []
+    for f in sorted(root.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(root)
+        if any(p in _SOURCE_SKIP_DIRS or p.startswith(".") for p in rel.parts[:-1]):
+            continue
+        if f.name.startswith(".") or f.name == "TIME":
+            continue
+        if f.suffix.lower() in _SOURCE_SKIP_SUFFIX:
+            continue
+        files.append((f, rel.as_posix()))
+    return files
+
+
+async def _submit_target_code(
+        app_name: str, app_type: Literal["spark", "flink"],
+        commit_cmd: str, project_dir: Path,
+) -> None:
+    """
+    将项目源码传到 code.commit.path/{app_type}/{date}/{app_name}，
+    并把定位信息 upsert 到 code.app_file_idx。
+
+    上传和落库互不影响：上传失败也落库；落库失败不影响已经上传的文件。
+    但 CONNECT_TO_CLUSTER=false 时不落库 —— 运维 Agent 不会启动，这条记录没有消费者。
+    """
+    create_time = datetime.now(timezone.utc)
+    date = create_time.date().isoformat()
+    try:
+        source_type, root = _commit_source_conf()
+    except Exception as exc:
+        logger.error(f"读取 code.commit 配置失败，跳过代码提交登记: {exc}")
+        return
+
+    rel = _commit_rel_dir(app_type, date, app_name)
+    source_dir = _commit_public_dir(source_type, root, rel)
+
+    try:
+        manifest = _source_manifest(Path(project_dir))
+        if not manifest:
+            logger.error(f"{project_dir} 里没有可上传的源码文件，跳过代码提交")
+            return
+        if source_type == "hdfs":
+            source_dir = await asyncio.to_thread(_upload_commit_hdfs, root, rel, manifest)
+        elif source_type == "local":
+            source_dir = await asyncio.to_thread(_upload_commit_local, root, rel, manifest)
+        elif source_type == "ssh":
+            source_dir = await asyncio.to_thread(_upload_commit_ssh, root, rel, manifest)
+        else:
+            source_dir = await asyncio.to_thread(_upload_commit_git, root, rel, manifest)
+    except Exception as exc:
+        logger.error(f"提交源码到 {source_type} 失败（不影响落库）: {type(exc).__name__}: {exc}")
+
+    if not CONNECT_TO_CLUSTER:
+        logger.info("CONNECT_TO_CLUSTER=false，运维 Agent 不会运行，跳过 code.app_file_idx 落库")
+        return
+
+    try:
+        await _save_app_file_idx(
+            app_name=app_name, app_type=app_type,
+            source_type=source_type, source_dir=source_dir, commit_cmd=commit_cmd,
+        )
+    except Exception as exc:
+        logger.error(f"写入 code.app_file_idx 失败（不影响上传）: {type(exc).__name__}: {exc}")
+
+
+def _schedule_submit_target_code(*args, **kwargs) -> None:
+    """从同步打包函数里调度异步提交任务；没有事件循环时退到后台线程"""
+    coro = _submit_target_code(*args, **kwargs)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        def _runner():
+            try:
+                asyncio.run(coro)
+            except Exception as exc:
+                logger.error(f"后台提交代码任务失败: {type(exc).__name__}: {exc}")
+
+        threading.Thread(target=_runner, daemon=True).start()
+        return
+
+    task = loop.create_task(coro)
+    _COMMIT_TASKS.add(task)
+
+    def _done(t: asyncio.Task):
+        _COMMIT_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(f"后台提交代码任务失败: {t.exception()}")
+
+    task.add_done_callback(_done)
+
+
 def _package_submit_f_command(app_path: str | Path, project_name: str, app_type: str = "flink") -> dict:
     # 打包：CVA 已经跑过测试；提交阶段跳过测试，避免测试代码问题阻塞应用打包
     rc, out = run_mvn_command("mvn clean package -Dmaven.test.skip=true", path=app_path)
@@ -420,17 +651,10 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
             break
     if not jar_file:
         return {"type": "error", "msg": f"未找到 {target_path} 下的 jar 包", "app_type": app_type}
-    if not CONNECT_TO_CLUSTER:
-        return {"type": "info",
-                "msg": f"集群被禁用，未上传/提交 jar：{jar_file}",
-                "app_type": app_type}
+
     # 提交 jar 包到指定的hdfs:///app/{app_type}/jar
     target_dir = f"/app/{app_type}/jar"
     cmd_dir = f"/app/{app_type}/cmd"
-    _hdfs_ensure_dir(target_dir)
-    _hdfs_ensure_dir(cmd_dir)
-    # 上传 jar 包到 hdfs
-    _hdfs_client.upload(target_dir, jar_file, overwrite=True)
     prefix = "DDA" if app_type == "flink" else "DAA"
     # 获取注册表信息
     submit_command_str = redis_con.hget(f"{prefix}:{project_name}", "submit_command")
@@ -442,6 +666,10 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     if isinstance(submit_command_str, bytes):
         submit_command_str = submit_command_str.decode("utf-8")
     submit_command = json.loads(submit_command_str)
+    # ynm 会覆盖 YARN 应用名；表、cmd 文件名和 job__restart 都按 YARN 名对齐
+    yarn_app_name = str(submit_command.get("ynm") or app_name)
+    if yarn_app_name in (".", "..") or "/" in yarn_app_name or "\\" in yarn_app_name:
+        return {"type": "error", "msg": f"应用名不能作为目录名: {yarn_app_name!r}", "app_type": app_type}
     # Flink 1.18 run-application 只认 generic 选项 + -D；-yjm/-ytm/-yn/-ys 等短选项不适用
     command_list: list[str] = ["flink", "run-application", "-t", "yarn-application", "-d"]
     app_args: list[str] = []
@@ -466,21 +694,37 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
                 app_args += [str(p_k), str(p_v)]
         else:
             command_list += ["-D", f"{k}={v}"]
+    if not submit_command.get("ynm"):
+        # 固定 YARN 应用名，保证 code.app_file_idx 的 app_name 与 RM 里的 name 一致
+        command_list += ["-D", f"yarn.application.name={yarn_app_name}"]
     command_list += ["-D", f"yarn.provided.lib.dir=hdfs://{target_dir}"]
     command_list.append(f"hdfs://{target_dir}/{jar_file.name}")
     command_list += app_args
     complete_command = shlex.join(command_list)
-    with open(app_path / f"{app_name}.cmd", "w") as f:
-        f.write(complete_command)
-    # 上传至 hdfs
-    _hdfs_client.upload(cmd_dir, app_path / f"{app_name}.cmd", overwrite=True)
+    # 本地留一份 cmd，再按集群开关决定是否上传
+    cmd_local = Path(app_path) / f"{yarn_app_name}.cmd"
+    cmd_local.write_text(complete_command, encoding="utf-8")
+
+    # 源码登记到 code.commit + code.app_file_idx（与集群提交互不影响）
+    _schedule_submit_target_code(
+        app_name=yarn_app_name, app_type="flink", commit_cmd=complete_command,
+        project_dir=Path(app_path),
+    )
+    # 源码登记后，对Redis中的注册信息进行移除
+    redis_con.hdel(f"{prefix}:{project_name}")
+
     # 运行
     if not CONNECT_TO_CLUSTER:
         return {"type": "info",
                 "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群并运行，可参考命令：{complete_command}"
                         f"\n项目在于：{app_path}"),
                 "app_type": app_type}
-    from urllib.parse import urlparse
+
+    _hdfs_ensure_dir(target_dir)
+    _hdfs_ensure_dir(cmd_dir)
+    _hdfs_client.upload(target_dir, jar_file, overwrite=True)
+    _hdfs_client.upload(cmd_dir, cmd_local, overwrite=True)
+
     host = urlparse(manager).hostname or ""
     res = node_ssh.run(host, complete_command, timeout=120)
     if not res.ok or (getattr(res, "rc", 0) or 0) != 0:
@@ -650,6 +894,14 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
         cmd_local.write_text(complete_command, encoding="utf-8")
         cmd_hdfs = _hdfs_upload_file(f"{cmd_dir}/{app_name}.cmd", cmd_local)
 
+        # 源码登记到 code.commit + code.app_file_idx（与集群提交互不影响）
+        _schedule_submit_target_code(
+            app_name=app_name, app_type="spark", commit_cmd=complete_command,
+            project_dir=app_path,
+        )
+        # 源码登记后，对Redis中的注册信息进行移除，避免占用资源
+        redis_con.hdel(key)
+
         if not CONNECT_TO_CLUSTER:
             return {"type": "info",
                     "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群，并运行，可参考命令：{complete_command}"
@@ -694,7 +946,7 @@ def _splicing_doc(doc_info: dict) -> dict:
     project_dir = None
     if date and project_name:
         project_dir = (
-            ROOT_BASE_DIR_PATH / "tmp_code" / str(app_type) / str(date) / str(project_name)
+                ROOT_BASE_DIR_PATH / "tmp_code" / str(app_type) / str(date) / str(project_name)
         ).resolve()
 
     res_lines.append("## 数据结果\n")
@@ -742,21 +994,6 @@ def _splicing_doc(doc_info: dict) -> dict:
     }
 
 
-def _error_dict_to_str(error_dict: dict) -> dict:
-    # 主要为 TaskOutcome
-    task_type = error_dict.get("type")
-    app_type = error_dict.get("app_type")
-    if task_type is None or task_type != "error":
-        return {"type": "error", "msg": f"_error_dict_to_str函数传入了不该传入的类型：task_type: {task_type}，应为 error",
-                "app_type": app_type}
-    msg = f"""任务在连续出现了2次错误被强制终止，现在由您确认一遍：
-    {error_dict.get('message') or error_dict.get('error') or '未解析'}
-    在强制中断前，任务的运行结果为：\n{error_dict.get('partial', '无')}
-    请你手动确认该测试是否通过，并进行手动测试。之后若对业务结果不满意，则可以提交对应说明去进行整改。
-    """
-    return {"type": "error", "msg": msg, "app_type": app_type}
-
-
 # --------------- nodes ---------------
 def _verify_input_handler(state: CodeVerifyAgentInputState) -> CodeVerifyAgentMainState:
     task_list = state.get("original_task_list") or []
@@ -782,6 +1019,9 @@ def _verify_input_handler(state: CodeVerifyAgentInputState) -> CodeVerifyAgentMa
         source=code_source,
         original_task_list=state.get("original_task_list") or [],
         mermaid_retry_num=0,  # 每次质检只允许重修一次流程图
+        is_submit=state.get("is_submit", False),
+        is_ops=state.get("is_ops", False),
+        status=state.get("status", "preliminary"),
     )
     if background_msg:
         # 后台回流是一次全新判断：清掉上一轮 handed_off 留下的结果和失败计数
@@ -820,16 +1060,16 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
                 name="shallow_command:result"
             )]
     if dres := state.get("deep_result"):
-        if dres.status == "completed":
-            result_msg = [AIMessage(
-                content=f"所有命令执行完成，结果为：{json.dumps(dres.result)}",
-                name="deep_command:result"
-            )]
+        if dres.status in ("completed", "background_completed"):
+            content = f"所有命令执行完成，结果为：{json.dumps(dres.result)}"
         elif dres.status == "handed_off":
-            result_msg = [AIMessage(
-                content=f"{dres.message}\n在转交之前运行的结果为：{json.dumps(dres.snapshot) if dres.snapshot else '无结果'}",
-                name="deep_command:result"
-            )]
+            content = (f"{dres.message}\n在转交之前运行的结果为："
+                       f"{json.dumps(dres.snapshot) if dres.snapshot else '无结果'}")
+        elif dres.status in ("timeout", "background_timeout"):
+            content = f"{dres.message}，终止之前返回的结果为：{json.dumps(dres.partial)}"
+        else:
+            content = f"{dres.message}, 具体的错误为：{dres.error}"
+        result_msg = [AIMessage(content=content, name="deep_command:result")]
     verify_request = ModelRequest(
         model=_verify_model,
         messages=state.get("messages"),
@@ -914,18 +1154,36 @@ def _route_error_send(state: CodeVerifyAgentMainState, desc: str, from_: str = "
 
 def _verify_error_node(state: dict, runtime: Runtime) -> Command:
     """ver_error 节点：把错误以 Command(graph=PARENT) 交回主图"""
+    desc = state.get("desc") or "代码质检失败"
+    # 浅层连错被强制终止时，把最后一次失败原因一起交给 work_end
+    if shallow := state.get("shallow_result"):
+        detail = (getattr(shallow, "message", "") or getattr(shallow, "error", "")
+                  or getattr(shallow, "partial", "") or getattr(shallow, "result", ""))
+        if detail:
+            desc = f"{desc}；浅层最后一次结果：{detail}"
     return Command(
         graph=Command.PARENT,
         goto="work_end",
         update={
             "type": "error",
-            "desc": state.get("desc") or "代码质检失败",
+            "desc": desc,
             "from_": state.get("from_") or "ver_chat",
             "thread_id": runtime.context.thread_id,
             "app_type": state.get("app_type"),
             "date": state.get("date"),
             "project_name": state.get("project_name"),
         },
+    )
+
+
+def _verify_warn_node(state: dict) -> Command:
+    """把「状态不匹配」的提示写回消息后重新问模型，不在节点间乱跳"""
+    return Command(
+        goto="ver_chat",
+        update={
+            "status": state.get("status", "preliminary"),
+            "messages": state.get("messages", []),
+        }
     )
 
 
@@ -960,42 +1218,39 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
     hard_timeout = execute_info.get("hard_timeout") or 600
     goto = execute_info.get("goto")
 
-    # 深层已经 completed 时禁止再跑 execute/user（否则会重复浅层/深层和人工确认）。
-    # 只允许 submit；submit_chat 缺失时给默认说明。
     deep_result = state.get("deep_result")
     deep_status = (deep_result.get("status") if isinstance(deep_result, dict)
                    else getattr(deep_result, "status", None))
-    if deep_status == "completed" and goto != "submit":
+    status = state.get("status", "preliminary")
+    if deep_status == "handed_off":
+        # 深层还在后台跑：本轮只允许收尾汇报，重跑/提前提交一律拦下
+        if goto == "end":
+            return Send(
+                "ver_end",
+                {
+                    "verify_end_msg": execute_info.get("end_chat"),
+                    "from_": "ver_dispatch",
+                    "date": date,
+                    "project_name": p_name,
+                    "app_type": app_type,
+                },
+            )
         return Send(
-            "ver_submit",
+            "ver_warn",
             {
-                "submit_msg": execute_info.get("submit_chat") or "深层测试已完成，请确认是否提交。",
-                "date": date,
-                "project_name": p_name,
-                "app_type": app_type,
+                "status": status,
+                "messages": [HumanMessage(
+                    content="深层测试已转后台运行，本轮只能用 goto=end 汇报情况，不要重跑测试或提交。")],
             },
         )
 
-    if goto == "execute":
+    # 浅层失败后允许改测试重跑，所以 shallow 阶段也接受 shallow
+    if goto == "shallow" and status in ("preliminary", "shallow"):
         if fail_num := state.get("fail_num"):
-            # 浅层连续失败超过 2 次就强制转人工，Spark/Flink 同一规则
+            # 浅层连续失败超过 2 次就强制终止，直接交父图 work_end，不再转人工
             if fail_num > 2:
-                shallow_result = state.get("shallow_result")
-                if hasattr(shallow_result, "__dataclass_fields__"):
-                    shallow_result = asdict(shallow_result)
-                test_code_dict = {
-                    "type": "error",
-                    **(shallow_result or {}),
-                    "app_type": app_type,
-                    "source": state.get("source"),
-                    "original_task_list": state.get("original_task_list") or [],
-                    "date": date,
-                    "project_name": p_name,
-                }
-                return Send(
-                    "ver_manual",
-                    test_code_dict
-                )
+                return _route_error_send(
+                    state, f"浅层测试连续失败 {fail_num} 次，超过系统上限，已强制终止")
         if app_type == "flink":
             shallow_commands = _parse_command(flink_command.get("flink_shallow_command") or [])
         elif app_type == "spark":
@@ -1010,8 +1265,7 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
                 "shallow_timeout": first_timeout,
             },
         )
-
-    if goto == "user":
+    elif goto == "deep" and status == "shallow":
         if app_type == "flink":
             deep_commands = _parse_command(flink_command.get("flink_deep_command") or [])
         elif app_type == "spark":
@@ -1038,18 +1292,38 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
             code_summary
         )
 
-    if goto == "submit":
+    elif goto == "end" and status == "deep":
+        is_submit = state.get("is_submit", False)
         submit_info = {
-            "submit_msg": execute_info.get("submit_chat"),
+            "verify_end_msg": execute_info.get("end_chat"),
             "date": state.get("date"),
             "project_name": state.get("project_name"),
             "app_type": app_type,
         }
+        if is_submit:
+            return Send(
+                "ver_submit",
+                submit_info
+            )
+        else:
+            submit_info["from_"] = "ver_dispatch"
+            return Send(
+                "ver_end",
+                submit_info
+            )
+    else:
+        target_goto = "shallow"
+        if status == "shallow":
+            target_goto = "deep"
+        elif status in ("deep", "done"):
+            target_goto = "end"
         return Send(
-            "ver_submit",
-            submit_info
+            "ver_warn",
+            {
+                "status": status,
+                "messages": [HumanMessage(content=f"当前状态: {status}，请先调用{target_goto}")],
+            }
         )
-    return _route_error_send(state, f"无法识别的 goto: {goto!r}")
 
 
 async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runtime) -> Command:
@@ -1081,7 +1355,7 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
                 buffer=buf
             )
         )
-        update_state = {"shallow_result": final_result}
+        update_state = {"shallow_result": final_result, "status": "shallow"}
         if final_result.status != "completed":
             if fail_num := state.get("fail_num"):
                 update_state["fail_num"] = fail_num + 1
@@ -1110,7 +1384,7 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
                 buffer=buf
             )
         )
-        update_state = {"shallow_result": final_result}
+        update_state = {"shallow_result": final_result, "status": "shallow"}
         if final_result.status != "completed":
             update_state["fail_num"] = (state.get("fail_num") or 0) + 1
         return Command(
@@ -1122,11 +1396,7 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
 
 
 def _verify_manual(code_summary: dict, runtime: Runtime) -> Command:
-    code_res_type = code_summary.get("type")
-    if code_res_type == "error":
-        to_manual_dict = _error_dict_to_str(code_summary)
-    else:
-        to_manual_dict = _splicing_doc(code_summary)
+    to_manual_dict = _splicing_doc(code_summary)
     mermaid_error = to_manual_dict.pop("mermaid_error", "")
     retry_num = code_summary.get("mermaid_retry_num") or 0
     if mermaid_error and retry_num < 1:
@@ -1137,7 +1407,7 @@ def _verify_manual(code_summary: dict, runtime: Runtime) -> Command:
             update={
                 "messages": [HumanMessage(content=(
                     "上一次输出的 mermaid_flowgraph 未通过 Mermaid 语法校验，请修正后重新调用 "
-                    "VerifyAgentOutClass（goto=user），其它字段保持不变。\n"
+                    "VerifyAgentOutClass（goto=deep），其它字段保持不变。\n"
                     f"校验错误：{mermaid_error}\n"
                     f"原始流程图：\n{code_summary.get('mermaid_flowgraph') or ''}"
                 ))],
@@ -1202,6 +1472,7 @@ def _verify_manual(code_summary: dict, runtime: Runtime) -> Command:
                 "deep_commands": deep_commands,
                 "deep_timeout": deep_timeout,
                 "shallow_timeout": shallow_timeout,
+                "status": "deep",
                 "fail_num": 0,  # 由于到达了这，说明浅层已经完成或者失败，并涉及人工，则重置失败次数
             }
         )
@@ -1265,6 +1536,7 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             second_timeout=deep_timeout,
             context={"buffer": buf},
             sink=background_broker,
+            status="deep",
         )
         final_result = await supervisor.run(
             coro=_run_flink_test_command(
@@ -1273,7 +1545,11 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
                 buffer=buf
             )
         )
-        update_state = {"deep_result": final_result}
+        update_state = {
+            "deep_result": final_result,
+            # 转后台时深层还没有结论：本轮只能收尾，等后台回流再 end
+            "status": "done" if final_result.status == "handed_off" else "deep",
+        }
         if final_result.status != "completed":
             if fail_num := state.get("fail_num"):
                 update_state["fail_num"] = fail_num + 1
@@ -1292,7 +1568,7 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             update={
                 **update_state,
                 "deep_task_id": deep_task_id,
-                "shallow_result": None  # 清空状态，否则被干扰
+                "shallow_result": None,  # 清空状态，否则被干扰
             }
         )
 
@@ -1311,6 +1587,7 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             second_timeout=deep_timeout,
             context={"buffer": buf},
             sink=background_broker,
+            status="deep",
         )
         final_result = await supervisor.run(
             coro=_run_spark_test_command(
@@ -1319,7 +1596,11 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
                 buffer=buf
             )
         )
-        update_state = {"deep_result": final_result}
+        update_state = {
+            "deep_result": final_result,
+            # 转后台时深层还没有结论：本轮只能收尾，等后台回流再 end
+            "status": "done" if final_result.status == "handed_off" else "deep",
+        }
         if final_result.status != "completed":
             update_state["fail_num"] = (state.get("fail_num") or 0) + 1
         if final_result.status == "handed_off":
@@ -1335,7 +1616,7 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             update={
                 **update_state,
                 "deep_task_id": deep_task_id,
-                "shallow_result": None  # 清空状态，否则被干扰
+                "shallow_result": None,  # 清空状态，否则被干扰
             }
         )
 
@@ -1343,7 +1624,7 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
 
 
 async def _verify_submit(state: dict, runtime: Runtime) -> Command:
-    submit_msg = state.get("submit_msg")
+    verify_end_msg = state.get("verify_end_msg")
     date = state.get("date")
     # 上游 Send 里两种写法都兼容：老版本叫 p_name，新版本叫 project_name
     p_name = state.get("project_name") or state.get("p_name")
@@ -1363,20 +1644,20 @@ async def _verify_submit(state: dict, runtime: Runtime) -> Command:
             }
         )
     app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
-    answer = interrupt(submit_msg)  # 人工回传 "yes"/"no" "yes" -> 自动提交 "no" -> 手动提交
+    answer = interrupt("请再次确认是否需要自动提交应用到真实环境")  # 人工回传 "yes"/"no" "yes" -> 自动提交 "no" -> 手动提交
     answer_norm = answer.strip().lower() if isinstance(answer, str) else ""
     if answer_norm in {"no", "n"}:
         return Command(
-            graph=Command.PARENT,
-            goto="work_end",
+            goto="ver_end",
             update={
                 "type": "info",
-                "desc": "人工拒绝自动提交，采用手动提交任务",
+                "submit_desc": "当再次确认时，人工表示拒绝自动提交，采用手动提交任务",
                 "from_": "ver_submit",
                 "thread_id": runtime.context.thread_id,
                 "date": date,
                 "project_name": p_name,
                 "app_type": app_type,
+                "verify_end_msg": verify_end_msg,
             }
         )
     if answer_norm not in {"yes", "y"}:
@@ -1408,16 +1689,56 @@ async def _verify_submit(state: dict, runtime: Runtime) -> Command:
         logger.error(f"提交应用失败{type(e).__name__}: {e}")
         res = {"type": "error", "msg": f"提交应用失败{type(e).__name__}: {e}", "app_type": app_type}
     return Command(
-        graph=Command.PARENT,
-        goto="work_end",
+        goto="ver_end",
         update={
             "type": res.get("type"),
-            "desc": res.get("msg"),
+            "submit_desc": res.get("msg"),
             "from_": "ver_submit",
             "thread_id": runtime.context.thread_id,
             "date": date,
             "project_name": p_name,
             "app_type": app_type,
+            "verify_end_msg": verify_end_msg,
+        }
+    )
+
+
+def _verify_end(state: dict, runtime: Runtime) -> Command:
+    """这里结束验证，将信息传到上游"""
+    verify_end_msg = state.get("verify_end_msg", "")
+    submit_desc = state.get("submit_desc")
+    date = state.get("date")
+    p_name = state.get("project_name")
+    app_type = state.get("app_type")
+    from_ = state.get("from_")
+    submit_type = state.get("type")
+    if submit_desc:
+        submit_msg = f"对于提交返回的结果：提交后返回的类型为{submit_type}, 该类型的详细描述为：{submit_desc}"
+    else:
+        submit_msg = "作业没有进行提交"
+    out_msg = (f"验证完毕，该项目的目录落于{ROOT_BASE_DIR_PATH / 'tmp_code' / app_type / date / p_name} 中。"
+               f"\n对于验证Agent它表示：{verify_end_msg}"
+               f"\n{submit_msg}")
+    if state.get("is_ops"):
+        # 运维转交：结果直接交父图 work_end，由 dev_handover 写回 AgentRun
+        return Command(
+            graph=Command.PARENT,
+            goto="work_end",
+            update={
+                "type": "error" if submit_desc and submit_type == "error" else "info",
+                "desc": out_msg,
+                "from_": from_ or "ver_end",
+                "thread_id": runtime.context.thread_id,
+                "app_type": app_type,
+                "date": date,
+                "project_name": p_name,
+            },
+        )
+    return Command(
+        graph=Command.PARENT,
+        goto="dis_chat",
+        update={
+            "messages": [AIMessage(content=out_msg, name=f"ver:{from_}")],
         }
     )
 
@@ -1430,23 +1751,31 @@ _verify_builder = StateGraph(
     output_schema=cast("OutputT", DevelopAgentMainState),
 )
 _verify_builder.add_node("ver_handler", cast("StateNode", _verify_input_handler))
-_verify_builder.add_node("ver_chat", cast("StateNode", _verify_agent_chat))
+_verify_builder.add_node("ver_chat", cast("StateNode", _verify_agent_chat), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
 _verify_builder.add_node("ver_error", cast("StateNode", _verify_error_node))
-_verify_builder.add_node("ver_com_exec", cast("StateNode", _verify_shallow_execute))
+_verify_builder.add_node("ver_warn", cast("StateNode", _verify_warn_node))
+_verify_builder.add_node("ver_com_exec", cast("StateNode", _verify_shallow_execute), cache_policy=CachePolicy(
+    ttl=1 * 60 * 60
+))
 _verify_builder.add_node("ver_manual", cast("StateNode", _verify_manual))
 _verify_builder.add_node("ver_deep_exec", cast("StateNode", _verify_deep_execute))
 _verify_builder.add_node("ver_submit", cast("StateNode", _verify_submit))
 _verify_builder.add_node("tools", ToolNode(
     tools=code_verify_agent_tools,
     awrap_tool_call=chain_tool_call_wrappers(verify_agent_middleware)
+), cache_policy=CachePolicy(
+    ttl=3 * 60 * 60
 ))
+_verify_builder.add_node("ver_end", cast("StateNode", _verify_end))
 
 _verify_builder.add_edge(START, "ver_handler")
 _verify_builder.add_edge("ver_handler", "ver_chat")
 _verify_builder.add_conditional_edges(
     "ver_chat",
     _verify_msg_dispatch,
-    ["ver_com_exec", "ver_manual", "ver_submit", "tools", "ver_error"]
+    ["ver_com_exec", "ver_manual", "ver_submit", "tools", "ver_error", "ver_warn", "ver_end"]
 )
 _verify_builder.add_edge("tools", "ver_chat")
 verify_agent = _verify_builder.compile()

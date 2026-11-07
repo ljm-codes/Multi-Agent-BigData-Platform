@@ -14,7 +14,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import Send
 
 from SPO.main_agent_state_model import AgentDevelopInputState, MainStateContext, CodeVerifyAgentInputState, \
-    DevelopGraphErrorState, AllocateErrorInfo, content_text
+    DevelopGraphErrorState, AllocateErrorInfo, content_text, WorkEndState
 from Tools.log_settings import LogSetting
 from Tools.data_develop_agent_tools import AGENT_NAME as DEVELOP_AGENT, run_mvn_command
 from Tools.registry import get_tools
@@ -70,6 +70,12 @@ async def big_data_develop_code_agent(
     else:
         handle_msg = HumanMessage(
             content=f"请根据以下任务列表，开发代码：{'\n'.join(task_list)}\n{state.get('human_suggestion', '')}"
+        )
+    if state.get("is_ops"):
+        tasks = "\n".join(f"- {item}" for item in (task_list or []))
+        handle_msg = HumanMessage(
+            content=f"这是运维 Agent 转交的现网应用修复任务，项目已经存在（{state.get('project_name')}），"
+                    f"不要重新初始化项目，直接定位并修改代码。\n修复清单：\n{tasks}"
         )
     if human_suggestion := state.get("human_suggestion"):
         handle_msg = HumanMessage(
@@ -162,6 +168,8 @@ async def big_data_develop_code_agent(
         date=date,
         original_task_list=task_list,
         is_repair=state.get("is_repair", False),
+        is_submit=state.get("is_submit", False),
+        is_ops=state.get("is_ops", False),
     )
     if repair_num:
         code_verify_in_state["repair_num"] = repair_num
@@ -169,7 +177,7 @@ async def big_data_develop_code_agent(
         # 把用户可见的最终回复写回父图 messages；Send 的临时输入不受影响
         return {
             **code_verify_in_state,
-            "messages": [AIMessage(content=final_text, name="data_develop")],
+            "messages": [AIMessage(content=f"来自大数据开发Agent的回复：\n{final_text}", name="data_develop")],
         }
     return code_verify_in_state
 
@@ -192,6 +200,19 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
     date = state.get("date")
     app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / project_name
     res_code, res_out = run_mvn_command("mvn clean compile", path=str(app_path))
+
+    repair_num = state.get("repair_num", 1)
+    if repair_num > 3:
+        return Send(
+            "work_end",
+            WorkEndState(
+                type="error",
+                from_="data_develop_agent",
+                desc=f"超过3次修复任然没有修复成功，强制终止该任务，该项目在{app_path}下，请手动修复",
+                thread_id=cast(str, state.get("thread_id")),
+                app_type="flink",
+            )
+        )
     if res_code != 0:
         return Send(
             "data_develop",
@@ -203,9 +224,13 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
                 "task_list": state.get("original_task_list"),
                 "is_repair": True,
                 "repair_num": 1 if not state.get("repair_num") else state.get("repair_num") + 1,
+                # 修复重入也要保留运维模式，否则验证结束会回到 dis_chat
+                "is_ops": state.get("is_ops", False),
+                "ops_handover": state.get("ops_handover"),
             }
         )
     return Send(
         "code_verify",
-        state
+        # 新任务/修复后的验证重新从浅层开始，不能沿用上一次后台回流留下的 status
+        {**state, "status": "preliminary"}
     )

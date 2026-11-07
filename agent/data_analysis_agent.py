@@ -71,6 +71,12 @@ async def big_data_analysis_code_agent(
             content=f"请根据以下任务列表，开发 spark 数据分析代码（python）：{'\n'.join(task_list)}\n"
                     f"{state.get('human_suggestion', '')}"
         )
+    if state.get("is_ops"):
+        tasks = "\n".join(f"- {item}" for item in (task_list or []))
+        handle_msg = HumanMessage(
+            content=f"这是运维 Agent 转交的现网应用修复任务，项目已经存在（{state.get('project_name')}），"
+                    f"不要重新初始化项目，直接定位并修改代码。\n修复清单：\n{tasks}"
+        )
     if human_suggestion := state.get("human_suggestion"):
         handle_msg = HumanMessage(
             content=f"经人工核对，代码开发不符合业务需求（系统已自动锁定该项目）。人工建议为：\n{human_suggestion}"
@@ -136,6 +142,8 @@ async def big_data_analysis_code_agent(
         date=date,
         original_task_list=task_list,
         is_repair=state.get("is_repair", False),
+        is_submit=state.get("is_submit", False),
+        is_ops=state.get("is_ops", False),
     )
     if repair_num:
         code_verify_in_state["repair_num"] = repair_num
@@ -143,7 +151,7 @@ async def big_data_analysis_code_agent(
         # 把用户可见的最终回复写回父图 messages；Send 的临时输入不受影响
         return {
             **code_verify_in_state,
-            "messages": [AIMessage(content=final_text, name="data_analysis")],
+            "messages": [AIMessage(content=f"来自数据分析Agent的回复：\n{final_text}", name="data_analysis")],
         }
     return code_verify_in_state
 
@@ -187,6 +195,19 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
             errors.append(f"{f.relative_to(app_path)} {location}：{e.msg}")
         except Exception as e:
             errors.append(f"{f.relative_to(app_path)} 读取/编译失败：{type(e).__name__}: {e}")
+
+    repair_num = state.get("repair_num", 1)
+    if repair_num > 3:
+        return Send(
+            "work_end",
+            WorkEndState(
+                type="error",
+                from_="data_analysis_agent",
+                desc=f"超过3次修复任然没有修复成功，强制终止该任务，该项目在{app_path}下，请手动修复",
+                thread_id=cast(str, state.get("thread_id")),
+                app_type="spark",
+            )
+        )
     if errors:
         return Send(
             "data_analysis",
@@ -199,9 +220,13 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
                 "task_num": len(original_task_list),
                 "is_repair": True,
                 "repair_num": 1 if not state.get("repair_num") else state.get("repair_num") + 1,
+                # 修复重入也要保留运维模式，否则验证结束会回到 dis_chat
+                "is_ops": state.get("is_ops", False),
+                "ops_handover": state.get("ops_handover"),
             }
         )
     return Send(
         "code_verify",
-        state
+        # 新任务/修复后的验证重新从浅层开始，不能沿用上一次后台回流留下的 status
+        {**state, "status": "preliminary"}
     )

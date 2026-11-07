@@ -9,7 +9,8 @@ runner 约定：
 - 用 context=MainStateContext(thread_id=..., user_id=...) 调用主图；
 - 必须等到这次图运行结束才返回，否则 occupancy 会提前释放；
 - 返回图的结果；结果里带 `__interrupt__` 时本 handler 会置 paused，不放锁。
-- input_state = {"input_msg": 后台通知, "deep_task_id": task_id, "is_background": True}。
+- input_state = {"input_msg": 后台通知, "deep_task_id": task_id, "is_background": True,
+  "status": outcome.ver_status}。
 """
 from __future__ import annotations
 
@@ -57,6 +58,8 @@ class BackgroundResumeHandler:
                     "input_msg": notice.content if isinstance(notice.content, str) else str(notice.content),
                     "deep_task_id": outcome.task_id,
                     "is_background": True,
+                    # 把任务所属的验证阶段带回 CVA，否则会被当成 preliminary 重跑浅层
+                    "status": outcome.ver_status,
                 }
                 try:
                     graph_result = await self._runner(thread_id, user_id, input_state)

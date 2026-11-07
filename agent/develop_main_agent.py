@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AI
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
-from langgraph.types import Command, Send
+from langgraph.types import Command, Send, CachePolicy
 from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import DevelopAgentMainState, DevelopAgentOutputState, DevelopAgentInputState, \
@@ -37,7 +37,6 @@ _dispatch_model = init_chat_model(
 dispatch_middleware = []
 dispatch_model_chain = chain_model_call_wrappers(dispatch_middleware)
 
-
 # Agent 与 app_type 的硬约束：data_develop 只做 Java Flink，data_analysis 只做 Python Spark
 _AGENT_APP_TYPE = {"data_develop": "flink", "data_analysis": "spark"}
 _APP_TYPE_AGENT = {app_type: agent for agent, app_type in _AGENT_APP_TYPE.items()}
@@ -53,6 +52,8 @@ class SendInfo(BaseModel):
         description="应用类型；data_develop 必须填 flink，data_analysis 必须填 spark"
     )
     task_list: List[str] = Field(description="要给对应的Agent发送的任务列表，每个任务是一个字符串")
+    is_submit: bool = Field(default=False,
+                            description="该任务是否需要提交作业到集群，false 表示不提交作业到集群，true 表示提交作业到集群")
 
 
 class DevelopAgentOutState(BaseModel):
@@ -107,6 +108,12 @@ def develop_msg_handler(state: DevelopAgentInputState) -> DevelopAgentMainState:
             update["deep_task_id"] = deep_task_id
         if source := state.get("source"):
             update["source"] = source
+        if status := state.get("status"):
+            update["status"] = status
+    if state.get("is_ops"):
+        update["is_ops"] = True
+        if handover := state.get("ops_handover"):
+            update["ops_handover"] = handover
     return update
 
 
@@ -118,7 +125,36 @@ def _last_human_text(state: DevelopAgentMainState) -> str:
 
 
 def _route_after_handler(state: DevelopAgentMainState, runtime: Runtime) -> str | Send:
-    """普通消息进 dispatch；后台回流直接进 CVA 子图"""
+    """普通消息进 dispatch；运维转交直进开发节点；后台回流直接进 CVA 子图"""
+    handover = state.get("ops_handover")
+    if state.get("is_ops") and handover:
+        app_type = handover.get("app_type")
+        if app_type not in ("spark", "flink"):
+            return Send(
+                "work_end",
+                WorkEndState(
+                    type="error",
+                    desc=f"运维转交的应用类型不支持：{app_type!r}",
+                    from_="handler",
+                    thread_id=runtime.context.thread_id,
+                ),
+            )
+        task_list = [str(item) for item in (handover.get("task_list") or [])]
+        return Send(
+            "data_develop" if app_type == "flink" else "data_analysis",
+            AgentDevelopInputState(
+                is_repair=True,          # 项目已搬进 tmp_code，不允许再初始化
+                task_list=task_list,
+                task_num=len(task_list),
+                app_type=app_type,
+                date=handover.get("date"),
+                project_name=handover.get("project_name"),
+                is_submit=True,          # 运维转交的修复完成后强制走提交（人工仍可拒绝）
+                is_ops=True,
+                ops_handover=handover,
+            ),
+        )
+
     if not state.get("is_background"):
         return "dis_chat"
 
@@ -149,6 +185,8 @@ def _route_after_handler(state: DevelopAgentMainState, runtime: Runtime) -> str 
             date=date,
             original_task_list=state.get("original_task_list") or [],
             deep_task_id=deep_task_id,
+            status=state.get("status", "preliminary"),
+            is_submit=state.get("is_submit", False),
         ),
     )
 
@@ -327,6 +365,7 @@ def distribute_task_to_agent(state: DevelopAgentMainState, runtime: Runtime) -> 
                     task_list=task_list,
                     task_num=len(task_list),
                     app_type=app_type,
+                    is_submit=send_info.get("is_submit", False),
                 ),
             )
         )
@@ -383,18 +422,27 @@ builder = StateGraph(
 )
 
 builder.add_node("handler", cast("StateNode", develop_msg_handler))
-builder.add_node("dis_chat", cast("StateNode", dispatch_chat))
-builder.add_node("data_develop", cast("StateNode", big_data_develop_code_agent))
-builder.add_node("data_analysis", cast("StateNode", big_data_analysis_code_agent))
+# 添加缓存策略，缓存2小时
+builder.add_node("dis_chat", cast("StateNode", dispatch_chat), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
+builder.add_node("data_develop", cast("StateNode", big_data_develop_code_agent), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
+builder.add_node("data_analysis", cast("StateNode", big_data_analysis_code_agent), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
 # 直接挂编译好的 CVA 子图：子图里的 Command(graph=PARENT) / interrupt 才会生效
-builder.add_node("code_verify", cast("StateNode", verify_agent))
+builder.add_node("code_verify", cast("StateNode", verify_agent), cache_policy=CachePolicy(
+    ttl=2 * 60 * 60
+))
 builder.add_node("work_end", cast("StateNode", work_end))
 
 builder.add_edge(START, "handler")
 builder.add_conditional_edges(
     "handler",
     _route_after_handler,
-    ["dis_chat", "code_verify", "work_end"]
+    ["dis_chat", "code_verify", "work_end", "data_develop", "data_analysis"]
 )
 builder.add_conditional_edges(
     "dis_chat",

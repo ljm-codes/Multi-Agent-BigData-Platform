@@ -40,6 +40,7 @@ Java + Spark、Python + Flink、Java + 其它计算引擎等组合没有对应 A
 - 不要把同一个任务同时派给两个 Agent；每个 Agent 在 `send_info_list` 里最多一条。
 - `send_info_list` 和 `out_to_user` 不要同时有内容：有 `out_to_user` 时 `send_info_list` 会被系统忽略。
 - 下游一次可以接多个任务：放在同一条 `SendInfo.task_list` 里，每条任务独立、可执行。
+- 用户明确要求“改完提交到集群 / 部署上线 / 跑起来” → `SendInfo.is_submit=true`；只是写/改代码或做分析 → `false`（默认），拿不准填 `false`。
 - 不要声称任务已经完成、代码已经运行、结果已经产出；这些由下游 Agent 执行并回报。
 
 ## task_list 写法
@@ -69,7 +70,7 @@ Java + Spark、Python + Flink、Java + 其它计算引擎等组合没有对应 A
 
 - `thread_action`：`continue` / `new_task`；
 - `thread_title`：新任务标题；
-- `send_info_list`：下游任务列表，每项含 `send_to`、`app_type`、`task_list`；
+- `send_info_list`：下游任务列表，每项含 `send_to`、`app_type`、`task_list`、`is_submit`；
 - `out_to_user`：给用户看的回复。
 
 ## 安全与边界

@@ -39,6 +39,7 @@ class TaskSupervisor:
             second_timeout: float | None = None,
             sink: Any | None = None,
             context: Any = None,
+            status: Literal["preliminary", "shallow", "deep", "done"] = "preliminary",
             on_handoff: Callable[[asyncio.Task, Any], Awaitable[None]] | None = None,
     ):
         if first_timeout <= 0:
@@ -56,9 +57,11 @@ class TaskSupervisor:
         self.second_timeout = second_timeout
         self.sink = sink
         self.context = context
+        self.status = status
         self.on_handoff = on_handoff
 
     """ public """
+
     async def run(self, coro: Awaitable[Any]) -> TaskOutcome:
         """
         执行协程，并根据配置施加超时策略。
@@ -70,6 +73,7 @@ class TaskSupervisor:
         return await self._run_handoff_mode(task)
 
     """ cancel mode """
+
     async def _run_cancel_mode(self, task: asyncio.Task) -> TaskOutcome:
         """场景一执行器"""
         try:
@@ -90,6 +94,7 @@ class TaskSupervisor:
             return self._outcome("error", error=repr(e), message="任务执行异常。")
 
     """ handoff mode """
+
     async def _run_handoff_mode(self, task: asyncio.Task) -> TaskOutcome:
         """场景二执行器"""
         try:
@@ -160,9 +165,13 @@ class TaskSupervisor:
             logger.exception("sink.put 失败 task_id=%s", self.task_id)
 
     """ utils """
+
     def _outcome(self, status: OutcomeStatus, **kwargs: Any) -> TaskOutcome:
         return TaskOutcome(
-            task_id=self.task_id, origin=self.origin, status=status, **kwargs
+            task_id=self.task_id,
+            origin=self.origin,
+            status=status, ver_status=self.status,
+            **kwargs
         )
 
     def _extract_snapshot(self) -> Any:

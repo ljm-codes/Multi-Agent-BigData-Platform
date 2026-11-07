@@ -4,6 +4,7 @@ from typing import Callable, Awaitable
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse, ExtendedModelResponse
 from langchain.agents.middleware.types import ResponseT
 from langchain_core.messages import AIMessage
+from langgraph.types import Command
 from langgraph.typing import ContextT
 from typing_extensions import override
 
@@ -41,6 +42,7 @@ class PerceptionBackground(AgentMiddleware):
     CVA 每次调用模型前，按当前 thread_id + state.deep_task_id 从 broker 取走
     属于这个后台任务的 TaskOutcome，拼成消息交给本次模型调用；不等待、不阻塞。
     没有 deep_task_id 或没有结果时原样放行。
+    取到结果时把 deep_result / status 写回图状态，dispatch 才能放行 goto=end。
     """
 
     def __init__(self, broker: BackgroundBroker | None = None):
@@ -64,6 +66,7 @@ class PerceptionBackground(AgentMiddleware):
 
         notices = [outcome_notice(outcome) for outcome in outcomes]
         try:
+            # override(state=...) 不会改 request.messages，结果要直接拼进 messages
             response = await handler(request.override(messages=[*request.messages, *notices]))
         except BaseException:
             # 模型调用失败/被取消：把结果放回桶里，等下次感知；不改 registry 状态
@@ -76,4 +79,16 @@ class PerceptionBackground(AgentMiddleware):
             if registry_status:
                 background_registry.update(outcome.task_id, status=registry_status)
 
-        return _with_notices(response, notices)
+        result = _with_notices(response, notices)
+        if isinstance(result, ExtendedModelResponse):
+            model_response = result.model_response
+        elif isinstance(result, ModelResponse):
+            model_response = result
+        else:
+            model_response = ModelResponse(result=[result])
+        # 结果同时写回图状态：dispatch 靠 deep_result.status 和 status 决定能否 goto=end
+        latest = outcomes[-1]
+        return ExtendedModelResponse(
+            model_response=model_response,
+            command=Command(update={"deep_result": latest, "status": latest.ver_status}),
+        )
