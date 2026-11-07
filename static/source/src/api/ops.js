@@ -36,6 +36,19 @@ export function resumeAgent({ sessionId, answer }) {
   })
 }
 
+/** 运维转交出去的那条开发会话（线程 ops:{session_id}）的历史与中断 */
+export function getHandoverHistory(sessionId) {
+  return request(`/ops/agent/handover/history${buildQuery({ session_id: sessionId })}`)
+}
+
+/** 回复开发会话停在的人工确认 */
+export function resumeHandover({ sessionId, answer }) {
+  return request('/ops/agent/handover/resume', {
+    method: 'POST',
+    body: { session_id: sessionId, answer },
+  })
+}
+
 /** 感知 WebSocket：先换一次性 ticket，再连 /ops/ws/perception/error */
 export function openPerceptionSocket(ticket) {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'

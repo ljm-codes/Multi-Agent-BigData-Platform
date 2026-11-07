@@ -140,7 +140,7 @@ create table code.app_file_idx
 create unique index uk_app_file_app on code.app_file_idx (app_type, app_name);
 
 -- 以下 SQL 均为 未开发 完整
-create table log.AIOps_log
-(
-
-)
+-- create table log.AIOps_log
+-- (
+--
+-- )

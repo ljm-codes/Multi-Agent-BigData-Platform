@@ -9,7 +9,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import jwt
-from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, Body
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk
@@ -25,11 +25,12 @@ from Tasks.background_broker import background_broker, background_registry
 from Tools.log_settings import LogSetting
 from Tools.db import AsyncSessionLocal
 from Tools.share_check_tool import redis_con
-from Tools.ws_registry import register_ws, unregister_ws, send_json_to_user
-from load_config.config import ROOT_BASE_DIR_PATH
+from Tools.ws_registry import register_ws, unregister_ws
+from load_config.config import ROOT_BASE_DIR_PATH, config
 
 route = APIRouter()
 logger = LogSetting.create(__name__)
+_is_conn_cluster = bool(config.get("app", {}).get("connect_to_cluster", False))
 
 
 class ChatRequest(BaseModel):
@@ -206,10 +207,10 @@ async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: A
         try:
             last_agent = None
             async for chunk, metadata in graph.astream(
-                payload,
-                config={"configurable": {"thread_id": thread_id}},
-                context=MainStateContext(thread_id=thread_id, user_id=user_id),
-                stream_mode="messages",
+                    payload,
+                    config={"configurable": {"thread_id": thread_id}},
+                    context=MainStateContext(thread_id=thread_id, user_id=user_id),
+                    stream_mode="messages",
             ):
                 # handler 回传的 HumanMessage 也会出现在 messages 流里；
                 # 只认打了 agent:* tag 的 AIMessageChunk，避免把用户原文当成助手输出。
@@ -938,8 +939,17 @@ def _generate_temp_key() -> str:
 
 
 @route.post("/background/verify")
-async def background_verify(request: Request) -> RouteResponse:
+async def background_verify(
+        request: Request,
+        source: Literal["main", "ops"] = Body(
+            default="main",
+            description="信号来源，避免当未开启 ops 功能时，ops 信号被错误触发",
+            embed=True
+        )
+) -> RouteResponse:
     """将token放于这里进行校验，返回一个短暂的 Ticket 用于后续的 WebSocket 连接"""
+    if source == "ops" and not _is_conn_cluster:
+        return RouteResponse.error(msg="ops 功能未开启", code=ResultCode.INVALID_VALUE_ERROR)
     token_info = request.state.info
     if not token_info or not isinstance(token_info, dict):
         return RouteResponse.error(msg="token 校验失败, 请重新登录", code=ResultCode.INVALID_VALUE_ERROR)

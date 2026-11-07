@@ -4,13 +4,16 @@ import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import JsonView from '@/components/JsonView.vue'
 import JobRestartReview from '@/components/JobRestartReview.vue'
+import InterruptPanel from '@/components/InterruptPanel.vue'
 import {
   createTicket,
   getAgentHistory,
+  getHandoverHistory,
   listAgentRuns,
   listCheckerErrors,
   openPerceptionSocket,
   resumeAgent,
+  resumeHandover,
 } from '@/api/ops'
 
 const router = useRouter()
@@ -61,6 +64,14 @@ const review = ref(null)
 const reviewBusy = ref(false)
 const reviewError = ref('')
 const reviewNotice = ref('')
+
+// 抽屉两种内容：运维消息 / 转交出去的开发会话
+const drawerMode = ref('ops')
+const devLoading = ref(false)
+const devError = ref('')
+const devData = ref(null)
+const devInterrupt = ref(null)
+const devBusy = ref(false)
 
 const ERROR_COLUMNS = [
   { key: 'id', label: 'ID', width: 56 },
@@ -289,7 +300,7 @@ async function connectWs() {
   if (disposed) return
   wsState.value = 'connecting'
   try {
-    const data = await createTicket()
+    const data = await createTicket('ops')
     if (!data?.ticket) throw new Error('生成 WebSocket ticket 失败')
     const ws = openPerceptionSocket(data.ticket)
     socket = ws
@@ -299,6 +310,11 @@ async function connectWs() {
     ws.onmessage = (event) => {
       try {
         const record = JSON.parse(event.data)
+        // 转交开发的事件不是检查错误，不能当 toast 弹
+        if (record?.kind === 'handover') {
+          handleHandoverEvent(record)
+          return
+        }
         pushToast(record)
         scheduleReload()
       } catch {
@@ -312,8 +328,10 @@ async function connectWs() {
     ws.onerror = () => {
       wsState.value = 'closed'
     }
-  } catch {
+  } catch (e) {
     wsState.value = 'closed'
+    // 参数类错误（如 ops 功能未开启）重试没用，别每 5 秒打一次
+    if (e?.code === 4004) return
     if (!disposed) retryTimer = setTimeout(connectWs, 5000)
   }
 }
@@ -330,6 +348,10 @@ function extractReview(payload) {
 async function openHistory(sessionId) {
   if (!sessionId) return
   historyOpen.value = true
+  drawerMode.value = 'ops'
+  devData.value = null
+  devInterrupt.value = null
+  devError.value = ''
   historyLoading.value = true
   historyError.value = ''
   historyData.value = null
@@ -344,6 +366,78 @@ async function openHistory(sessionId) {
     historyError.value = e?.message || '加载历史失败'
   } finally {
     historyLoading.value = false
+  }
+}
+
+function extractDevInterrupt(payload) {
+  const list = Array.isArray(payload) ? payload : payload ? [payload] : []
+  const first = list[0]
+  const value = first?.value ?? first
+  if (!value) return null
+  if (typeof value === 'string') return { kind: 'submit', text: value }
+  return { kind: 'manual', text: value.msg || value.message || '' }
+}
+
+async function loadDevHistory() {
+  const sid = historyData.value?.thread_id
+  if (!sid) return
+  devLoading.value = true
+  devError.value = ''
+  try {
+    const data = await getHandoverHistory(sid)
+    devData.value = data
+    devInterrupt.value = data?.interrupted ? extractDevInterrupt(data.interrupt) : null
+  } catch (e) {
+    devError.value = e?.message || '加载开发会话失败'
+  } finally {
+    devLoading.value = false
+  }
+}
+
+function openHandover() {
+  if (!historyData.value?.handover) return
+  drawerMode.value = 'dev'
+  loadDevHistory()
+}
+
+function backToOps() {
+  drawerMode.value = 'ops'
+}
+
+async function submitDevAnswer(answer) {
+  const sid = historyData.value?.thread_id
+  if (!sid || devBusy.value) return
+  devBusy.value = true
+  devError.value = ''
+  devInterrupt.value = null
+  try {
+    await resumeHandover({ sessionId: sid, answer })
+    await loadDevHistory()
+    await loadRuns()
+  } catch (e) {
+    devError.value = e?.message || '提交失败'
+  } finally {
+    devBusy.value = false
+  }
+}
+
+async function refreshOpsHistory(sid) {
+  try {
+    const data = await getAgentHistory(sid)
+    // 只替换数据，不动 review/notice，避免打断正在填的确认框
+    if (historyData.value?.thread_id === sid) historyData.value = data
+  } catch {
+    // 拉不到就保持旧数据
+  }
+}
+
+function handleHandoverEvent(record) {
+  scheduleReload()
+  const sid = record?.session_id
+  if (!sid) return
+  if (historyOpen.value && historyData.value?.thread_id === sid) {
+    if (drawerMode.value === 'dev') loadDevHistory()
+    else refreshOpsHistory(sid)
   }
 }
 
@@ -738,56 +832,107 @@ onBeforeUnmount(() => {
       <aside class="drawer">
         <header class="drawer-head">
           <div class="drawer-title">
-            <h2>Agent 历史</h2>
-            <span v-if="historyData" class="muted small">
+            <button v-if="drawerMode === 'dev'" class="ghost back-btn" @click="backToOps">
+              ← 返回运维消息
+            </button>
+            <h2>{{ drawerMode === 'dev' ? '开发 Agent 会话' : 'Agent 历史' }}</h2>
+            <span v-if="drawerMode === 'ops' && historyData" class="muted small">
               session: {{ historyData.thread_id }} · app: {{ historyData.app_id || '—' }} ·
               {{ appType(historyData.app_type) }}
+            </span>
+            <span v-else-if="drawerMode === 'dev' && devData" class="muted small">
+              session: {{ devData.thread_id }} · {{ devData.project_name || '—' }} ·
+              {{ appType(devData.app_type) }}
             </span>
           </div>
           <button class="ghost close-btn" @click="historyOpen = false">关闭</button>
         </header>
-        <p v-if="historyLoading" class="muted">加载中…</p>
-        <p v-else-if="historyError" class="error">{{ historyError }}</p>
-        <template v-else-if="historyData">
-          <p v-if="historyData.out_msg" class="out-msg">{{ historyData.out_msg }}</p>
-          <p v-if="historyData.error_desc_text" class="error">{{ historyData.error_desc_text }}</p>
-          <p v-if="reviewNotice" class="bar notice">{{ reviewNotice }}</p>
-          <JobRestartReview
-            v-if="review"
-            :review="review"
-            :busy="reviewBusy"
-            :error="reviewError"
-            @submit="submitReview"
-          />
-          <p v-else-if="historyData.interrupted" class="error bar">
-            有待确认的中断，但当前看板不支持该类型；请回到发起该任务的会话处理。
-          </p>
-          <div v-if="!historyData.messages.length" class="muted">没有消息</div>
-          <div class="messages">
-            <article
-              v-for="(message, index) in historyData.messages"
-              :key="index"
-              :class="['msg', message.type]"
-            >
-              <div class="msg-head">
-                <strong>{{ message.type }}</strong>
-                <span v-if="message.name" class="muted">{{ message.name }}</span>
-              </div>
-              <JsonView
-                v-if="parseJson(message.content)"
-                :data="parseJson(message.content)"
-              />
-              <pre v-else-if="message.content">{{ typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2) }}</pre>
-              <div v-if="message.tool_calls?.length" class="tool-calls">
-                <div v-for="(call, callIndex) in message.tool_calls" :key="callIndex">
-                  <code>{{ call.name }}</code>
-                  <JsonView v-if="call.args" :data="call.args" />
+
+        <template v-if="drawerMode === 'dev'">
+          <p v-if="devLoading" class="muted">加载中…</p>
+          <p v-else-if="devError" class="error">{{ devError }}</p>
+          <template v-else-if="devData">
+            <p v-if="devData.output_msg" class="out-msg">{{ devData.output_msg }}</p>
+            <div v-if="!devData.messages.length" class="muted">没有消息</div>
+            <div class="messages">
+              <article
+                v-for="(message, index) in devData.messages"
+                :key="index"
+                :class="['msg', message.type]"
+              >
+                <div class="msg-head">
+                  <strong>{{ message.type }}</strong>
+                  <span v-if="message.name" class="muted">{{ message.name }}</span>
                 </div>
-              </div>
-            </article>
-          </div>
+                <JsonView
+                  v-if="parseJson(message.content)"
+                  :data="parseJson(message.content)"
+                />
+                <pre v-else-if="message.content">{{ typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2) }}</pre>
+                <div v-if="message.tool_calls?.length" class="tool-calls">
+                  <div v-for="(call, callIndex) in message.tool_calls" :key="callIndex">
+                    <code>{{ call.name }}</code>
+                    <JsonView v-if="call.args" :data="call.args" />
+                  </div>
+                </div>
+              </article>
+            </div>
+            <InterruptPanel
+              v-if="devInterrupt"
+              :interrupt="devInterrupt"
+              @submit="submitDevAnswer"
+            />
+          </template>
+          <p v-else class="muted">暂无数据</p>
         </template>
-        <p v-else class="muted">暂无数据</p>
+
+        <template v-else>
+          <p v-if="historyLoading" class="muted">加载中…</p>
+          <p v-else-if="historyError" class="error">{{ historyError }}</p>
+          <template v-else-if="historyData">
+            <p v-if="historyData.out_msg" class="out-msg">{{ historyData.out_msg }}</p>
+            <p v-if="historyData.error_desc_text" class="error">{{ historyData.error_desc_text }}</p>
+            <p v-if="reviewNotice" class="bar notice">{{ reviewNotice }}</p>
+            <JobRestartReview
+              v-if="review"
+              :review="review"
+              :busy="reviewBusy"
+              :error="reviewError"
+              @submit="submitReview"
+            />
+            <p v-else-if="historyData.interrupted" class="error bar">
+              有待确认的中断，但当前看板不支持该类型；请回到发起该任务的会话处理。
+            </p>
+            <div v-if="!historyData.messages.length" class="muted">没有消息</div>
+            <div class="messages">
+              <article
+                v-for="(message, index) in historyData.messages"
+                :key="index"
+                :class="['msg', message.type]"
+              >
+                <div class="msg-head">
+                  <strong>{{ message.type }}</strong>
+                  <span v-if="message.name" class="muted">{{ message.name }}</span>
+                </div>
+                <JsonView
+                  v-if="parseJson(message.content)"
+                  :data="parseJson(message.content)"
+                />
+                <pre v-else-if="message.content">{{ typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2) }}</pre>
+                <div v-if="message.tool_calls?.length" class="tool-calls">
+                  <div v-for="(call, callIndex) in message.tool_calls" :key="callIndex">
+                    <code>{{ call.name }}</code>
+                    <JsonView v-if="call.args" :data="call.args" />
+                  </div>
+                </div>
+              </article>
+            </div>
+            <button v-if="historyData.handover" class="ghost handover-btn" @click="openHandover">
+              查看开发 Agent
+            </button>
+          </template>
+          <p v-else class="muted">暂无数据</p>
+        </template>
       </aside>
     </div>
   </div>
@@ -1267,6 +1412,23 @@ h1 {
   background: var(--bg-soft);
   border-radius: 8px;
   white-space: pre-wrap;
+}
+
+.back-btn {
+  margin-bottom: 8px;
+}
+
+/* 转交开发入口：亮色暗红 / 暗色亮红，跟随 --danger */
+.handover-btn {
+  margin-top: 14px;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.handover-btn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 
 .messages {

@@ -395,6 +395,7 @@ async def worker_handle(aid: str, sid: str):
     """
     run_finished = False
     paused = False
+    held = False
     try:
         app_error_info, app_type = await asyncio.to_thread(_load_error_info, aid)
         app_type = app_type or "CLUSTER"
@@ -427,6 +428,7 @@ async def worker_handle(aid: str, sid: str):
             config={'configurable': {'thread_id': sid}},
             context=OperationsAndReconcileContext(app_id=aid, session_id=sid))
         interrupted = isinstance(result, dict) and bool(result.get("__interrupt__"))
+        handover_tid = result.get("handover_dev_thread_id") if isinstance(result, dict) else ""
         out_msg = result.get("out_msg", "") if isinstance(result, dict) else ""
         if interrupted:
             # 图停在人工审核；保留 lease，等 /ops/agent/resume
@@ -435,6 +437,11 @@ async def worker_handle(aid: str, sid: str):
             run_finished = True
             paused = True
             logger.info(f"应用 {aid} 停在人工审核: session={sid}")
+        elif handover_tid:
+            # app_handover 已把记录挂成 PAUSED 并保留租约，等开发流程跑完由 dev_handover 收尾
+            run_finished = True
+            held = True
+            logger.info(f"应用 {aid} 已转交开发: {handover_tid}")
         elif result.get("type", "") == "error":
             await asyncio.to_thread(_finish_agent_run, sid, "ERROR", "", out_msg)
             run_finished = True
@@ -457,7 +464,8 @@ async def worker_handle(aid: str, sid: str):
         # 取消/强杀路径也要留一条可查记录；chat_end 正常跑过时会先删锁
         if not run_finished:
             _finish_agent_run(sid, "ABANDONED", "", "worker cancelled or terminated")
-        if not paused:
+        # 转交开发期间不解锁：开发流程结束（成功/失败）时由 dev_handover 解锁
+        if not paused and not held:
             _release_lease(aid, sid)
 
 

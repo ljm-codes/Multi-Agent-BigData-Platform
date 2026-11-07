@@ -9,26 +9,26 @@
 
 ## 按内存选模式
 
-| VM 可用内存 | 启动命令 | 包含 |
-|---|---|---|
-| 4 GB | `docker compose -f docker-compose.lite.yml up -d` | app + Postgres + Redis + 沙箱；不连集群，UI/对话/本地沙箱可用 |
-| 8 GB | `docker compose up -d` | 单节点伪分布式：node1 跑 NameNode/DataNode/RM/NM/Proxy/SSH，app 2g |
-| 12 GB+ | `docker compose --profile full --profile workers up -d` | 再加 node2 worker、checker、ops |
+| VM 可用内存 | 启动命令                                                    | 包含                                                       |
+|---------|---------------------------------------------------------|----------------------------------------------------------|
+| 4 GB    | `docker compose -f docker-compose.lite.yml up -d`       | app + Postgres + Redis + 沙箱；不连集群，UI/对话/本地沙箱可用            |
+| 8 GB    | `docker compose up -d`                                  | 单节点伪分布式：node1 跑 NameNode/DataNode/RM/NM/Proxy/SSH，app 2g |
+| 12 GB+  | `docker compose --profile full --profile workers up -d` | 再加 node2 worker、checker、ops                              |
 
 lite 用 `config/config.apponly.yaml`（`connect_to_cluster: false`）；另外两种用 `config/config.docker.yaml`。
 
 ## 服务与版本
 
-| 服务             | 说明                                                               | 版本 / 路径                                     |
-|----------------|------------------------------------------------------------------|---------------------------------------------|
-| `app`          | FastAPI + Vue 静态页 + Python 3.8 沙箱调用方                             | Python 3.12、JDK 8、Maven 3.9.9、Node 20       |
+| 服务             | 说明                                                                    | 版本 / 路径                                     |
+|----------------|-----------------------------------------------------------------------|---------------------------------------------|
+| `app`          | FastAPI + Vue 静态页 + Python 3.8 沙箱调用方                                  | Python 3.12、JDK 8、Maven 3.9.9、Node 20       |
 | `checker`      | 可选（`--profile workers`）：检测调度 `Tools.main_check_tool:main_check`       | 复用 `app` 镜像                                 |
-| `ops`          | 可选（`--profile workers`）：运维 Agent `agent/operations_agent_run.py`     | 复用 `app` 镜像                                 |
+| `ops`          | 可选（`--profile workers`）：运维 Agent `agent/operations_agent_run.py`      | 复用 `app` 镜像                                 |
 | `node1`        | 默认单节点：NameNode + DataNode + RM + NM + WebAppProxy + SSH + Spark/Flink | Hadoop 3.3.6、Spark 3.1.3、Flink 1.18.1、JDK 8 |
-| `node2`        | 可选（`--profile full`）：DataNode + NodeManager + SSH                | 同上                                          |
-| `sandbox-init` | 初始化 Python 3.8 沙箱环境（一次性）                                         | Python 3.8 + pyspark 3.1.3                  |
-| `postgres`     | LangGraph checkpoint/store + 业务表                                 | PostgreSQL 16                               |
-| `redis`        | JWT、检测队列、运行状态                                                    | Redis 7                                     |
+| `node2`        | 可选（`--profile full`）：DataNode + NodeManager + SSH                     | 同上                                          |
+| `sandbox-init` | 初始化 Python 3.8 沙箱环境（一次性）                                              | Python 3.8 + pyspark 3.1.3                  |
+| `postgres`     | LangGraph checkpoint/store + 业务表                                      | PostgreSQL 16                               |
+| `redis`        | JWT、检测队列、运行状态                                                         | Redis 7                                     |
 
 配置模板里的 MySQL、Elasticsearch、Milvus、RabbitMQ 当前代码并没有使用，这里不启动；
 需要时再按实际接入的模块单独加服务。
@@ -81,6 +81,26 @@ lite 的 `exec` 也要带 `-f docker-compose.lite.yml`。
 - 前端：`http://localhost:8000/`
 - YARN：`http://localhost:8088/`
 - HDFS：`http://localhost:9870/`
+
+## 只部署项目（不带集群）
+
+只需要平台本身（App + Postgres + Redis + Python 3.8 沙箱）时，用 lite compose；它不会启动
+`node1` / `node2`，也不拉起 checker/ops：
+
+```bash
+cd docker
+cp .env.example .env                      # 填模型 Key、DB/Redis 密码
+docker compose -f docker-compose.lite.yml up -d
+docker compose -f docker-compose.lite.yml exec app python scripts/init_admin.py \
+  --email admin@example.com --password Admin@123
+```
+
+- lite 挂的是 `config/config.apponly.yaml`（`connect_to_cluster: false`），UI / 对话 / 本地沙箱可用；
+- 如果要连**已有的外部集群**：把 `config/config.apponly.yaml` 里的 `connect_to_cluster` 改成 `true`，
+  并把 `hadoop.yarn` / `hadoop.hdfs` / `ssh` 换成真实集群地址；需要源码登记（运维转交取码）或飞书提醒时，
+  再按根目录 `config.yaml.template` 补上 `code` / `feishu` 段，然后用同一条命令启动；
+- 只更新项目、不重建沙箱：`docker compose -f docker-compose.lite.yml up -d --build app`；
+- 标准模式的 `app` 依赖 `node1`（`depends_on`），不能单独起；只部署项目请用 lite compose。
 
 ## 目录
 
@@ -188,6 +208,8 @@ docker compose exec node1 tail -f /data/yarn/log/container_*.log 2>/dev/null
 ## 应用配置
 
 - 标准/完整模式挂载 `config/config.docker.yaml`；lite 挂载 `config/config.apponly.yaml`
+- `config.docker.yaml` 已带 `code.commit`（HDFS 源码归档）和 `feishu`（留空则不发消息）；
+  lite 的 `config.apponly.yaml` 不连集群，没有这两段
 - `.env` 通过 compose `env_file` 传给 `app`（以及可选启用的 `checker`/`ops`）
 - Postgres/Redis 密码在 `.env` 和配置文件里各有一份，**改一处要同步另一处**
 - 沙箱路径、YARN/HDFS 地址、Spark 提交路径都已经按 compose 服务名/容器路径写好
@@ -216,18 +238,18 @@ lite 没有 HDFS 卷。`tmp_code/` 和 `log/` 是宿主机目录（bind mount）
 
 ## 排查
 
-| 现象                   | 处理                                                                                                       |
-|----------------------|----------------------------------------------------------------------------------------------------------|
-| `sandbox-init` 失败    | 看 `docker compose logs sandbox-init`；多半是 conda/PyPI 网络或某个包没有 cp38 wheel                                  |
-| `app` 起不来            | 先确认 `config.yaml` 已挂载、`static/dist` 在镜像里；看 `logs/app`                                                    |
-| `node1` 一直 unhealthy | NameNode 首次格式化失败或端口被占用；看 `/data/hadoop/logs`                                                             |
-| Spark 提交失败           | 确认 `node1` 上 `spark-submit --version`、`hdfs dfs -ls /user/hadoop/spark-libs.zip`、sandbox 路径存在  |
-| Flink 提交失败           | 确认 `node1` 的 `flink --version`、`HADOOP_CONF_DIR` 和 `yarn` 可用；命令必须是 `run-application -t yarn-application` |
-| Flink 编译失败           | `app` 内 `mvn -v`、JDK 8；首次构建需要 Maven Central；可预先灌满 `m2` 卷                                                 |
-| 登录报“用户不存在”           | 先执行 `docker compose exec app python scripts/init_admin.py ...`                                           |
-| 内存不足                 | 先降级：4GB 用 lite，8GB 用单节点；虚拟机在 hypervisor 设置里加内存，改 `.wslconfig` 只对 WSL2 有效                          |
-| 看不到 node2/checker/ops | 它们默认在 profile 里：`--profile full`（node2）、`--profile workers`（checker/ops）                                  |
-| 前端“打开 IDE”不可用       | 容器里没有 Windows IDE/注册表；这是宿主机的桌面功能，Docker 部署下只保留代码链接展示                                                        |
+| 现象                    | 处理                                                                                                       |
+|-----------------------|----------------------------------------------------------------------------------------------------------|
+| `sandbox-init` 失败     | 看 `docker compose logs sandbox-init`；多半是 conda/PyPI 网络或某个包没有 cp38 wheel                                  |
+| `app` 起不来             | 先确认 `config.yaml` 已挂载、`static/dist` 在镜像里；看 `logs/app`                                                    |
+| `node1` 一直 unhealthy  | NameNode 首次格式化失败或端口被占用；看 `/data/hadoop/logs`                                                             |
+| Spark 提交失败            | 确认 `node1` 上 `spark-submit --version`、`hdfs dfs -ls /user/hadoop/spark-libs.zip`、sandbox 路径存在            |
+| Flink 提交失败            | 确认 `node1` 的 `flink --version`、`HADOOP_CONF_DIR` 和 `yarn` 可用；命令必须是 `run-application -t yarn-application` |
+| Flink 编译失败            | `app` 内 `mvn -v`、JDK 8；首次构建需要 Maven Central；可预先灌满 `m2` 卷                                                 |
+| 登录报“用户不存在”            | 先执行 `docker compose exec app python scripts/init_admin.py ...`                                           |
+| 内存不足                  | 先降级：4GB 用 lite，8GB 用单节点；虚拟机在 hypervisor 设置里加内存，改 `.wslconfig` 只对 WSL2 有效                                 |
+| 看不到 node2/checker/ops | 它们默认在 profile 里：`--profile full`（node2）、`--profile workers`（checker/ops）                                 |
+| 前端“打开 IDE”不可用         | 容器里没有 Windows IDE/注册表；这是宿主机的桌面功能，Docker 部署下只保留代码链接展示                                                     |
 
 ## 安全说明
 

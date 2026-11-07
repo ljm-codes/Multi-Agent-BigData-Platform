@@ -6,11 +6,13 @@ from typing import Any, Literal
 import jwt
 from fastapi import APIRouter, WebSocket, Query, Request
 from fastapi.encoders import jsonable_encoder
+from langchain_core.messages import AIMessage
 from langgraph.types import Command
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from starlette.websockets import WebSocketDisconnect
 
+from SPO.main_agent_state_model import content_text
 from SPO.operations_agent_state_model import OperationsAndReconcileContext
 from SPO.postgresql_model import AgentRun, CheckLog
 from SPO.route_results import RouteResponse, ResultCode
@@ -279,6 +281,12 @@ async def get_agent_history(request: Request, session_id: str | None = Query(def
             'error_desc_text': values.get('error_desc_text', ''),
             'error_id_list': values.get('error_id_list', []),
             'messages': messages,
+            # 有转交时前端显示入口；信息来自运维图状态，不额外建表
+            'handover': ({
+                'dev_thread_id': values.get('handover_dev_thread_id'),
+                'app_name': values.get('handover_app_name', ''),
+                'project_name': values.get('handover_project_name', ''),
+            } if values.get('handover_dev_thread_id') else None),
         }
         return RouteResponse.ok(data=jsonable_encoder(data))
     except Exception as exc:
@@ -444,3 +452,94 @@ async def resume_agent(req: OpsResumeRequest, request: Request) -> RouteResponse
             logger.error(f"恢复运维会话 {req.session_id} 失败：{type(exc).__name__}: {exc}")
             return RouteResponse.error(msg=f"恢复失败：{exc}",
                                        code=ResultCode.SERVER_ERROR)
+
+
+@route.get("/agent/handover/history")
+async def get_handover_history(request: Request, session_id: str | None = Query(default=None)) -> RouteResponse:
+    """开发图历史（线程 ops:{session_id}），含中断信息"""
+    try:
+        permission = int(request.state.info.get("permission"))
+    except (ValueError, TypeError):
+        return RouteResponse.error(msg="token解析错误，请重新登录", code=ResultCode.INVALID_VALUE_ERROR)
+    if permission < 1:
+        return RouteResponse.error(msg="权限不足", code=ResultCode.PERMISSION_ERROR)
+    if not (session_id or "").strip():
+        return RouteResponse.error(msg="session_id 不能为空", code=ResultCode.INVALID_VALUE_ERROR)
+
+    dev_graph = getattr(request.app.state, "main_graph", None)
+    if dev_graph is None:
+        return RouteResponse.error(msg="开发图尚未初始化", code=ResultCode.SERVER_ERROR)
+
+    from Tasks.dev_handover import dev_thread_id
+    thread_id = dev_thread_id(session_id)
+    try:
+        snapshot = await dev_graph.aget_state({'configurable': {'thread_id': thread_id}})
+        interrupts = list(snapshot.interrupts or ())
+        values = snapshot.values or {}
+        messages = []
+        for message in values.get("messages", []):
+            text = content_text(message.content)
+            # 结构化输出只有 tool call、没有正文，前端不展示
+            if isinstance(message, AIMessage) and not text.strip():
+                continue
+            messages.append({
+                "type": type(message).__name__,
+                "name": getattr(message, "name", None),
+                "content": text,
+            })
+        data = {
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "app_type": values.get("app_type", ""),
+            "project_name": values.get("project_name", ""),
+            "date": values.get("date", ""),
+            "is_ops": bool(values.get("is_ops")),
+            "interrupted": bool(interrupts),
+            "interrupt": jsonable_encoder(interrupts),
+            "output_msg": "" if interrupts else values.get("output_msg", ""),
+            "metadata": values.get("metadata") or {},
+            "messages": messages,
+        }
+        return RouteResponse.ok(data=jsonable_encoder(data))
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"获取转交开发历史失败：{type(exc).__name__}: {exc}")
+        return RouteResponse.error(msg=f"获取转交开发历史失败：{exc}",
+                                   code=ResultCode.SERVER_ERROR)
+
+
+@route.post("/agent/handover/resume")
+async def resume_handover(request: Request, req: OpsResumeRequest) -> RouteResponse:
+    """恢复转交开发会话停在的人工确认"""
+    try:
+        permission = int(request.state.info.get("permission"))
+    except (ValueError, TypeError):
+        return RouteResponse.error(msg="token解析错误，请重新登录", code=ResultCode.INVALID_VALUE_ERROR)
+    if permission < 1:
+        return RouteResponse.error(msg="权限不足", code=ResultCode.PERMISSION_ERROR)
+    if not (req.session_id or "").strip():
+        return RouteResponse.error(msg="session_id 不能为空", code=ResultCode.INVALID_VALUE_ERROR)
+
+    if getattr(request.app.state, "main_graph", None) is None:
+        return RouteResponse.error(msg="开发图尚未初始化", code=ResultCode.SERVER_ERROR)
+
+    from Tasks.background_broker import background_broker
+    from Tasks.dev_handover import dev_thread_id, resume_handover as resume_dev_handover
+    thread_id = dev_thread_id(req.session_id)
+    if background_broker.occupancy(thread_id) == "active":
+        return RouteResponse.error(msg="开发会话正在运行，请稍后再试", code=ResultCode.SERVER_ERROR)
+
+    try:
+        result = await resume_dev_handover(req.session_id, req.answer)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"恢复转交开发会话 {req.session_id} 失败：{type(exc).__name__}: {exc}")
+        return RouteResponse.error(msg=f"恢复失败：{exc}", code=ResultCode.SERVER_ERROR)
+
+    interrupted = isinstance(result, dict) and bool(result.get("__interrupt__"))
+    return RouteResponse.ok(data={
+        "session_id": req.session_id,
+        "thread_id": thread_id,
+        "interrupted": interrupted,
+        "interrupt": jsonable_encoder(result.get("__interrupt__")) if interrupted else [],
+        "output_msg": "" if interrupted or not isinstance(result, dict) else result.get("output_msg", ""),
+        "type": (result.get("metadata") or {}).get("type", "") if isinstance(result, dict) else "",
+    })

@@ -28,6 +28,10 @@ class OperationsAndReconcileMainState(MessagesState):
     is_cluster: NotRequired[bool]
     # 源码项目根目录（tmp/target/{app_type}/{date}/{app_name}）  集群不填
     app_file_path: NotRequired[str]
+    # handover 成功后的开发会话信息（前端据此显示入口）
+    handover_dev_thread_id: NotRequired[str]
+    handover_app_name: NotRequired[str]
+    handover_project_name: NotRequired[str]
 
 
 class OperationsAndReconcileCheckInfo(TypedDict):
@@ -59,6 +63,8 @@ class OperationsAndReconcileInputState(TypedDict):
 class OperationsAndReconcileOutputState(TypedDict):
     type: Literal["error", "info"]
     out_msg: str
+    # 非空表示本次运维已把任务转交开发，运行记录/租约由开发流程收尾
+    handover_dev_thread_id: NotRequired[str]
 
 
 class ErrorInfo(TypedDict):

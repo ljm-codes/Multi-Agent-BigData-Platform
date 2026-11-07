@@ -5,7 +5,7 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager, nullcontext
-from typing import cast, Optional
+from typing import Any, cast, Optional
 
 import jwt
 from fastapi import FastAPI, Request
@@ -111,11 +111,34 @@ async def _background_runner(thread_id: str, user_id: str, input_state: dict):
     """perceptron 拉起后台续跑：和用户入口共用同一张主图、同一个 thread_id"""
     if main_graph is None:
         raise RuntimeError("main_graph 尚未初始化")
+    if thread_id.startswith("ops:"):
+        # 运维转交的开发线程：深层测试转后台后用感知层续跑，收尾/解锁交给 dev_handover
+        from Tasks.dev_handover import run_ops_reflow
+        return await run_ops_reflow(thread_id, input_state)
     return await main_graph.ainvoke(
         input_state,
         config={"configurable": {"thread_id": thread_id}},
         context=MainStateContext(thread_id=thread_id, user_id=user_id),
     )
+
+
+async def _dev_handover_runner(thread_id: str, payload: Any):
+    """运维转交开发：线程 id 固定为 ops:{运维session_id}，payload 可以是输入或 Command(resume=...)"""
+    if main_graph is None:
+        raise RuntimeError("main_graph 尚未初始化")
+    return await main_graph.ainvoke(
+        payload,
+        config={"configurable": {"thread_id": thread_id}},
+        context=MainStateContext(thread_id=thread_id, user_id="ops"),
+    )
+
+
+async def _dev_handover_state(thread_id: str) -> dict:
+    """给 dev_handover 判断流程是否真的跑到了 work_end"""
+    if main_graph is None:
+        return {}
+    snapshot = await main_graph.aget_state({"configurable": {"thread_id": thread_id}})
+    return dict(snapshot.values or {})
 
 
 def _normalize_id(raw_id) -> str:
@@ -216,6 +239,10 @@ async def lifespan(api: FastAPI):
         api.state.main_graph = main_graph
         api.state.operations_agent = get_ops_agent() if _is_conn_cluster else None
         api.state.perceptron = start_perceptron(_background_runner)
+        if _is_conn_cluster:
+            from Tasks.dev_handover import set_dev_runner, set_dev_state_getter
+            set_dev_runner(_dev_handover_runner)
+            set_dev_state_getter(_dev_handover_state)
         key_manage = KeyManage()
         key_manage.start()
         # 启动整个运维流程
@@ -247,6 +274,10 @@ async def lifespan(api: FastAPI):
             if perceptron is not None:
                 await perceptron.stop()
             key_manage.shutdown()
+            if _is_conn_cluster:
+                from Tasks.dev_handover import set_dev_runner, set_dev_state_getter
+                set_dev_runner(None)
+                set_dev_state_getter(None)
             api.state.main_graph = None
             api.state.operations_agent = None
             main_graph = None

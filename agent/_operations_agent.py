@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -30,7 +31,7 @@ from SPO.operations_agent_state_model import (OperationsAndReconcileMainState,
 from SPO.postgresql_model import CheckLog, app_lease
 from Tools.operations_agent_tools import AGENT_NAME as OM_AGENT
 from Tools.log_settings import LogSetting
-from Tools.alarm_sender import send_warning_msg
+from Tools.alarm_sender import send_feishu_text, send_warning_msg
 from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.registry import get_tools, get_priority_tools
 from Tools.struct_analy import parse_route_message
@@ -83,6 +84,8 @@ class HandoverMsgModel(BaseModel):
     error_describe: str = Field(description="错误详细描述")
     # 建议
     suggest: str = Field(description="建议")
+    # 交给开发 Agent 的修复清单：逐条写明哪个文件/类/方法出的问题、要改什么
+    task_list: list[str] = Field(default_factory=list, description="修复清单，逐条写明问题位置与要改什么")
 
 
 class SummaryMsgModel(TypedDict):
@@ -119,7 +122,8 @@ class OperationsAndMaintenanceAgentOutModel(BaseModel):
                     "unsolvable_description 是可选的，是对你无法解决的错误的简单描述；"
                     "当你填入 handover 时，必须要填入 handover_info 参数，"
                     "其中，handover_info 参数中，error_describe 是错误详细描述，"
-                    "suggest 是建议。"
+                    "suggest 是建议，task_list 是交给开发 Agent 的修复清单"
+                    "（逐条写明哪个文件/类/方法出的问题、要改什么）。"
     )
 
 
@@ -305,9 +309,14 @@ def forward_node(
                 node.get("summary_info", {}),
             ))
         if node_name == "handover":
+            # app_type / app_file_path 模型不知道，由状态补上；app_name 从路径最后一段取
             send_list.append(Send(
                 "handover",
-                node.get("handover_info", {}),
+                {
+                    **(node.get("handover_info") or {}),
+                    "app_type": state.get("app_type"),
+                    "app_file_path": state.get("app_file_path"),
+                },
             ))
     return send_list
 
@@ -352,9 +361,69 @@ def app_summary(state: SummaryMsgModel) -> dict | None:
         }
 
 
-async def app_handover(state: HandoverMsgModel) -> Literal["chat_end"] | Send:
-    # 暂时不写，因为 对应的开发 Agent 还没实现
-    pass
+async def app_handover(state: dict, runtime: Runtime) -> dict:
+    """把代码/调优问题转交开发 Agent：搬源码 -> 后台跑开发图 -> 飞书提醒"""
+    raw = dict(state or {})
+    app_type = str(raw.get("app_type") or "").upper()
+    app_file_path = str(raw.get("app_file_path") or "")
+
+    if app_type not in {"SPARK", "FLINK"}:
+        return {"type": "error",
+                "error_desc_text": f"应用类型 {app_type or '未知'} 不支持转交开发（只支持 SPARK/FLINK）"}
+    if not app_file_path or not Path(app_file_path).is_dir():
+        return {"type": "error",
+                "error_desc_text": f"没有可用的源码目录（app_file_path={app_file_path!r}），无法转交开发"}
+
+    # 延迟导入：Tasks.dev_handover -> agent.operations_agent_run -> 本模块，模块级导入会成环
+    from Tasks.dev_handover import prepare_project, start_handover
+
+    session_id = runtime.context.session_id
+    app_id = runtime.context.app_id
+    app_name = Path(app_file_path).name
+    try:
+        project_name, date = await asyncio.to_thread(prepare_project, app_file_path, app_type)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"转交开发前搬移源码失败: {type(exc).__name__}: {exc}")
+        return {"type": "error", "error_desc_text": f"搬移源码失败：{type(exc).__name__}: {exc}"}
+
+    error_describe = str(raw.get("error_describe") or "")
+    suggest = str(raw.get("suggest") or "")
+    task_list = [str(item) for item in (raw.get("task_list") or [])]
+    if not task_list:
+        # 模型偶尔漏填：用错误描述+建议兜底，别让整条转交白跑
+        task_list = [f"{error_describe}（建议：{suggest or '按错误描述修复'}）"]
+    handover = {
+        "app_id": app_id,
+        "app_type": app_type.lower(),
+        "app_name": app_name,
+        "project_name": project_name,
+        "date": date,
+        "source_path": app_file_path,
+        "session_id": session_id,
+        "error_describe": error_describe,
+        "suggest": suggest,
+        "task_list": task_list,
+    }
+    try:
+        thread_id = await start_handover(session_id=session_id, handover=handover)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"启动开发 Agent 失败: {type(exc).__name__}: {exc}")
+        return {"type": "error", "error_desc_text": f"启动开发 Agent 失败：{type(exc).__name__}: {exc}"}
+
+    await asyncio.to_thread(
+        send_feishu_text,
+        f"运维转交开发：应用 {app_id}（{app_name}，{app_type}）\n"
+        f"错误：{handover['error_describe']}\n开发会话：{thread_id}",
+    )
+    return {
+        "handover_dev_thread_id": thread_id,
+        "handover_app_name": app_name,
+        "handover_project_name": project_name,
+        "messages": [AIMessage(content=(
+            f"已转交开发 Agent 修复（开发会话 {thread_id}，项目 {project_name}）。\n"
+            f"错误描述：{handover['error_describe'] or '无'}"
+        ))],
+    }
 
 
 def _annotate_and_sort(tool_calls: list[ToolCall]) -> list[dict]:
@@ -493,34 +562,38 @@ async def chat_end(
         state: OperationsAndReconcileMainState,
         runtime: Runtime
 ) -> OperationsAndReconcileOutputState:
-    # 无论如何都要解锁
+    # 转交开发时不解锁：开发流程还没结束，运行记录/租约由 Tasks.dev_handover 收尾
+    handover_tid = state.get("handover_dev_thread_id")
     _tool_progress_savepoint.pop(runtime.context.session_id, None)
-    try:
-        async with AsyncSessionLocal() as session:
-            stmt = delete(app_lease).where(
-                and_(
-                    app_lease.c.app_id == runtime.context.app_id,
-                    app_lease.c.session_id == runtime.context.session_id
+    if not handover_tid:
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = delete(app_lease).where(
+                    and_(
+                        app_lease.c.app_id == runtime.context.app_id,
+                        app_lease.c.session_id == runtime.context.session_id
+                    )
                 )
+                await session.execute(stmt)
+                # AsyncSession 的上下文管理不会自动 commit；不提交 = delete 回滚，锁永远不释放
+                await session.commit()
+        except Exception as e:
+            logger.exception(f"在尝试解锁应用占用锁时出错 {type(e).__name__}: {e}")
+            return OperationsAndReconcileOutputState(
+                type="error",
+                out_msg=f"解锁应用占用锁时出错 {type(e).__name__}: {e}"
             )
-            await session.execute(stmt)
-            # AsyncSession 的上下文管理不会自动 commit；不提交 = delete 回滚，锁永远不释放
-            await session.commit()
-    except Exception as e:
-        logger.exception(f"在尝试解锁应用占用锁时出错 {type(e).__name__}: {e}")
-        return OperationsAndReconcileOutputState(
-            type="error",
-            out_msg=f"解锁应用占用锁时出错 {type(e).__name__}: {e}"
-        )
 
     if state.get("type", "") == "error":
         return OperationsAndReconcileOutputState(
             type="error",
-            out_msg=state.get("error_desc_text", "")
+            out_msg=state.get("error_desc_text", ""),
+            handover_dev_thread_id=handover_tid or "",
         )
     return OperationsAndReconcileOutputState(
         type="info",
-        out_msg=state.get("messages")[-1].content
+        out_msg=state.get("messages")[-1].content,
+        handover_dev_thread_id=handover_tid or "",
     )
 
 

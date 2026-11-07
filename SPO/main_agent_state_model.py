@@ -24,6 +24,7 @@ class TaskOutcome:
     partial: Any = None  # 后台超时中断时的已产出内容
     snapshot: Any = None  # 场景二第一阶段 handed_off 时的进度快照
     message: str = ""
+    ver_status: Literal["preliminary", "shallow", "deep", "done"] = "preliminary"
     error: str | None = None
 
 
@@ -62,13 +63,30 @@ def agent_label(from_: str | None) -> str:
 
 
 # 大数据开发Agent的状态模型
+class OpsHandoverState(TypedDict):
+    """运维转交开发时带过来的上下文（不经过 dis_chat 直接进开发节点）"""
+    app_id: str
+    app_type: Literal["spark", "flink"]
+    app_name: str          # 运维拉取目录里的原始应用名
+    project_name: str      # 搬进 tmp_code 后的目录名（重名时带前缀）
+    date: str              # tmp_code 下使用的当前日期
+    source_path: str       # 原来的 tmp/target/... 路径
+    session_id: str        # 运维会话 id，开发 thread_id = f"ops:{session_id}"
+    error_describe: str
+    suggest: str
+    task_list: list[str]
+
+
 class DevelopAgentInputState(TypedDict):
     input_msg: str
     # 后台续跑时由感知层带入，用于中间件按任务取结果
     deep_task_id: NotRequired[str]
     is_background: NotRequired[bool]
-    is_ops: NotRequired[Literal[True]]
+    is_ops: NotRequired[bool]
+    ops_handover: NotRequired[OpsHandoverState]
     source: NotRequired[str]
+    # 后台回流时带回来的验证阶段，CVA 据此决定 goto 是否放行
+    status: NotRequired[Literal["preliminary", "shallow", "deep", "done"]]
 
 
 class AgentDevelopInputState(TypedDict):
@@ -81,6 +99,9 @@ class AgentDevelopInputState(TypedDict):
     error_msg: NotRequired[str]
     human_suggestion: NotRequired[str]
     repair_num: NotRequired[int]
+    is_submit: NotRequired[bool]
+    is_ops: NotRequired[bool]
+    ops_handover: NotRequired[OpsHandoverState]
 
 
 class AllocateErrorInfo(TypedDict):
@@ -98,6 +119,8 @@ class DevelopAgentMainState(MessagesState):
     thread_id: NotRequired[str]
     deep_task_id: NotRequired[str]
     is_background: NotRequired[bool]
+    is_ops: NotRequired[bool]
+    ops_handover: NotRequired[OpsHandoverState]
     source: NotRequired[str]
     app_type: NotRequired[Literal["spark", "flink"]]
     date: NotRequired[str]
@@ -108,6 +131,9 @@ class DevelopAgentMainState(MessagesState):
     repair_num: NotRequired[int]
     is_repair: NotRequired[bool]
     human_suggestion: NotRequired[str]
+    is_submit: NotRequired[bool]
+    # 验证阶段；后台回流时从 CodeVerify 的 TaskOutcome.ver_status
+    status: NotRequired[Literal["preliminary", "shallow", "deep", "done"]]
     # work_end 的产出；event streaming v3 的 stream.output() 读的是 state values
     output_msg: NotRequired[str]
     out_time: NotRequired[datetime]
@@ -151,12 +177,16 @@ class CodeVerifyAgentInputState(TypedDict):
     is_repair: NotRequired[bool]
     deep_task_id: NotRequired[str]
     background_msg: NotRequired[str]
+    is_submit: NotRequired[bool]
+    is_ops: NotRequired[bool]
+    status: NotRequired[Literal["preliminary", "shallow", "deep", "done"]]
 
 
 class CodeVerifyAgentMainState(MessagesState):
     date: str
     app_type: str
     project_name: str
+    status: Literal["preliminary", "shallow", "deep", "done"]  # 当前验证Agent处于哪个阶段
     source: NotRequired[str]
     deep_task_id: NotRequired[str]
     original_task_list: NotRequired[list[str]]
@@ -171,6 +201,14 @@ class CodeVerifyAgentMainState(MessagesState):
     repair_num: NotRequired[int]
     is_repair: NotRequired[bool]
     mermaid_retry_num: NotRequired[int]
+    is_submit: NotRequired[bool]
+    is_ops: NotRequired[bool]
+    verify_end_msg: NotRequired[str]
+    # ver_submit 回传给 ver_end 的字段；
+    type: NotRequired[Literal["info", "warn", "error"]]
+    submit_desc: NotRequired[str]
+    from_: NotRequired[str]
+    thread_id: NotRequired[str]
 
 
 # 结束状态

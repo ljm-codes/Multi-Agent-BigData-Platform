@@ -72,28 +72,13 @@ def send_error_email(
 #     return "邮件发送成功" if send_error_email(subject, content) else "邮件发送失败"
 
 
-def send_warning_msg(
-        app_id: str, description: str,
-        error_id: Optional[list[int]] = None,
-):
-    """
-    不向 Agent 进行提供该工具， 采用手动 告警
-    向人员发送警告消息
-    Args:
-        error_id: 错误ID
-        app_id: YARN 应用ID
-        description: 警告简单描述
-    Returns:
-
-    """
+def send_feishu_text(text: str) -> tuple[bool, str]:
+    """向飞书群机器人发送一条纯文本消息"""
     try:
-        error_id_str = ','.join(map(str, error_id)) if error_id else "None"
         resp = requests.post(_feishu_uri, headers={"Content-Type": "application/json"},
                              data=json.dumps({
                                  "msg_type": "text",
-                                 "content": {
-                                     "text": f"错误ids: {error_id_str} 来自 {app_id}，{description}"
-                                 }
+                                 "content": {"text": text}
                              }), timeout=10)
         if resp.status_code != 200:
             logger.error(f"发送消息失败，状态码 {resp.status_code}，响应体 {resp.text}")
@@ -117,6 +102,24 @@ def send_warning_msg(
         return False, f"连不上: {e}"
     except requests.exceptions.RequestException as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+def send_warning_msg(
+        app_id: str, description: str,
+        error_id: Optional[list[int]] = None,
+):
+    """
+    不向 Agent 进行提供该工具， 采用手动 告警
+    向人员发送警告消息
+    Args:
+        error_id: 错误ID
+        app_id: YARN 应用ID
+        description: 警告简单描述
+    Returns:
+
+    """
+    error_id_str = ','.join(map(str, error_id)) if error_id else "None"
+    return send_feishu_text(f"错误ids: {error_id_str} 来自 {app_id}，{description}")
 
 
 if __name__ == '__main__':
