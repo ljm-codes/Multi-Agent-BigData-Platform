@@ -20,6 +20,18 @@ class OperationsAndReconcileMainState(MessagesState):
     remaining_tool_calls: NotRequired[List[Dict]]
     # 在网关执行时 临时添加的 AI 消息 -> 到时候将会在转 Agent 节点时，进行去除
     temp_ai_ids: NotRequired[List[str]]
+    # 应用ID
+    app_id: NotRequired[str]
+    # 应用类型
+    app_type: NotRequired[Literal["SPARK", "FLINK", "CLUSTER"]]
+    # 是否为集群
+    is_cluster: NotRequired[bool]
+    # 源码项目根目录（tmp/target/{app_type}/{date}/{app_name}）  集群不填
+    app_file_path: NotRequired[str]
+    # handover 成功后的开发会话信息（前端据此显示入口）
+    handover_dev_thread_id: NotRequired[str]
+    handover_app_name: NotRequired[str]
+    handover_project_name: NotRequired[str]
 
 
 class OperationsAndReconcileCheckInfo(TypedDict):
@@ -44,11 +56,15 @@ class OperationsAndReconcileInputState(TypedDict):
     app_id: NotRequired[str]
     # 应用类型
     app_type: NotRequired[Literal["SPARK", "FLINK", "CLUSTER"]]
+    # 源码项目根目录（tmp/target/{app_type}/{date}/{app_name}）  集群不填
+    app_file_path: NotRequired[str]
 
 
 class OperationsAndReconcileOutputState(TypedDict):
     type: Literal["error", "info"]
     out_msg: str
+    # 非空表示本次运维已把任务转交开发，运行记录/租约由开发流程收尾
+    handover_dev_thread_id: NotRequired[str]
 
 
 class ErrorInfo(TypedDict):

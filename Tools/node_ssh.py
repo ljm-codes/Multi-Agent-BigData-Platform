@@ -19,6 +19,7 @@ import os
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -38,7 +39,7 @@ SSH_TIMEOUT = int(_ssh_conf.get("timeout", 15))
 SSH_PASSWORD = os.getenv("SSH_PASSWORD", "")
 
 _pool: Dict[str, paramiko.SSHClient] = {}
-# 每 host 一把锁：连接内的命令执行串行（gateway 本来也要求 ssh 类限并发），
+# 每个连接一把锁：连接内的命令/SFTP 串行（gateway 本来也要求 ssh 类限并发），
 # 同时避免多线程共用一个 paramiko 连接
 _locks: Dict[str, threading.Lock] = {}
 _pool_lock = threading.Lock()
@@ -56,22 +57,35 @@ class SshResult:
     cost_ms: int = field(default=0)
 
 
-def _lock_of(host: str) -> threading.Lock:
+def _endpoint(host: str, user: Optional[str] = None, port: Optional[int] = None,
+              password: Optional[str] = None) -> Tuple[str, int, str]:
+    """把「默认配置 + 调用方覆盖」合成一组连接参数"""
+    return (str(user or SSH_USER), int(port or SSH_PORT),
+            SSH_PASSWORD if password is None else str(password))
+
+
+def _key(host: str, user: str, port: int) -> str:
+    """池的键：同一台机器可能用不同账号/端口连（如 code.commit.ssh），不能只按 host"""
+    return f"{user}@{host}:{port}"
+
+
+def _lock_of(key: str) -> threading.Lock:
     with _pool_lock:
-        return _locks.setdefault(host, threading.Lock())
+        return _locks.setdefault(key, threading.Lock())
 
 
-def _connect(host: str, timeout: int) -> Tuple[Optional[paramiko.SSHClient], str, str]:
+def _connect(host: str, timeout: int, user: str, port: int,
+             password: str) -> Tuple[Optional[paramiko.SSHClient], str, str]:
     """建连；失败返回 (None, 错误类别, 说明)"""
     client = paramiko.SSHClient()
     # 与测试脚手架的 -o StrictHostKeyChecking=no 等价：集群节点会重建，主机键留不住
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         client.connect(
-            hostname=host, port=SSH_PORT, username=SSH_USER,
-            password=SSH_PASSWORD or None,
+            hostname=host, port=port, username=user,
+            password=password or None,
             timeout=timeout, banner_timeout=timeout, auth_timeout=timeout,
-            look_for_keys=not SSH_PASSWORD, allow_agent=not SSH_PASSWORD,
+            look_for_keys=not password, allow_agent=not password,
         )
         # 创造 心跳
         client.get_transport().set_keepalive(timeout)
@@ -81,7 +95,7 @@ def _connect(host: str, timeout: int) -> Tuple[Optional[paramiko.SSHClient], str
     except (socket.timeout, TimeoutError) as e:
         return None, ERR_TIMEOUT, f"建连超时({timeout}s): {e}"
     except (socket.gaierror, ConnectionRefusedError, OSError) as e:
-        return None, ERR_REFUSED, f"连不上 {host}:{SSH_PORT}: {e}"
+        return None, ERR_REFUSED, f"连不上 {host}:{port}: {e}"
     except paramiko.SSHException as e:
         # "No authentication methods available" 也走这条（它是 SSHException 不是
         # AuthenticationException）—— 认证问题要归 auth，否则网关会当普通错误去重试
@@ -93,22 +107,22 @@ def _connect(host: str, timeout: int) -> Tuple[Optional[paramiko.SSHClient], str
         raise
 
 
-def _alive(host: str) -> Optional[paramiko.SSHClient]:
+def _alive(key: str) -> Optional[paramiko.SSHClient]:
     """取池里还活着的连接；断了的顺手丢掉"""
     with _pool_lock:
-        client = _pool.get(host)
+        client = _pool.get(key)
     if client is None:
         return None
     transport = client.get_transport()
     if transport is None or not transport.is_active():
-        _drop(host)
+        _drop(key)
         return None
     return client
 
 
-def _drop(host: str) -> None:
+def _drop(key: str) -> None:
     with _pool_lock:
-        client = _pool.pop(host, None)
+        client = _pool.pop(key, None)
     if client is not None:
         try:
             client.close()
@@ -116,16 +130,20 @@ def _drop(host: str) -> None:
             pass
 
 
-def _ensure(host: str, timeout: int) -> Tuple[Optional[paramiko.SSHClient], str, str]:
+def _ensure(host: str, timeout: int, *, user: Optional[str] = None,
+            port: Optional[int] = None,
+            password: Optional[str] = None) -> Tuple[Optional[paramiko.SSHClient], str, str]:
     """复用或新建；**新建的连接放进池里长期保留**"""
-    client = _alive(host)
+    user, port, password = _endpoint(host, user, port, password)
+    key = _key(host, user, port)
+    client = _alive(key)
     if client is not None:
         return client, "", ""
-    client, kind, msg = _connect(host, timeout)
+    client, kind, msg = _connect(host, timeout, user, port, password)
     if client is None:
         return None, kind, msg
     with _pool_lock:
-        _pool[host] = client
+        _pool[key] = client
     return client, "", ""
 
 
@@ -138,18 +156,20 @@ def warm_up(hosts: Iterable[str], *, timeout: int = SSH_TIMEOUT) -> Dict[str, st
     """
     outcome: Dict[str, str] = {}
     for host in dict.fromkeys(h for h in hosts if h):
-        with _lock_of(host):
-            client = _alive(host)
+        user, port, password = _endpoint(host)
+        key = _key(host, user, port)
+        with _lock_of(key):
+            client = _alive(key)
             if client is not None:
                 outcome[host] = ""
                 continue
-            client, kind, msg = _connect(host, timeout)
+            client, kind, msg = _connect(host, timeout, user, port, password)
             if client is None:
                 logger.error(f"预热 ssh {host} 失败({kind}): {msg}")
                 outcome[host] = f"{kind}: {msg}"
                 continue
             with _pool_lock:
-                _pool[host] = client
+                _pool[key] = client
             outcome[host] = ""
         logger.info(f"ssh 预热完成: {host}")
     return outcome
@@ -160,18 +180,18 @@ def pool_status() -> List[dict]:
     with _pool_lock:
         items = list(_pool.items())
     out = []
-    for host, client in items:
+    for key, client in items:
         transport = client.get_transport()
-        out.append({"host": host, "active": bool(transport and transport.is_active())})
+        out.append({"host": key, "active": bool(transport and transport.is_active())})
     return out
 
 
 def close_all() -> None:
     """进程退出 / 配置变更时清池"""
     with _pool_lock:
-        hosts = list(_pool)
-    for host in hosts:
-        _drop(host)
+        keys = list(_pool)
+    for key in keys:
+        _drop(key)
 
 
 def _exec(client: paramiko.SSHClient, command: str, timeout: int) -> SshResult:
@@ -191,8 +211,10 @@ def run(host: str, command: str, *, timeout: int = SSH_TIMEOUT) -> SshResult:
     :param timeout: 单次建连/执行的超时（秒）。一次调用最坏 = 建连 + 执行，各算各的
     """
     t0 = time.time()
-    with _lock_of(host):
-        client, kind, msg = _ensure(host, timeout)
+    user, port, password = _endpoint(host)
+    key = _key(host, user, port)
+    with _lock_of(key):
+        client, kind, msg = _ensure(host, timeout, user=user, port=port, password=password)
         if client is None:
             logger.error(f"ssh {host} 不可用({kind}): {msg}")
             return SshResult(ok=False, error_kind=kind, message=msg,
@@ -200,22 +222,22 @@ def run(host: str, command: str, *, timeout: int = SSH_TIMEOUT) -> SshResult:
         try:
             result = _exec(client, command, timeout)
         except (socket.timeout, TimeoutError) as e:
-            _drop(host)
+            _drop(key)
             msg = f"命令执行超时({timeout}s): {e}"
             logger.error(f"ssh {host} {msg}")
             return SshResult(ok=False, error_kind=ERR_TIMEOUT, message=msg,
                              cost_ms=int((time.time() - t0) * 1000))
         except paramiko.SSHException as e:
             # 复用中的连接可能已被服务端断掉（空闲超时 / 重启）。丢掉重连一次
-            _drop(host)
-            fresh, kind, msg = _ensure(host, timeout)
+            _drop(key)
+            fresh, kind, msg = _ensure(host, timeout, user=user, port=port, password=password)
             if fresh is None:
                 return SshResult(ok=False, error_kind=kind, message=msg,
                                  cost_ms=int((time.time() - t0) * 1000))
             try:
                 result = _exec(fresh, command, timeout)
             except paramiko.SSHException as e2:
-                _drop(host)
+                _drop(key)
                 msg = f"重连后仍失败: {e2}"
                 logger.error(f"ssh {host} {msg}")
                 return SshResult(ok=False, error_kind=ERR_UNKNOWN, message=msg,
@@ -223,3 +245,49 @@ def run(host: str, command: str, *, timeout: int = SSH_TIMEOUT) -> SshResult:
 
         result.cost_ms = int((time.time() - t0) * 1000)
         return result
+
+
+@contextmanager
+def sftp(host: str, *, user: Optional[str] = None, port: Optional[int] = None,
+         password: Optional[str] = None, timeout: int = SSH_TIMEOUT):
+    """
+    在池里的连接上开一个 SFTP 通道 —— **通道关，连接不关**
+
+    同一端点的命令和 SFTP 共用一把锁，所以一个文件树传完前，别的 ssh 调用会等着；
+    paramiko 的连接本来也不适合多线程并发。code.commit.ssh 可能是另一台/另一个账号，
+    所以允许覆盖 user/port/password（密码默认 SSH_PASSWORD）。
+    """
+    user, port, password = _endpoint(host, user, port, password)
+    key = _key(host, user, port)
+    with _lock_of(key):
+        client, kind, msg = _ensure(host, timeout, user=user, port=port, password=password)
+        if client is None:
+            raise RuntimeError(f"ssh {host} 不可用({kind}): {msg}")
+        try:
+            channel = client.open_sftp()
+        except paramiko.SSHException:
+            # 空闲连接可能已被服务端断掉，和 run() 一样重连一次
+            _drop(key)
+            client, kind, msg = _ensure(host, timeout, user=user, port=port, password=password)
+            if client is None:
+                raise RuntimeError(f"ssh {host} 不可用({kind}): {msg}")
+            channel = client.open_sftp()
+        try:
+            yield channel
+        finally:
+            channel.close()
+
+
+def ensure_remote_dirs(sftp: paramiko.SFTPClient, remote_dir: str) -> None:
+    """逐级建远端目录（SFTP 没有 mkdir -p）"""
+    if not remote_dir or remote_dir in ("/", "."):
+        return
+    current = "/" if remote_dir.startswith("/") else ""
+    for part in remote_dir.strip("/").split("/"):
+        if not part:
+            continue
+        current = f"{current.rstrip('/')}/{part}" if current else part
+        try:
+            sftp.stat(current)
+        except OSError:
+            sftp.mkdir(current)

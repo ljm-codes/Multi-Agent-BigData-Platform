@@ -13,7 +13,7 @@
     flink__    Job / Vertex / Checkpoint / TaskManager 指标
     db__       按 id 取检查记录的明细（invoke 里只给摘要，明细按需取）
     code__     作业代码：总体样貌 / 按限定名取源码段 / 全文搜索
-               （源码在 HDFS 上，自身没有文件访问的 Agent 靠这组工具看代码）
+               （源码由运维前台拉到本地，自己不能访问文件的 Agent 靠这组工具看代码）
     job__      重提作业（写操作，默认只回显不执行）/ 需要动实际代码文件时，转发到对应的 代码开发 Agent
 """
 import html
@@ -21,22 +21,29 @@ import json
 import re
 import shlex
 import time
-from typing import Any, Optional, Tuple
+from pathlib import Path
+from typing import Any, Optional, Tuple, Literal
 
 import requests
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
+from langgraph.types import interrupt
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from SPO.postgresql_model import CheckLog
+from SPO.postgresql_model import CheckLog, AppFileIndex
 from SPO.tool_result import (ERR_PARSE, ERR_REFUSED, ERR_TIMEOUT, ERR_UNSUPPORTED,
-                             ERR_UNKNOWN, ToolResult, empty, fail, not_found, ok)
+                             ERR_UNKNOWN, ERR_WRITE_FAILED, ToolResult, empty, fail,
+                             not_found, ok)
 from Tools import node_ssh
 from Tools.code_analysis import JavaAnalyzer, PyAnalyzer
 from Tools.db import SessionLocal
+from Tools.job_command import (change_command, normalize_answer, rows as command_rows,
+                               split as split_command, validate_command)
 from Tools.log_settings import LogSetting
 from Tools.registry import register_tool
 from Tools.share_check_tool import (get_flink_rest_base, get_stage_summary,
                                     manager, proxy)
+from Tools.yarn_queue import leaf_queues, scheduler_root
 from load_config.config import config
 
 logger = LogSetting.create(__name__)
@@ -122,26 +129,27 @@ def _get_json(uri: str, *, timeout: int = _HTTP_TIMEOUT,
 
 @register_tool(AGENT_NAME, 1)
 @tool("yarn__get_app")
-def yarn_get_app(app_id: str) -> str:
+def yarn_get_app(runtime: ToolRuntime) -> str:
     """
     (工具优先级：1)
     取一个 YARN 应用的状态和终局。
 
     它返回的 state 决定后面每个工具的结果该怎么解读。
 
-    Args:
-        app_id: YARN 应用 ID，形如 application_1790322150352_0001
+    参数:
+        无
 
-    Returns:
+    返回:
         data: {state, finalStatus, diagnostics, applicationType, queue, name,
                startedTime, finishedTime, allocatedMB, runningContainers}
         diagnostics 是 YARN 记的失败原因原文。
         注意：
             **若state 不是 RUNNING 时，后面的取数工具可能会陆续失败** —— 先看这个值再往下走。
     """
+    app_id = runtime.state.get("app_id")
     app_id = (app_id or "").strip()
     if not app_id:
-        return _dump(fail(ERR_UNKNOWN, "app_id 不能为空"))
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
     data, err, cost = _get_json(f"{manager}/ws/v1/cluster/apps/{app_id}",
                                 what=f"应用 {app_id} ")
     if err:
@@ -155,7 +163,7 @@ def yarn_get_app(app_id: str) -> str:
 
 @register_tool(AGENT_NAME, 2)
 @tool("yarn__get_app_containers")
-def yarn_get_app_containers(app_id: str) -> str:
+def yarn_get_app_containers(runtime: ToolRuntime) -> str:
     """
     (工具优先级：2)
     列出应用的所有容器：在哪台节点、退出码是多少。
@@ -163,10 +171,10 @@ def yarn_get_app_containers(app_id: str) -> str:
     用途是把「应用」落到「节点 + 容器」上 —— 后面的 log__ 工具要这两个值才能读日志。
     Spark 和 Flink 都适用，AM / JobManager 容器也在列表里。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
+        无
 
-    Returns:
+    返回:
         data: [{container_id, host, node_id, state, exit_status, allocated_mb,
                 log_url, is_am}]
         注意：
@@ -174,9 +182,10 @@ def yarn_get_app_containers(app_id: str) -> str:
             is_am=true，别取第一个。
         - **不含死因原文** —— 死因看 yarn__get_app 的 diagnostics。
     """
+    app_id = runtime.state.get("app_id")
     app_id = (app_id or "").strip()
     if not app_id:
-        return _dump(fail(ERR_UNKNOWN, "app_id 不能为空"))
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
 
     data, err, cost = _get_json(f"{manager}/ws/v1/cluster/apps/{app_id}/appattempts",
                                 what=f"应用 {app_id} 的 attempt 列表 ")
@@ -605,8 +614,6 @@ def node_dmesg(host: str, limit: int = 50) -> str:
 # code__
 # ---------------------------------------------------------------------------
 
-_CODE_PATH = "{root}/{app_type}/code"
-
 
 def _job_app(app_id: str, what: str):
     """
@@ -628,72 +635,41 @@ def _job_app(app_id: str, what: str):
     return app, app_type, None, cost
 
 
-def _fetch_job_code(app_id: str):
-    """
-    把作业的主运行文件取回来
-
-    :return: (源码, app_type, 失败信封)；**失败时源码是 None**
-    """
-    app_id = (app_id or "").strip()
-    if not app_id:
-        return None, None, fail(ERR_UNKNOWN, "app_id 不能为空")
-
-    _, app_type, err, cost = _job_app(app_id, "代码")
-    if err:
-        return None, None, err
-
-    host = _client_host()
-    if not host:
-        return None, None, fail(ERR_UNKNOWN, f"从 manager 配置里解析不出客户端主机: {manager}",
-                                cost_ms=cost)
-
-    code_path = _CODE_PATH.format(root=STARTUP_CMD_DIR, app_type=app_type)
-    res = node_ssh.run(host, f'hdfs dfs -cat {shlex.quote(code_path)} 2>&1')
-    if not res.ok:
-        return None, None, fail(res.error_kind, res.message, cost_ms=res.cost_ms)
-
-    body = res.stdout
-    # 存成目录时 hdfs 回的是 `cat: `/app/spark/code': Is a directory` —— 也在 "cat: " 之列，先判它
-    if "Is a directory" in body:
-        ls = node_ssh.run(host, f'hdfs dfs -ls {shlex.quote(code_path)} 2>&1')
-        files = [ln.split()[-1] for ln in ls.stdout.splitlines()
-                 if ln.strip() and not ln.startswith("Found")]
-        return None, None, not_found(
-            f"hdfs://{code_path} 是个目录不是文件，里面有 {files} —— 先确认哪个是主运行文件",
-            cost_ms=ls.cost_ms)
-    if "No such file or directory" in body or "File does not exist" in body:
-        return None, None, not_found(f"HDFS 上没有这个作业的代码: hdfs://{code_path}",
-                                     cost_ms=res.cost_ms)
-    if "cat: " in body:
-        # 剩下的 cat 报错是 RPC 失败 / 没权限那一类 —— 那是「没取到」，不能报成「没有」
-        return None, None, fail(ERR_UNKNOWN, f"取代码失败: {body[:300]}", cost_ms=res.cost_ms)
-    return body, app_type, None
-
-
-def _analyzer_of(source: str):
+def _analyzer_of(source: str, app_type: Literal["SPARK", "FLINK"]):
     """
     把源码变成对应的分析器 —— **语言分派就在这一处**
 
-    先当 Python 解，解不动再当 Java 解（代码路径没有扩展名，只能这么认）
+    按 app_type 分派：SPARK 走 Python，FLINK 走 Java。
 
     :return: PyAnalyzer / JavaAnalyzer，或失败信封
     """
-    try:
-        return PyAnalyzer(source_code=source)
-    except (SyntaxError, ValueError) as exc:
-        py_err = f"第 {getattr(exc, 'lineno', '?')} 行 {getattr(exc, 'msg', exc)}"
+    if app_type == "SPARK":
+        try:
+            return PyAnalyzer(source_code=source)
+        except (SyntaxError, ValueError) as exc:
+            return fail(ERR_UNSUPPORTED, f"第 {getattr(exc, 'lineno', '?')} 行 {getattr(exc, 'msg', exc)}")
+    elif app_type == "FLINK":
+        try:
+            analyzer = JavaAnalyzer(source_code=source)
+        except RuntimeError as exc:  # 环境里没有 tree_sitter
+            return fail(ERR_UNSUPPORTED, str(exc))
+        if analyzer.has_error and not analyzer.class_hierarchy():
+            head = (source.splitlines() or [""])[0][:80]
+            return fail(ERR_UNSUPPORTED,
+                        f"Java 解析失败：有语法错误且没解析出任何类/方法。文件首行: {head!r}")
+        return analyzer
+    else:
+        return fail(ERR_UNKNOWN, f"应用类型 {app_type} 未知")
 
-    try:
-        analyzer = JavaAnalyzer(source_code=source)
-    except RuntimeError as exc:  # 环境里没有 tree_sitter
-        return fail(ERR_UNSUPPORTED, str(exc))
 
-    if analyzer.has_error and not analyzer.class_hierarchy():
-        head = (source.splitlines() or [""])[0][:80]
-        return fail(ERR_UNSUPPORTED,
-                    f"这份代码既不是 Python 也不是 Java（当成 Python 解: {py_err}；"
-                    f"当成 Java 解: 有语法错误且没解析出任何类/方法）。文件首行: {head!r}")
-    return analyzer
+"""
+避免自己忘了，这里临时写个文本：
+所有作业代码都是打包好的，也就是说是处于在 code_verify_agent.py 中打包的形式
+前台（即operations_agent_run.py 中）会根据用户的配置从远程或本地拉取打包好的作业文件
+拉取到 -> tmp/target/{app_type}/{date}/{app_name} 中
+那么对于 flink 作业文件，只有一个jar包 ，那么对应的文件夹中只有这一个jar包，到时候获取解析源代码将会将代码同时放入这个目录中
+    对于 spark 作业文件，只有一个运行主文件与一个aux.zip文件，解压也会发生在这个目录中
+"""
 
 
 def _dump_capped(payload: dict, big_key: str, cost_ms: int = 0) -> str:
@@ -711,17 +687,200 @@ def _dump_capped(payload: dict, big_key: str, cost_ms: int = 0) -> str:
     return _dump(ok(payload, cost_ms=cost_ms))
 
 
+_SPARK_SOURCE_DIR = ("src", "main", "python")
+_JAVA_SOURCE_DIR = ("src", "main", "java")
+_SKIP_SOURCE_DIRS = {"__pycache__", "test", "tests", "__tests__", "target"}
+
+
+def _source_root(base: Path, parts: tuple[str, ...]) -> Path:
+    """源码根：标准布局是 src/main/{python,java}，没有就退回项目根"""
+    root = base.joinpath(*parts)
+    return root if root.is_dir() else base
+
+
+def _legacy_hint(base: Path) -> str:
+    """旧版 code.commit 目录里只有打包产物，把「为什么读不到源码」说清楚"""
+    try:
+        has_pack = (base / "aux.zip").is_file() or any(
+            p.is_file() and p.suffix == ".jar" for p in base.iterdir())
+    except OSError:
+        has_pack = False
+    return "（这个目录里只有旧版打包产物，请重新提交应用以登记源码）" if has_pack else ""
+
+
+def _skip_source_path(rel: Path) -> bool:
+    """测试/缓存/隐藏目录，以及备份文件和 TIME 标记都不参与"""
+    if any(p in _SKIP_SOURCE_DIRS or p.startswith(".") for p in rel.parts[:-1]):
+        return True
+    return rel.name.startswith(".") or rel.name.endswith(".bak") or rel.name == "TIME"
+
+
+def _parse_spark_list_modules(app_file_path: str) -> str:
+    """
+    spark 源码目录 -> 模块路径
+
+    返回相对于 src/main/python 的模块路径，如：main.py、operator.app_map.py。
+    """
+    try:
+        base = Path(app_file_path)
+        root = _source_root(base, _SPARK_SOURCE_DIR)
+        modules: list[str] = []
+        # 按 as_posix 排：Windows 的 Path 比较忽略大小写，跨平台顺序会不一样
+        for file in sorted(root.rglob("*.py"), key=lambda p: p.relative_to(root).as_posix()):
+            rel = file.relative_to(root)
+            if _skip_source_path(rel):
+                continue
+            modules.append(".".join(rel.with_suffix("").parts) + ".py")
+        if not modules:
+            return _dump(not_found(f"源码目录里没有 .py 文件{_legacy_hint(base)}"))
+        return _dump(ok(modules))
+    except Exception as exc:
+        logger.error(f"解析 {app_file_path} 时出错: {exc}")
+        return _dump(fail(ERR_UNKNOWN, f"解析 spark 作业源码出错: {exc}"))
+
+
+def _resolve_java_source(base: Path, module_path: str) -> Path | str:
+    """
+    module_path -> .java 源码文件
+
+    认三种写法：项目相对路径、src/main/java 相对路径、类全名（旧的 .class 后缀也接受）。
+    :return: Path，或找不到时的错误说明
+    """
+    raw = (module_path or "").strip().replace("\\", "/")
+    if raw.endswith(".class"):
+        raw = raw[:-6]
+    if not raw:
+        return "module_path 不能为空"
+    if raw.endswith(".java"):
+        rel = raw
+    elif "/" in raw:
+        rel = f"{raw}.java"
+    else:
+        rel = raw.replace(".", "/") + ".java"
+
+    source_root = base.joinpath(*_JAVA_SOURCE_DIR)
+    candidates = [base / rel, source_root / rel]
+    prefix = "/".join(_JAVA_SOURCE_DIR) + "/"
+    if rel.startswith(prefix):
+        candidates.append(base / rel[len(prefix):])
+    for path in candidates:
+        if path.is_file():
+            return path
+
+    # 包名和目录对不上时，按简单类名兜一次
+    simple = rel.rsplit("/", 1)[-1]
+    hits = [p for p in base.rglob(simple)
+            if p.is_file() and p.suffix == ".java" and "target" not in p.parts]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        shown = [p.relative_to(base).as_posix() for p in hits]
+        return f"有多个同名源码文件: {shown}，请用项目相对路径"
+    return f"源码里没有 {module_path}{_legacy_hint(base)}"
+
+
+def _convert_code(runtime: ToolRuntime, module_path: str) -> tuple[bool, str | ToolResult]:
+    """
+    将解析代码内容的过程提取为一个共有函数
+    """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return False, fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人")
+    is_cluster = runtime.state.get("is_cluster", False)
+    if is_cluster:
+        return False, fail(ERR_UNSUPPORTED, "集群模式不支持查看作业代码")
+
+    app_type = runtime.state.get("app_type", "")
+    if app_type not in ("SPARK", "FLINK"):
+        return False, fail(ERR_UNSUPPORTED, "当前作业类型不支持")
+
+    app_file_path = runtime.state.get("app_file_path", "")
+    if not app_file_path:
+        return False, fail(ERR_UNSUPPORTED, "作业文件路径为空，可能是还没下载完毕")
+    base = Path(app_file_path)
+    if app_type == "SPARK":
+        module_path = module_path.replace("\\", "/").replace("/", ".")
+        if not module_path.endswith(".py"):
+            return False, not_found(f"Spark 作业模块必须是 .py: {module_path}")
+        rel = Path(*module_path[:-3].split(".")).with_suffix(".py")
+        root = _source_root(base, _SPARK_SOURCE_DIR)
+        source_path = root / rel
+        if not source_path.is_file() and root != base:
+            source_path = base / rel
+        if not source_path.is_file():
+            return False, not_found(f"源码里没有 {module_path}{_legacy_hint(base)}")
+    else:
+        source_path = _resolve_java_source(base, module_path)
+        if isinstance(source_path, str):
+            return False, not_found(source_path)
+    try:
+        source = source_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, fail(ERR_UNKNOWN, f"读取 {module_path} 失败: {exc}")
+    return True, source
+
+
+@register_tool(AGENT_NAME, 3)
+@tool("code__list_modules")
+def code_list_modules(runtime: ToolRuntime) -> str:
+    """
+    (工具优先级：3)
+    查看业务代码的目录结构
+
+    参数:
+        无
+    返回:
+        flink: 项目相对路径的 .java 源码列表，如 src/main/java/com/fm/WordCountApp.java
+        spark: 相对于 src/main/python 的模块路径，如 main.py、operator.app_map.py
+    """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
+    is_cluster = runtime.state.get("is_cluster", False)
+    if is_cluster:
+        return _dump(fail(ERR_UNSUPPORTED, "集群模式不支持查看作业代码"))
+    app_type = runtime.state.get("app_type", "")
+    if app_type not in ("SPARK", "FLINK"):
+        return _dump(fail(ERR_UNSUPPORTED, "当前作业类型不支持"))
+    app_file_path = runtime.state.get("app_file_path", "")
+    if not app_file_path:
+        return _dump(fail(ERR_UNSUPPORTED, "作业文件路径为空，可能是还没下载完毕"))
+    if not Path(app_file_path).is_dir():
+        return _dump(not_found(f"作业文件不存在，可能是还没下载完毕，也可能是没有对应的作业文件"))
+    if app_type == "SPARK":
+        # spark + python 直接列源码目录（src/main/python）
+        return _parse_spark_list_modules(app_file_path)
+    elif app_type == "FLINK":
+        base = Path(app_file_path)
+        root = _source_root(base, _JAVA_SOURCE_DIR)
+        sources: list[str] = []
+        for file in sorted(root.rglob("*.java"), key=lambda p: p.relative_to(root).as_posix()):
+            rel = file.relative_to(root)
+            if _skip_source_path(rel):
+                continue
+            sources.append(file.relative_to(base).as_posix())
+        if not sources:
+            return _dump(not_found(f"源码目录里没有 .java 文件{_legacy_hint(base)}"))
+        return _dump(ok(sources))
+    else:
+        return _dump(fail(ERR_UNSUPPORTED, "当前作业类型不支持"))
+
+
 @register_tool(AGENT_NAME, 3)
 @tool("code__appearance")
-def code_appearance(app_id: str) -> str:
+def code_appearance(runtime: ToolRuntime, module_path: str) -> str:
     """
     (工具优先级：3)
     看作业代码的总体样貌 —— 不读全文就知道这是个什么作业
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
+        module_path: 作业模块路径（来源于工具 code__list_modules）
+            如： flink(java): src/main/java/com/fm/WordCountApp.java 或 com.fm.WordCountApp 都可以
+                spark(python): operator.app_map.py 或 operator/app_map.py 都可以，建议使用前者
 
-    Returns:
+    返回:
         data: {app_id, app_type, total_lines, entry, imports, hierarchy}
               （Java 还多一个 package）
         其中：
@@ -736,11 +895,18 @@ def code_appearance(app_id: str) -> str:
               **它是 None 不代表没有入口**，只代表没认出来
             - package 是 Java 文件自己的包名，拿它把栈帧里的全名对回文件里的短名
     """
-    source, app_type, err = _fetch_job_code(app_id)
-    if err:
-        return _dump(err)
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
+    app_type = runtime.state.get("app_type", "")
+    if app_type not in ("SPARK", "FLINK"):
+        return _dump(fail(ERR_UNSUPPORTED, "当前作业类型不支持"))
+    success, source = _convert_code(runtime, module_path)
+    if not success:
+        return _dump(source if isinstance(source, ToolResult) else fail(ERR_UNSUPPORTED, str(source)))
 
-    analyzer = _analyzer_of(source)
+    analyzer = _analyzer_of(source, app_type)
     if isinstance(analyzer, ToolResult):
         return _dump(analyzer)
 
@@ -760,21 +926,26 @@ def code_appearance(app_id: str) -> str:
 
 @register_tool(AGENT_NAME, 3)
 @tool("code__read")
-def code_read(app_id: str, qualname: str = None, start_line: int = None,
-              end_line: int = None) -> str:
+def code_read(
+        runtime: ToolRuntime, module_path: str,
+        qualname: str = None, start_line: int = None,
+        end_line: int = None
+) -> str:
     """
     (工具优先级：3)
     取作业代码里的一段 —— 要么按名字取整个函数/类，要么按行号取几行
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
+        module_path: 作业模块路径（来源于工具 code__list_modules）
+            如： flink(java): src/main/java/com/fm/WordCountApp.java 或 com.fm.WordCountApp 都可以
+                spark(python): operator.app_map.py 或 operator/app_map.py 都可以，建议使用前者
         qualname: 限定名，**从文件的类往下写全**，如 "Job.process"；模块级的函数用裸名。
                   Java 可以直接抄栈帧里的写法（com.ops.fault.FaultJob$RateSource.run），
                   包名和 $ 会被归一
         start_line: 起始行（从 1 开始）
         end_line: 结束行；不给就只取 start_line 那一行
 
-    Returns:
+    返回:
         data: {app_id, qualname, start_line, end_line, code}，Java 碰到同名方法时多一个 overloads
         其中：
             - 给了 qualname 就**以它为准，行号参数被忽略**；code 是那个函数/类的完整源码段
@@ -784,11 +955,18 @@ def code_read(app_id: str, qualname: str = None, start_line: int = None,
             - 按行取时 code 每行带 `行号: ` 前缀，方便接着定位
             - not_found 时 message 会写明**错在哪一层、那一层有什么**，照着重试
     """
-    source, app_type, err = _fetch_job_code(app_id)
-    if err:
-        return _dump(err)
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
+    app_type = runtime.state.get("app_type", "")
+    if app_type not in ("SPARK", "FLINK"):
+        return _dump(fail(ERR_UNSUPPORTED, "当前作业类型不支持"))
+    success, source = _convert_code(runtime, module_path)
+    if not success:
+        return _dump(source if isinstance(source, ToolResult) else fail(ERR_UNSUPPORTED, str(source)))
 
-    analyzer = _analyzer_of(source)
+    analyzer = _analyzer_of(source, app_type)
     if isinstance(analyzer, ToolResult):
         return _dump(analyzer)
 
@@ -823,21 +1001,26 @@ def code_read(app_id: str, qualname: str = None, start_line: int = None,
 
 @register_tool(AGENT_NAME, 3)
 @tool("code__grep")
-def code_grep(app_id: str, pattern: str, start_line: int = None, end_line: int = None,
-              is_regex: bool = False, exclude_docstring: bool = False) -> str:
+def code_grep(
+        runtime: ToolRuntime, pattern: str, module_path: str,
+        start_line: int = None, end_line: int = None,
+        is_regex: bool = False, exclude_docstring: bool = False
+) -> str:
     """
     (工具优先级：3)
     在作业代码里按行搜文本 —— 注释、字符串、配置键都能搜到
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
         pattern: 要找的内容；**默认按字面量匹配**（不当正则），搜代码片段和配置键不会踩元字符
+        module_path: 作业模块路径（来源于工具 code__list_modules）
+            如： flink(java): src/main/java/com/fm/WordCountApp.java 或 com.fm.WordCountApp 都可以
+                spark(python): operator.app_map.py 或 operator/app_map.py 都可以，建议使用前者
         start_line: 起始行（从 1 开始）；不给则从第 1 行开始
         end_line: 结束行；**不给就只看 start_line 那一行**，此时 is_regex 和 exclude_docstring 都不生效
         is_regex: True 才把 pattern 当正则
         exclude_docstring: True 时剔除落在注释里的命中（Python 是 docstring，Java 是 // 和 /* */）
 
-    Returns:
+    返回:
         data: {app_id, pattern, matched, hits: [{lineno, text, scope}]}
         其中：
             - scope 是这一行所在函数/方法的限定名，不在任何类/函数里就是 "模块级"
@@ -845,11 +1028,18 @@ def code_grep(app_id: str, pattern: str, start_line: int = None, end_line: int =
             - matched=0 是「这份代码里确实没有」，**不是「没取到」**
             - 搜的是源码文本，所以**注释和字符串也会命中** —— 这正是它区别于按名字查的地方
     """
-    source, app_type, err = _fetch_job_code(app_id)
-    if err:
-        return _dump(err)
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
+    app_type = runtime.state.get("app_type", "")
+    if app_type not in ("SPARK", "FLINK"):
+        return _dump(fail(ERR_UNSUPPORTED, "当前作业类型不支持"))
+    success, source = _convert_code(runtime, module_path)
+    if not success:
+        return _dump(source if isinstance(source, ToolResult) else fail(ERR_UNSUPPORTED, str(source)))
 
-    analyzer = _analyzer_of(source)
+    analyzer = _analyzer_of(source, app_type)
     if isinstance(analyzer, ToolResult):
         return _dump(analyzer)
 
@@ -871,63 +1061,205 @@ def _client_host() -> str:
     return urlparse(manager).hostname or ""
 
 
+def _commit_cmd_of(app_type: str, app_name: str) -> tuple[str, str]:
+    """本地 code.app_file_idx 的提交命令；返回 (命令, 来源)"""
+    try:
+        with SessionLocal() as session:
+            row = session.query(AppFileIndex).filter(
+                AppFileIndex.app_type == app_type.upper(),
+                AppFileIndex.app_name == app_name,
+            ).first()
+    except (OperationalError, SQLAlchemyError) as exc:
+        logger.warning(f"查询 code.app_file_idx 失败: {type(exc).__name__}: {exc}")
+        return "", ""
+    if row is None:
+        return "", ""
+    return (row.commit_cmd or "").strip(), "db"
+
+
 @register_tool(AGENT_NAME, 4)
 @tool("job__restart")
-def job_restart(app_id: str, dry_run: bool = True, app_name: str | None = None) -> str:
+def job_restart(
+        runtime: ToolRuntime,
+        dry_run: bool = True,
+        app_name: str | None = None,
+        com_params: dict[str, Any] | None = None,
+) -> str:
     """
     (工具优先级：4)
     重提一个作业：把当初提交它的那条命令原样再跑一次。
 
-    命令取自 HDFS 上按应用名存档的 `{startup_cmd_dir}/{spark|flink}/cmd/{name}.cmd`。
+    命令优先取本地 `code.app_file_idx` 的 `commit_cmd`；没有或为空时，回退到
+    HDFS 上按应用名存档的 `{startup_cmd_dir}/{spark|flink}/cmd/{name}.cmd`。
 
-    Args:
-        app_id: YARN 应用 ID；内部会用 YARN 返回的 name 去找命令文件
+    参数:
         dry_run: True（默认）只把命令取回来，**不执行**；False 才真的提交
-        app_name: YARN 应用名称；不给则用 app_id 去找(可选)
+        app_name: YARN 应用名称；状态里有 app_type 时直接给这个参数可以不再问 RM
+        com_params: 替换命令的参数；键是参数名，值是新的参数值，若参数名不存在，则会跳过不替换
 
-    Returns:
-        data: {app_id, app_name, app_type, cmd_path, command, executed, output}
+    注意：
+        关于参数 com_params：
+            - 无法替换提交的应用名称
+            - 对于需要替换的参数名可以省略 `--` 或 `-` 前缀，flink应用有点特殊， 对于 `-D` `-p` 之类的可以省略
+            - 比如对于flink应用：原命令为 `-D jobmanager.memory.process.size=128m` 对于键你只需输入 `jobmanager.memory.process.size` 即可
+            - 比如对于spark应用：原命令为 `--conf spark.yarn.submit.waitAppCompletion=false` 对于键你只需输入 `config spark.yarn.submit.waitAppCompletion` 即可
+            - 当然你也可以输入 `--` 或 `-` 前缀，系统会自动处理
+            - 值不合法的参数会被**跳过并保留原值**，在返回的 ignored_params 里说明；不会整单失败
+            - 关于这个参数，当且仅当 dry_run为False 时才会生效
+        关于人工审核：
+            - dry_run=False 时会在提交前暂停，等待人工确认；人工可以提交、改命令或提异议
+            - 人工改出来的命令值不合法时同样保留原值，在 ignored_values 里说明
+            - 人工提异议时不会提交，返回 executed=False + objection
+
+    返回:
+        data: {app_id, app_name, app_type, source, cmd_path, command, executed, output,
+               ignored_params?, ignored_values?, objection?}
         其中：
-            - app_name 是 YARN 返回的应用名称（也是 cmd 文件名）
+            - source="db" 表示命令来自本地 code.app_file_idx，source="hdfs" 表示回退到了 HDFS
             - status = not_found 表示这个应用没有存档命令 —— 只能人工重提。
         （Spark 可以用 log__read 读它的 launch_container.sh，里面有 AM 当时的实际命令行，
         但那是 ApplicationMaster 的形态，和 spark-submit 的那条不是一回事。）
     """
+    app_id = runtime.state.get("app_id")
     app_id = (app_id or "").strip()
     if not app_id:
-        return _dump(fail(ERR_UNKNOWN, "app_name 不能为空"))
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
 
-    app, app_type, err, cost = _job_app(app_id, "启动命令")
-    if err:
-        return _dump(err)
+    app_type = (runtime.state.get("app_type") or "").strip().upper()
+    resolved_name = (app_name or "").strip()
+    cost = 0
+
+    # 状态里有 app_type + 调用方给了 app_name 时，不再访问 RM
+    if app_type not in ("SPARK", "FLINK") or not resolved_name:
+        app, rm_type, err, cost = _job_app(app_id, "启动命令")
+        if err:
+            return _dump(err)
+        resolved_name = (resolved_name or (app or {}).get("name") or "").strip()
+        if app_type not in ("SPARK", "FLINK"):
+            app_type = (rm_type or "").upper()
+
+    if app_type not in ("SPARK", "FLINK"):
+        return _dump(fail(ERR_UNSUPPORTED, f"当前应用类型不支持重启: {app_type!r}",
+                          cost_ms=cost))
+    if not resolved_name:
+        return _dump(not_found(f"应用 {app_id} 没有可用的 YARN 应用名", cost_ms=cost))
 
     host = _client_host()
     if not host:
         return _dump(fail(ERR_UNKNOWN, f"从 manager 配置里解析不出客户端主机: {manager}",
                           cost_ms=cost))
 
-    # app_name 传的是 app_id；命令文件按 YARN 的 name 存
-    resolved_name = ((app or {}).get("name") or app_name).strip()
-    cmd_path = f"{STARTUP_CMD_DIR}/{app_type}/cmd/{resolved_name}.cmd"
-    res = node_ssh.run(host, f'hdfs dfs -cat {shlex.quote(cmd_path)} 2>&1')
-    if not res.ok:
-        return _dump(fail(res.error_kind, res.message, cost_ms=res.cost_ms))
-    command = res.stdout.strip()
-    if not command or "No such file or directory" in command or command.startswith("cat: "):
-        return _dump(not_found(
-            f"没有这个应用的启动命令存档: hdfs://{cmd_path} —— 只能人工重提",
-            cost_ms=res.cost_ms))
+    command, source = _commit_cmd_of(app_type, resolved_name)
+    if command:
+        cmd_path = "code.app_file_idx"
+    else:
+        cmd_path = f"{STARTUP_CMD_DIR}/{app_type.lower()}/cmd/{resolved_name}.cmd"
+        res = node_ssh.run(host, f'hdfs dfs -cat {shlex.quote(cmd_path)} 2>&1')
+        if not res.ok:
+            return _dump(fail(res.error_kind, res.message, cost_ms=res.cost_ms))
+        command = res.stdout.strip()
+        if not command or "No such file or directory" in command or command.startswith("cat: "):
+            return _dump(not_found(
+                f"没有这个应用的启动命令存档: hdfs://{cmd_path} —— 只能人工重提",
+                cost_ms=res.cost_ms))
+        source = "hdfs"
+        cost = res.cost_ms
 
-    payload = {"app_id": app_name, "app_name": resolved_name, "app_type": app_type,
-               "cmd_path": cmd_path, "command": command, "executed": False, "output": ""}
+    payload = {"app_id": app_id, "app_name": resolved_name, "app_type": app_type.lower(),
+               "source": source, "cmd_path": cmd_path, "command": command,
+               "executed": False, "output": ""}
     if dry_run:
-        payload["note"] = "dry_run=True，只回显命令没有执行"
-        return _dump(ok(payload, cost_ms=res.cost_ms))
+        payload["note"] = f"dry_run=True，只回显命令没有执行（来源: {source}）"
+        return _dump(ok(payload, cost_ms=cost))
+
+    # 存档命令先做结构校验：程序名、shell 控制符、黑名单键值
+    try:
+        original_tokens = split_command(command)
+    except ValueError as exc:
+        return _dump(fail(ERR_UNSUPPORTED, str(exc), cost_ms=cost))
+    _, _, base_error = validate_command(original_tokens, original_tokens, app_type)
+    if base_error:
+        return _dump(fail(ERR_UNSUPPORTED, f"存档命令不可执行: {base_error}",
+                          cost_ms=cost))
+
+    # 更改参数：值不合法跳过替换、保留原值
+    ignored_params: list[dict] = []
+    if com_params:
+        try:
+            command, ignored_params = change_command(app_type, com_params, command)
+        except ValueError as exc:
+            return _dump(fail(ERR_UNSUPPORTED, str(exc), cost_ms=cost))
+        payload["command"] = command
+
+    # 提交前中断审核
+    try:
+        review_tokens = split_command(command)
+    except ValueError as exc:
+        return _dump(fail(ERR_UNSUPPORTED, str(exc), cost_ms=cost))
+    review = {
+        **payload,
+        "kind": "job_restart",
+        "prompt": "请审阅一下命令，来确认是否提交或者提出你的想法或直接修改",
+        "command_tokens": review_tokens,
+        "command_rows": command_rows(review_tokens),
+    }
+    if ignored_params:
+        review["ignored_params"] = ignored_params
+    answer = interrupt(review)
+
+    # LangGraph 恢复时会从头重跑工具；审核基准以 answer.base_command 为准。
+    # 人工没改就执行审核时看到的那条，人工改了就用 new_command —— 不再拿重跑结果比对失败。
+    approved_tokens = review_tokens
+    approved_command = command
+    base_command = answer.get("base_command") if isinstance(answer, dict) else ""
+    if base_command:
+        try:
+            approved_tokens = split_command(base_command)
+        except ValueError as exc:
+            return _dump(fail(ERR_UNSUPPORTED, f"审核时的命令无法解析: {exc}",
+                              cost_ms=cost))
+        _, _, base_error = validate_command(approved_tokens, approved_tokens, app_type)
+        if base_error:
+            return _dump(fail(ERR_UNSUPPORTED, f"审核时的命令不可执行: {base_error}",
+                              cost_ms=cost))
+        approved_command = shlex.join(approved_tokens)
+    payload["command"] = approved_command
+
+    action, new_tokens, human_msg, answer_error = normalize_answer(answer)
+    if answer_error:
+        # 回复格式问题是人工输入错误，不该让网关自动重试出第二次中断
+        return _dump(fail(ERR_UNSUPPORTED,
+                          f"人工审核回复格式不正确: {answer_error}", cost_ms=cost))
+
+    ignored_values: list[dict] = []
+    if action == "no":
+        if human_msg:
+            payload.update({"executed": False, "output": "", "objection": human_msg})
+            if ignored_params:
+                payload["ignored_params"] = ignored_params
+            return _dump(ok(payload, cost_ms=cost))
+        effective, ignored_values, command_error = validate_command(
+            approved_tokens, new_tokens or [], app_type)
+        if command_error:
+            return _dump(fail(ERR_UNSUPPORTED,
+                              f"人工修改的命令不可执行: {command_error}", cost_ms=cost))
+        command = shlex.join(effective)
+        payload["command"] = command
+    else:
+        command = approved_command
+
+    if ignored_params:
+        payload["ignored_params"] = ignored_params
+    if ignored_values:
+        payload["ignored_values"] = ignored_values
 
     # 写操作：真提交。非幂等，网关那一侧不要让这条自动重试
-    run_res = node_ssh.run(host, f"{command} 2>&1 | tail -n 40", timeout=120)
+    shell_command = f"{command} 2>&1 | tail -n 40"
+    run_res = node_ssh.run(host, f"bash -o pipefail -c {shlex.quote(shell_command)}",
+                           timeout=120)
     if not run_res.ok:
-        return _dump(fail(run_res.error_kind, run_res.message, cost_ms=run_res.cost_ms))
+        # 写操作不确定是否已提交，禁止网关自动重试
+        return _dump(fail(ERR_WRITE_FAILED, run_res.message, cost_ms=run_res.cost_ms))
     payload["executed"] = True
     payload["output"] = run_res.stdout[-4000:]
     payload["exit_code"] = run_res.rc
@@ -1106,35 +1438,6 @@ def cluster_get_metrics() -> str:
     }, cost_ms=cost))
 
 
-def _leaf_queues(node: dict) -> list:
-    """
-    递归摊平出叶子队列 —— 判据是节点自己的 `type`，不靠层数
-
-    和 check_resource_abnormal.get_all_queue_info 同一个思路（按 type 认叶子），
-    但那边只认 `capacitySchedulerLeafQueueInfo`、且从 `queues.queue` 起步，
-    **在本集群（fairScheduler）会一条都取不到**：叶子是 `fairSchedulerLeafQueueInfo`，
-    根在 `schedulerInfo.rootQueue`，子节点在 `childQueues.queue`（也是 dict 包一层）。
-    这里两种调度器都认，判据统一成「type 以 LeafQueueInfo 结尾」。
-    """
-    kids = (((node or {}).get("queues") or {}).get("queue")
-            or ((node or {}).get("childQueues") or {}).get("queue")
-            or [])
-    if str((node or {}).get("type", "")).endswith("LeafQueueInfo"):
-        return [node]
-    if not kids:
-        # 既没有 type 又没有子节点：当叶子兜底，总比整棵树都丢掉好
-        return [node] if (node or {}).get("queueName") else []
-    out = []
-    for child in kids:
-        out.extend(_leaf_queues(child))
-    return out
-
-
-def _scheduler_root(info: dict) -> dict:
-    """容量调度器的根就是 schedulerInfo 自己，公平调度器的根在 rootQueue 里"""
-    return (info or {}).get("rootQueue") or info or {}
-
-
 @register_tool(AGENT_NAME, 1)
 @tool("cluster__get_queue")
 def cluster_get_queue(queue: str = "") -> str:
@@ -1165,7 +1468,7 @@ def cluster_get_queue(queue: str = "") -> str:
     if not info:
         return _dump(empty("RM 没返回调度器信息", cost_ms=cost))
 
-    leaves = _leaf_queues(_scheduler_root(info))
+    leaves = leaf_queues(scheduler_root(info))
     if queue.strip():
         want = queue.strip().rstrip(".")
         leaves = [q for q in leaves if (q.get("queueName") or "").rstrip(".") == want]
@@ -1254,7 +1557,7 @@ def _spark_task_rollup(tasks: dict) -> dict:
 
 @register_tool(AGENT_NAME, 2)
 @tool("spark__get_jobs")
-def spark_get_jobs(app_id: str) -> str:
+def spark_get_jobs(runtime: ToolRuntime) -> str:
     """
     (工具优先级：2)
     取 Spark 应用当前的 job 列表。
@@ -1262,16 +1565,20 @@ def spark_get_jobs(app_id: str) -> str:
     「任务超时」那类告警要拿它看 job 是不是真的不动了：/jobs 是**新的在前**，
     列表第一个就是最后跑的那个 job。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
+        无
 
-    Returns:
+    返回:
         data: [{job_id, name, status, submission_time, completion_time,
                 num_active_tasks, num_completed_tasks, num_failed_tasks}]
         注意：
             传进来的 job 一定会跟着 stage 一起返回，但**失败后重试成功的 stage 不在这里**，
             要看失败证据得用 spark__get_stage。
     """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
     data, err, cost = _get_json(f"{_spark_base(app_id)}/jobs", what=f"应用 {app_id} 的 job 列表 ")
     if err:
         return _dump(err)
@@ -1292,7 +1599,7 @@ def spark_get_jobs(app_id: str) -> str:
 
 @register_tool(AGENT_NAME, 2)
 @tool("spark__get_stage")
-def spark_get_stage(app_id: str, stage_id: int) -> str:
+def spark_get_stage(runtime: ToolRuntime, stage_id: int) -> str:
     """
     (工具优先级：2)
     取一个 Spark stage 的详细指标。
@@ -1302,11 +1609,10 @@ def spark_get_stage(app_id: str, stage_id: int) -> str:
     —— Spark 会重试 stage，重试成功后最新 attempt 就是 COMPLETE，只看最新会漏掉
     已经自愈的失败（实测有 stage attempt0 失败、attempt1 成功后 5 个 checker 全返回 None）。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
         stage_id: stage ID
 
-    Returns:
+    返回:
         data: {latest: {...}, latest_failed: {...}}
         其中：
               每个 attempt: {attempt_id, status, num_tasks, by_status,
@@ -1315,6 +1621,10 @@ def spark_get_stage(app_id: str, stage_id: int) -> str:
                              disk_bytes_spilled, peak_execution_memory}
               task 级明细被压成计数，不逐条返回。
     """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
     latest, latest_failed = get_stage_summary(stage_id, app_id)
     if latest is None and latest_failed is None:
         return _dump(not_found(f"应用 {app_id} 里取不到 stage {stage_id}（stage 不存在，"
@@ -1343,7 +1653,7 @@ def spark_get_stage(app_id: str, stage_id: int) -> str:
 
 @register_tool(AGENT_NAME, 2)
 @tool("spark__get_executors")
-def spark_get_executors(app_id: str) -> str:
+def spark_get_executors(runtime: ToolRuntime) -> str:
     """
     (工具优先级：2)
     取 Spark 应用的 executor 列表与指标。
@@ -1352,10 +1662,10 @@ def spark_get_executors(app_id: str) -> str:
     它比退出码有信息量：137 只说明"被 SIGKILL"，kill -9 / 抢占 / 缩容 / 内存超限
     全长这样（实测同一个 137 曾被误报成 72 条「内存不足」）。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
+        无
 
-    Returns:
+    返回:
         data: [{executor_id, host, is_active, remove_reason, remove_time,
                 rdd_blocks, memory_used, max_memory, jvm_heap_memory, jvm_gc_time,
                 peak_on_heap_execution_memory}]
@@ -1364,6 +1674,10 @@ def spark_get_executors(app_id: str) -> str:
             短任务读到 0 一般是「没采到」，不是「没超」——要和 stage 的 disk_bytes_spilled
             交叉验证。
     """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
     data, err, cost = _get_json(f"{_spark_base(app_id)}/allexecutors", what=f"应用 {app_id} 的 executor 列表 ")
     if err:
         return _dump(err)
@@ -1414,7 +1728,7 @@ def _flink_job_ids(app_id: str) -> Tuple[list, Optional[ToolResult], int]:
 
 @register_tool(AGENT_NAME, 2)
 @tool("flink__get_job")
-def flink_get_job(app_id: str, job_id: str = "") -> str:
+def flink_get_job(runtime: ToolRuntime, job_id: str = "") -> str:
     """
     (工具优先级：2)
     取 Flink job 的概览，以及它的算子（vertex）列表。
@@ -1422,8 +1736,7 @@ def flink_get_job(app_id: str, job_id: str = "") -> str:
     **这是 Flink 侧的第一个调用** —— 它给出 job_id 和 vertex_id，后面
     flink__get_vertex / flink__get_health 都要这两个值。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
         job_id: job ID。留空则自动取该应用当前 RUNNING 的那个（通常只有一个）
 
     Returns:
@@ -1433,6 +1746,11 @@ def flink_get_job(app_id: str, job_id: str = "") -> str:
                            read_records, write_records}
               各 vertex 之间 read_records 差得远 = 数据倾斜的信号。
     """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
+
     jid = (job_id or "").strip()
     if not jid:
         ids, err, _ = _flink_job_ids(app_id)
@@ -1466,7 +1784,7 @@ def flink_get_job(app_id: str, job_id: str = "") -> str:
 
 @register_tool(AGENT_NAME, 2)
 @tool("flink__get_vertex")
-def flink_get_vertex(app_id: str, vertex_id: str, job_id: str = "") -> str:
+def flink_get_vertex(runtime: ToolRuntime, vertex_id: str, job_id: str = "") -> str:
     """
     (工具优先级：2)
     取一个算子的子任务级指标、水位线和背压。
@@ -1474,12 +1792,11 @@ def flink_get_vertex(app_id: str, vertex_id: str, job_id: str = "") -> str:
     **数据倾斜看这里** —— 倾斜是子任务之间的量差，只有子任务级看得到。
     水位线和背压一并取，取不到时在 partial 里说明，不影响主数据。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
         vertex_id: 算子 ID，取自 flink__get_job 的 vertices
         job_id: job ID，留空则自动取当前 RUNNING 的
 
-    Returns:
+    返回:
         data: {vertex_id, name, parallelism, subtasks: [...],
                watermarks: [...], backpressure: [...]}
         其中：
@@ -1489,6 +1806,11 @@ def flink_get_vertex(app_id: str, vertex_id: str, job_id: str = "") -> str:
               **watermarks / backpressure 取失败时是 null 并在 partial 里列出原因**
               —— 别把 null 当成"没有异常"。
     """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
+
     jid = (job_id or "").strip()
     if not jid:
         ids, err, _ = _flink_job_ids(app_id)
@@ -1538,7 +1860,7 @@ def flink_get_vertex(app_id: str, vertex_id: str, job_id: str = "") -> str:
 
 @register_tool(AGENT_NAME, 2)
 @tool("flink__get_health")
-def flink_get_health(app_id: str, job_id: str = "") -> str:
+def flink_get_health(runtime: ToolRuntime, job_id: str = "") -> str:
     """
     (工具优先级：2)
     取 Flink job 的 checkpoint 记录和异常历史。
@@ -1546,11 +1868,10 @@ def flink_get_health(app_id: str, job_id: str = "") -> str:
     「检查点异常」「任务挂起」「其他异常」这几类告警的信息源。
     **exceptions 里的 stacktrace 是定因的关键** —— 类冲突、数据源、权限、格式都在里面。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
         job_id: job ID，留空则自动取当前 RUNNING 的
 
-    Returns:
+    返回:
         data: {job_id, checkpoints: {...}, exceptions: [...]}
         其中：
               exceptions 每项: {exception_name, stacktrace, task_name,
@@ -1558,6 +1879,11 @@ def flink_get_health(app_id: str, job_id: str = "") -> str:
               **checkpoint 一条都没有**（counts 全 0）和「checkpoint 取失败」不是一回事，
               后者会在 partial 里列出来。
     """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
+
     jid = (job_id or "").strip()
     if not jid:
         ids, err, _ = _flink_job_ids(app_id)
@@ -1604,7 +1930,7 @@ def flink_get_health(app_id: str, job_id: str = "") -> str:
 
 @register_tool(AGENT_NAME, 2)
 @tool("flink__get_taskmanagers")
-def flink_get_taskmanagers(app_id: str) -> str:
+def flink_get_taskmanagers(runtime: ToolRuntime) -> str:
     """
     (工具优先级：2)
     取 Flink 应用的 TaskManager 列表与堆内存水位。
@@ -1612,10 +1938,10 @@ def flink_get_taskmanagers(app_id: str) -> str:
     「TaskManager OOM 水位」那类告警用。**日志和详情的入口也在返回里**
     （detail_path / log_url），不用自己拼地址 —— JobManager 落在哪台机器是动态的。
 
-    Args:
-        app_id: YARN 应用 ID
+    参数:
+        无
 
-    Returns:
+    返回:
         data: {taskmanagers: [{taskmanager_id, host, slots_number, free_slots,
                 heap_used, heap_max, heap_usage_ratio, detail_path, log_url}]}
         注意：
@@ -1624,6 +1950,10 @@ def flink_get_taskmanagers(app_id: str) -> str:
               某个 TM 的详情取不到时它的堆字段是 null，并在 partial 里给出原因
               —— null 是「没取到」，不是「没占用」。
     """
+    app_id = runtime.state.get("app_id")
+    app_id = (app_id or "").strip()
+    if not app_id:
+        return _dump(fail(ERR_UNKNOWN, "工具出现了异常，请提交给接手人"))
     base = get_flink_rest_base(app_id)
     data, err, cost = _flink_get(app_id, "/taskmanagers", "TaskManager 列表")
     if err:

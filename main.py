@@ -2,12 +2,14 @@
 项目主文件
 用于fastapi的路由定义、中间件配置以及LangGraph图的初始化等操作
 """
+import asyncio
 import os
-from contextlib import asynccontextmanager
-from typing import cast, Optional
+from contextlib import asynccontextmanager, nullcontext
+from typing import Any, cast, Optional
 
 import jwt
 from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse
 from langchain_core.stores import BaseStore
 from langgraph.cache.sqlite import SqliteCache
 from langgraph.checkpoint.memory import InMemorySaver
@@ -39,10 +41,14 @@ from routers.open_app import route as open_app_route
 from routers.start_file import route as start_file_route
 
 main_graph = None
+checker_task = None
+ops_task = None
+perception_task = None
 _postgres_conf = (config.get('databases') or {}).get('postgres') or {}
 _postgres_url = f"postgresql://{_postgres_conf.get('user')}:{_postgres_conf.get('password')}@{_postgres_conf.get('host')}:{_postgres_conf.get('port')}/{_postgres_conf.get('db')}?sslmode=disable"
 # enabled: false 时退回 InMemorySaver/InMemoryStore（仅适合本地调试）
 _pg_enabled = bool(_postgres_conf.get('enabled', True)) if _postgres_conf else False
+_is_conn_cluster = bool(config.get("app", {}).get("connect_to_cluster", False))
 
 logger = LogSetting.create(__name__)
 token_prefix = "Bearer token "
@@ -50,7 +56,7 @@ whitelist = {"/auth/admin/recommend/register", "/auth/admin/login", "/open/app/g
              "/favicon.ico"}
 # 只保护这三组接口；其余路径（静态资源、/admin 这种 SPA 路由）一律放行 ——
 # 浏览器直接访问页面时不会带 Authorization 头，拦了就打不开
-_PROTECTED_PREFIXES = ("/ai/", "/auth/admin/", "/open/app/")
+_PROTECTED_PREFIXES = ("/ai/", "/auth/admin/", "/open/app/", "/ops/")
 
 if not os.path.isdir(ROOT_BASE_DIR_PATH / 'cache'):
     os.makedirs(ROOT_BASE_DIR_PATH / 'cache')
@@ -105,11 +111,34 @@ async def _background_runner(thread_id: str, user_id: str, input_state: dict):
     """perceptron 拉起后台续跑：和用户入口共用同一张主图、同一个 thread_id"""
     if main_graph is None:
         raise RuntimeError("main_graph 尚未初始化")
+    if thread_id.startswith("ops:"):
+        # 运维转交的开发线程：深层测试转后台后用感知层续跑，收尾/解锁交给 dev_handover
+        from Tasks.dev_handover import run_ops_reflow
+        return await run_ops_reflow(thread_id, input_state)
     return await main_graph.ainvoke(
         input_state,
         config={"configurable": {"thread_id": thread_id}},
         context=MainStateContext(thread_id=thread_id, user_id=user_id),
     )
+
+
+async def _dev_handover_runner(thread_id: str, payload: Any):
+    """运维转交开发：线程 id 固定为 ops:{运维session_id}，payload 可以是输入或 Command(resume=...)"""
+    if main_graph is None:
+        raise RuntimeError("main_graph 尚未初始化")
+    return await main_graph.ainvoke(
+        payload,
+        config={"configurable": {"thread_id": thread_id}},
+        context=MainStateContext(thread_id=thread_id, user_id="ops"),
+    )
+
+
+async def _dev_handover_state(thread_id: str) -> dict:
+    """给 dev_handover 判断流程是否真的跑到了 work_end"""
+    if main_graph is None:
+        return {}
+    snapshot = await main_graph.aget_state({"configurable": {"thread_id": thread_id}})
+    return dict(snapshot.values or {})
 
 
 def _normalize_id(raw_id) -> str:
@@ -197,24 +226,75 @@ def _verify_authorization_header(token: str) -> tuple[ParsedTokenData | None, st
 @asynccontextmanager
 async def lifespan(api: FastAPI):
     global main_graph
-    async with _graph_scope():
+    global checker_task
+    global ops_task
+    global perception_task
+    if _is_conn_cluster:
+        from agent._operations_agent import get_ops_agent, ops_graph_scope
+        ops_scope = ops_graph_scope()
+    else:
+        get_ops_agent = None
+        ops_scope = nullcontext()
+    async with _graph_scope(), ops_scope:
         api.state.main_graph = main_graph
+        api.state.operations_agent = get_ops_agent() if _is_conn_cluster else None
         api.state.perceptron = start_perceptron(_background_runner)
+        if _is_conn_cluster:
+            from Tasks.dev_handover import set_dev_runner, set_dev_state_getter
+            set_dev_runner(_dev_handover_runner)
+            set_dev_state_getter(_dev_handover_state)
         key_manage = KeyManage()
         key_manage.start()
+        # 启动整个运维流程
+        if _is_conn_cluster:
+            from Tools.main_check_tool import main_check
+            from agent.operations_agent_run import operations_main
+            from routers.ops_control import perception_broadcast
+            try:
+                checker_task = asyncio.create_task(main_check(), name="CheckTask")
+                ops_task = asyncio.create_task(operations_main(), name="OpsTask")
+                perception_task = asyncio.create_task(
+                    perception_broadcast(), name="PerceptionBroadcast")
+            except Exception as e:
+                logger.error(f"启动运维流程失败：{e}, 但你仍能使用，但是对应的运维功能将无法使用")
         logger.info("=" * 60)
         logger.info("FastAPI 应用已【完全启动成功】！")
         logger.info("主页: http://127.0.0.1:8000")
         logger.info("=" * 60)
         try:
             yield
+            if checker_task is not None:
+                checker_task.cancel()
+            if ops_task is not None:
+                ops_task.cancel()
+            if perception_task is not None:
+                perception_task.cancel()
         finally:
             perceptron = getattr(api.state, "perceptron", None)
             if perceptron is not None:
                 await perceptron.stop()
             key_manage.shutdown()
+            if _is_conn_cluster:
+                from Tasks.dev_handover import set_dev_runner, set_dev_state_getter
+                set_dev_runner(None)
+                set_dev_state_getter(None)
             api.state.main_graph = None
+            api.state.operations_agent = None
             main_graph = None
+            # 逐个 await：一个任务的 CancelledError 不能挡住另一个任务收尾
+            for task in (checker_task, ops_task, perception_task):
+                if task is None:
+                    continue
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"关闭运维流程失败：{e}[!!!应用无法正常关闭!!!]")
+                    raise e
+            checker_task = None
+            ops_task = None
+            perception_task = None
             logger.info("应用已关闭")
 
 
@@ -259,8 +339,18 @@ def start_app():
     )
     app.state = State()
     app.include_router(ai_chat_route, prefix="/ai", tags=["Agent对话聊天等操作"])
+    if _is_conn_cluster:
+        # 这里动态注册运维相关路由
+        from routers.ops_control import route as ops_control_route
+        app.include_router(ops_control_route, prefix="/ops", tags=["运维操作"])
     app.include_router(login_route, prefix="/auth/admin", tags=["账号管理"])
     app.include_router(open_app_route, prefix="/open/app", tags=["打开应用操作"])
     app.include_router(start_file_route, tags=["启动文件"])
+
+    @app.get("/ops", include_in_schema=False)
+    async def ops_page():
+        # 前端是 history 路由；直接刷新 /ops 不能落到 StaticFiles（它不认识这个路径）
+        return FileResponse(ROOT_BASE_DIR_PATH / "static" / "dist" / "index.html")
+
     app.mount("/", StaticFiles(directory=ROOT_BASE_DIR_PATH / "static" / "dist"), name="static")
     return app

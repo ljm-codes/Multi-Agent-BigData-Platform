@@ -31,17 +31,19 @@ len(redis) -> 放入Redis中的应用错误数量
 阈值与报警(按postgreSql库中的数据为准)：
 在yaml中按数据量(不分类型)设置 低告警 中告警 高告警
 """
+import asyncio
 import hashlib
-import time
+from asyncio import Queue
 from datetime import datetime, timezone, timedelta
 from typing import List
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update, and_
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from SPO.check_result import CheckOutcome
 from SPO.postgresql_model import CheckLog
 from Tools.log_settings import LogSetting
-from Tools.db import SessionLocal
+from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.alarm_sender import send_error_email
 from Tools.scheduler import run_cycle
 from Tools.share_check_tool import redis_con
@@ -83,6 +85,7 @@ return added
 """
 
 _add_ordered = redis_con.register_script(_DEDUPLICATE_AND_INSERT)
+APP_PERCEPTION_QUEUE = Queue()  # 应用错误感知队列，同步应用错误信息列入队列
 
 
 def make_error_key(app_id: str, app_type: str,
@@ -97,20 +100,19 @@ def add_error_app_infos(error_app_infos: List[str]):
     return _add_ordered(keys=[key, f"{key}:seq"], args=error_app_infos)
 
 
-def check_unique_key(data, session: SessionLocal, error_key: str, checker_error: bool) -> bool:
+async def check_unique_key(data, session: AsyncSession, error_key: str, checker_error: bool) -> bool:
     """
-    检查 error_key 是否已经在 postgresql 中不存在
+    检查 error_key 是否已经存在
     若存在，则对 repeat_count 字段进行 +1 操作，并返回False，反之返回True
-    :param data: 检查数据
-    :param session: 数据库会话
-    :param error_key: 错误键
-    :param checker_error: 检查者本身是否出错
-    :return: bool
+
+    **不按 status 过滤**：同一应用的同一条错误，即使 Agent 已经标成 DONE，
+    只要 checker 还在同一个 app 上看到它，就聚合到最新那行，不再新建行/重复入队。
+    app_id 变了会生成新的 dedup_key，所以新应用仍然会有新行。
     """
-    # 只看 PENDING: 处理完(DONE/...)的老行不该挡住复发重新入队
-    # (表上的唯一索引 uk_checker_log_dedup_pending 也是 where status='PENDING')
-    log = session.query(CheckLog).filter(CheckLog.dedup_key == error_key,
-                                         CheckLog.status == "PENDING").first()
+    stmt = select(CheckLog).where(
+        CheckLog.dedup_key == error_key,
+    ).order_by(CheckLog.id.desc()).limit(1)
+    log = (await session.execute(stmt)).scalars().first()
     if not log:
         return True
     # 存在，更新 repeat_count 字段
@@ -122,13 +124,14 @@ def check_unique_key(data, session: SessionLocal, error_key: str, checker_error:
         update_data['checker_error'] = data
     else:
         update_data['check_data'] = data
-    session.query(CheckLog).filter(CheckLog.dedup_key == error_key,
-                                   CheckLog.status == "PENDING").update(update_data)
+    await session.execute(
+        update(CheckLog).where(CheckLog.id == log.id).values(**update_data)
+    )
     # 不统一提交事务，由调用方负责提交
     return False
 
 
-def _enqueue_one(session: SessionLocal, outcome: CheckOutcome):
+async def _enqueue_one(session: AsyncSessionLocal, outcome: CheckOutcome):
     """
     把一条 outcome 写进队列（clean 不会走到这里）
 
@@ -140,20 +143,43 @@ def _enqueue_one(session: SessionLocal, outcome: CheckOutcome):
     # 出现 检查者 本身出错时
     if outcome.status == "invalid" and outcome.error:
         error_key = make_error_key(outcome.app_id, outcome.app_type, outcome.label, describe=outcome.error)
-        if not check_unique_key(outcome.error, session, error_key, True):
+        if not await check_unique_key(outcome.error, session, error_key, True):
             return
+        check_status = outcome.status
+        app_id = outcome.app_id
+        check_label = outcome.label
+        check_error = outcome.error
+        # CheckOutcome 里 invalid 的时间字段叫 error_time，没有 check_time
+        check_error_time = outcome.error_time or datetime.now(timezone.utc)
+        create_time = datetime.now(timezone.utc)
+        payload = {
+            "check_status": check_status,
+            "metadata": {
+                "app_id": app_id,
+                "app_type": app_type,
+                "check_type": check_label,
+                "error": check_error,
+                "dedup_key": error_key,
+                "status": "PENDING",
+                "is_solved": False,
+                "repeat_count": 1,
+                "check_time": check_error_time,
+                "create_time": create_time,
+            }
+        }
+        await APP_PERCEPTION_QUEUE.put(payload)
         session.add(CheckLog(
-            app_id=outcome.app_id,
+            app_id=app_id,
             app_type=app_type,
-            checker_error=outcome.error,
-            check_type=outcome.label,
+            checker_error=check_error,
+            check_type=check_label,
             dedup_key=error_key,
             status="PENDING",
             is_solved=False,
             repeat_count=1,
-            create_time=datetime.now(timezone.utc),
+            create_time=create_time,
             update_time=datetime.now(timezone.utc),
-            check_time=outcome.error_time,
+            check_time=check_error_time,
         ))
     # 当 检查者 检查到错误时
     if outcome.status == "found" and check_result:
@@ -164,10 +190,32 @@ def _enqueue_one(session: SessionLocal, outcome: CheckOutcome):
         check_key = make_error_key(outcome.app_id, outcome.app_type,
                                    outcome.label, error_type=check_type,
                                    describe=check_desc)
-        if not check_unique_key(check_data, session, check_key, False):
+        if not await check_unique_key(check_data, session, check_key, False):
             return
 
         check_time = check_result.check_time or datetime.now(timezone.utc)
+        check_status = outcome.status
+        app_id = outcome.app_id
+        check_label = outcome.label
+        create_time = datetime.now(timezone.utc)
+        payload = {
+            "check_status": check_status,
+            "metadata": {
+                "app_id": app_id,
+                "app_type": app_type,
+                "check_type": check_label,
+                "dedup_key": check_key,
+                "error_type": check_type,
+                "check_describe": check_desc,
+                "check_data": check_data,
+                "status": "PENDING",
+                "is_solved": False,
+                "repeat_count": 1,
+                "check_time": check_time,
+                "create_time": create_time,
+            }
+        }
+        await APP_PERCEPTION_QUEUE.put(payload)
         session.add(CheckLog(
             app_id=outcome.app_id,
             app_type=app_type,
@@ -179,16 +227,16 @@ def _enqueue_one(session: SessionLocal, outcome: CheckOutcome):
             status="PENDING",
             is_solved=False,
             repeat_count=1,
-            create_time=datetime.now(timezone.utc),
+            create_time=create_time,
             update_time=datetime.now(timezone.utc),
             check_time=check_time,
         ))
 
 
-def check_message_handle(outcomes: List[CheckOutcome]):
+async def check_message_handle(outcomes: List[CheckOutcome]):
     if not outcomes:
         return None
-    with SessionLocal() as session:
+    async with AsyncSessionLocal() as session:
         for outcome in outcomes:
             if outcome.status == "clean":
                 continue
@@ -200,20 +248,21 @@ def check_message_handle(outcomes: List[CheckOutcome]):
                 continue
             try:
                 # 一条消息一个 savepoint：写不进去的只丢它自己，同批其它消息照常入队
-                with session.begin_nested():
-                    _enqueue_one(session, outcome)
+                # AsyncSession 的 begin_nested() 是异步上下文管理器，不能写成普通 with
+                async with session.begin_nested():
+                    await _enqueue_one(session, outcome)
 
-                    session.flush()
+                    await session.flush()
             except Exception as e:
                 logger.error(f"丢弃一条消息 app={outcome.app_id!r} {outcome.label}: "
                              f"{type(e).__name__}: {e}")
         try:
             # 成功时提交事务
-            session.commit()
+            await session.commit()
         except Exception as e:
             # 只剩"提交本身"失败（连接断了等），这时整批确实保不住
             logger.error(f"提交失败，本批 {len(outcomes)} 条消息全部丢弃: {type(e).__name__}: {e}")
-            session.rollback()
+            await session.rollback()
 
 
 def release_notice_to_redis():
@@ -331,13 +380,13 @@ def check_queue_situation():
     _last_level = level
 
 
-def main_check():
+async def main_check():
     while True:
         try:
             # 进行检测
             outcomes = run_cycle()
             # 处理检测结果
-            check_message_handle(outcomes)
+            await check_message_handle(outcomes)
             # 将 postgreSQL 中已经存入的错误信息的应用放入 redis 通知中
             release_notice_to_redis()
             # 检查队列情况
@@ -345,4 +394,4 @@ def main_check():
         except Exception as e:
             logger.error(f"本轮调度异常: {type(e).__name__}: {e}")
 
-        time.sleep(POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)

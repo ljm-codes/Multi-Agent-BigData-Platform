@@ -9,6 +9,8 @@ from yarn_api_client.constants import RUNNING
 from Tools.log_settings import LogSetting
 
 logger = LogSetting.create(__name__)
+# 应用结束后代理没有内容，同一个 (app, stage) 只提示一次，避免重试刷屏
+_bad_stage_json_logged: set[tuple[str, int]] = set()
 
 try:
     from load_config.config import config as _app_config
@@ -129,7 +131,13 @@ def request_get(uri: str, params: Optional[Dict[str, Any]] = None, timeout: int 
     try:
         response = requests.get(url=uri, timeout=timeout, params=params)
         if response.status_code in (200, 202):
-            return response.json()
+            try:
+                return response.json()
+            except ValueError:
+                # 应用结束后代理可能返回空体/HTML；这不是异常，按“没有数据”处理
+                logger.warning(f"响应不是有效 JSON: 状态码 {response.status_code}, "
+                               f"内容 {response.text[:200]!r}")
+                return None
         else:
             logger.warning(f"获取数据失败: 状态码为 {response.status_code}, 响应内容为 {response.text}")
             return None
@@ -238,14 +246,23 @@ def get_stage_info(stage_id: int, app_id: str) -> Dict[str, Any]:
     获取 Spark 应用任务的详细信息
     :param stage_id: 任务 ID
     :param app_id: 应用 ID
-    :return: 任务详细信息
+    :return: 任务详细信息；应用结束/代理无内容时返回空 dict
     """
     uri = f"{proxy}/proxy/{app_id}/api/v1/applications/{app_id}/stages/{stage_id}/"
     try:
         response = requests.get(url=uri, timeout=10, params={"details": True})
         if response.status_code in (200, 202):
-            # print(f"获取任务详细信息成功: {response.json()}")
-            return response.json()
+            try:
+                return response.json()
+            except ValueError:
+                # 应用 FINISHED 后 Spark 代理常返回空体/HTML；每次重试都 error 会刷屏
+                key = (app_id, stage_id)
+                if key not in _bad_stage_json_logged:
+                    _bad_stage_json_logged.add(key)
+                    logger.warning(f"获取任务摘要信息失败: 响应不是 JSON(应用可能已结束) "
+                                   f"app={app_id} stage={stage_id} status={response.status_code} "
+                                   f"content={response.text[:200]!r}")
+                return {}
         else:
             logger.warning(f"获取任务摘要信息失败: 状态码为 {response.status_code}, 响应内容为 {response.text}")
             return {}

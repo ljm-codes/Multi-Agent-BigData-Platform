@@ -33,6 +33,7 @@ hadoop:
     manager: node1:8088
     proxy: node1:8089
     poll_interval: 30
+    scheduler_type: fair
     nm_log_dirs: /data/yarn/log
     remote_app_log_dir: /tmp/logs
     log_user: hadoop
@@ -57,6 +58,13 @@ ssh:
   user: hadoop
   port: 22
   timeout: 15
+
+code:
+  commit:
+    # 源码归档：CVA 提交应用时登记，运维 Agent 按 code.app_file_idx 取码
+    # 可选：hdfs / local / ssh / git；hdfs 复用 hadoop.hdfs.webhdfs
+    type: hdfs
+    path: hdfs://node1:8020/app/target
 
 model:
   name: deepseek-flash
@@ -103,6 +111,10 @@ email:
   sender: ''
   sender_name: ''
   receiver: []
+
+# 飞书群机器人：运维告警/转交提醒；留空则只记日志、不发消息
+feishu:
+  uri: ''
 
 mcp:
   maven:

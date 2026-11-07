@@ -19,7 +19,7 @@
   * 导入 agent._operations_agent 期间给 builtins.open 装垫片 —— 该模块用
     open("./prompt/operations_agent.md") 这种 CWD 相对路径读手册（缺陷, 见 t1 输出）。
   * 导入之后替换 大模型 / SessionLocal / AsyncSessionLocal / send_warning_msg,
-    并把 22 个工具的 .func 换成桩 —— 图里 chat_end 会删 app_lease、app_summary 会改
+    并把 23 个工具的 .func 换成桩 —— 图里 chat_end 会删 app_lease、app_summary 会改
     CheckLog, 所以桩必须**先于任何 invoke** 装好。
 """
 import asyncio
@@ -231,6 +231,10 @@ class FakeAsyncSession(FakeSession):
         self.log.append(("execute", str(stmt)))
         return FakeResult(self.rows)
 
+    async def commit(self):
+        # chat_end 真实实现用 await session.commit() 释放租约
+        self.log.append(("commit", ""))
+
 
 def _record_warning(**kwargs):
     WARNINGS.append(kwargs)
@@ -254,6 +258,11 @@ def install_collaborators():
     OA.send_warning_msg = _record_warning
     FTM.send_warning_msg = _record_warning
     RUN.send_warning_msg = _record_warning
+
+    # 图现在由 lifespan 的 create_ops_graph 编译；离线验证用内存 saver 初始化一次，
+    # 否则 OA.operations_agent 是 None，所有图用例都会死在 None.invoke
+    if OA.operations_agent is None:
+        asyncio.run(OA.create_ops_graph(OA._builder))
 
 
 # --------------------------------------------------------------- 消息构造
@@ -365,7 +374,7 @@ def t0_wiring():
     section("[0] 注册表 -> 图的接线")
     prio = get_priority_tools("OM")
     count = sum(len(v) for v in prio.values())
-    check("22 个工具全部登记进优先级表", count == 22, f"实际 {count} 个: {sorted(prio)}")
+    check("23 个工具全部登记进优先级表", count == 23, f"实际 {count} 个: {sorted(prio)}")
     check("工具全在 tool_to_category 里（没有掉进 -1 的）",
           len(OA.tool_to_category) == count,
           f"tool_to_category={len(OA.tool_to_category)} / 注册表={count}")
@@ -497,7 +506,7 @@ def t3_skip_level_rejected():
     section("[3] 越级调用被拒（网关）")
     out, err, model = run_case(
         steps=[
-            tool_ai("code__appearance", {"app_id": "application_1"}, "c1"),
+            tool_ai("code__appearance", {"module_path": "main.py"}, "c1"),
             summary_route([101], "application_1"),
         ])
 
@@ -520,7 +529,7 @@ def t4_downgrade_allowed():
         steps=[
             tool_ai("yarn__get_app", {"app_id": "application_1"}, "c1"),
             tool_ai("log__list", {"host": "node1", "container_id": "container_1"}, "c2"),
-            tool_ai("code__appearance", {"app_id": "application_1"}, "c3"),
+            tool_ai("code__appearance", {"module_path": "main.py"}, "c3"),
             tool_ai("yarn__get_app", {"app_id": "application_1"}, "c4"),
             summary_route([101], "application_1"),
         ])
@@ -624,9 +633,9 @@ def t7_worker_handle():
             captured["context"] = context
             return {"type": "info", "out_msg": "stubbed"}
 
-    real_session, real_graph = RUN.SessionLocal, RUN.operations_agent
+    real_session, real_getter = RUN.SessionLocal, RUN.get_ops_agent
     try:
-        RUN.operations_agent = _GraphRecorder()
+        RUN.get_ops_agent = lambda: _GraphRecorder()
         rows = [
             (1, "SPARK", "", "OOM", "error", "容器被杀", 3),          # 正常
             (2, "SPARK", "checker 自身炸了", "OOM", "error", "?", 1),  # checker_error -> 跳过
@@ -655,36 +664,22 @@ def t7_worker_handle():
                 return {"type": "error", "out_msg": "解析失败"}
 
         WARNINGS.clear()
-        RUN.operations_agent = _ErrGraph()
+        RUN.get_ops_agent = lambda: _ErrGraph()
         asyncio.run(RUN.worker_handle("application_1", "sid-3"))
         check("图为 error 时调用方(worker_handle)会发告警",
               len(WARNINGS) > 0, f"WARNINGS={WARNINGS}")
 
-        # 提交点：worker_handle 现在是 async def，但 operations_main 还在往线程池里 submit
-        class _CountGraph:
-            def __init__(self):
-                self.n = 0
-
-            async def ainvoke(self, *a, **kw):
-                self.n += 1
-                return {"type": "info", "out_msg": "ok"}
-
-        counted = _CountGraph()
-        RUN.operations_agent = counted
-        RUN.SessionLocal = lambda: _FakeRunSession(rows, ("SPARK",))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            # 与 operations_agent_run.py 里的提交点同款：executor.submit(run_async, worker_handle, …)
-            future = ex.submit(RUN.run_async, RUN.worker_handle, "application_1", "sid-4")
-            submitted = future.result()
-        check("线程池 submit 出去的 worker_handle 真的被执行了",
-              counted.n == 1,
-              f"submit 拿回来的是 {type(submitted).__name__}（异步函数被丢进线程池，没人 await）"
-              f"，图跑了 {counted.n} 次",
-              defect="agent/operations_agent_run.py:171 executor.submit(worker_handle, app_id, session_id) —— "
-                     "worker_handle 已改成 async def 但提交点没跟着改：拿到的是 coroutine，永远不会被 await "
-                     "-> 运维 Agent 一次都不会真正跑")
+        # 提交点：worker_handle 必须作为 task 进主事件循环，不能再被线程池 asyncio.run 包一层
+        src = (PROJECT_ROOT / "agent" / "operations_agent_run.py").read_text(encoding="utf-8")
+        check("operations_main 在主事件循环调度 worker_handle",
+              "asyncio.create_task(" in src
+              and "worker_handle(app_id, session_id)" in src
+              and "executor.submit(" not in src,
+              "agent/operations_agent_run.py 的提交点")
+        check("调用方运行时取图（不再 import None 快照）",
+              "operations_agent = get_ops_agent()" in src)
     finally:
-        RUN.SessionLocal, RUN.operations_agent = real_session, real_graph
+        RUN.SessionLocal, RUN.get_ops_agent = real_session, real_getter
 
 
 def t8_tool_path_isolated():

@@ -97,6 +97,7 @@ hadoop:
     manager: node1:8088            # ResourceManager 地址
     proxy: node1:8089              # WebAppProxy 地址(checker 走它取应用数据)
     poll_interval: 30              # 轮询间隔, 单位秒
+    scheduler_type: auto           # auto | capacity | fair; auto 按 schedulerInfo.type 判断
     max_job_timeout: 1800          # 作业最大运行时间, 单位秒, 超过判定为超时
     spark:
       # 数据倾斜判定阈值: 取 shuffle 读记录数的 max/median
@@ -133,7 +134,32 @@ hadoop:
       url: http://node1:8030
       user: hadoop
 
+# 节点侧 ssh：容器日志和节点证据只能这么取（平台不在大数据节点上）。
+# 密码走 .env 的 SSH_PASSWORD；留空则回落到密钥 / ssh-agent。
+ssh:
+  user: hadoop
+  port: 22
+  timeout: 15
+
+# 源码归档：CVA 提交应用时把源码登记到这里，运维 Agent 按 code.app_file_idx 取码。
+code:
+  commit:
+    # 可选：hdfs-HDFS 目录 / local-本地目录 / ssh-远程服务器 / git-GitHub 仓库
+    # hdfs 会复用 hadoop.hdfs.webhdfs；local 只填 path；ssh 需配 ssh.ip/user/port/timeout，
+    # 密码走 .env 的 COMMIT_SSH_PASSWORD（没有则读 SSH_PASSWORD）；git 需在 .env 配 GIT_API 和 git.git_repo
+    type: hdfs
+    path: hdfs://node1:8020/app/target
+#    git:
+#      git_repo: your-name/your-repo
+#    ssh:
+#      ip: node1
+#      user: hadoop
+#      port: 22
+#      timeout: 15
+
 agent:
+  OM:
+    n_workers: 3  # 运维 Agent 数量（不是 Spark worker 节点数）
   DDA:
     java_maven_lib_dir: ~/.m2/repository
   DAA:
@@ -193,3 +219,16 @@ email:
   sender_name: '智能客服告警'
   receiver:
     - 'your_email@qq.com'
+
+# 飞书群机器人：运维告警、转交开发提醒都发到这里
+feishu:
+  uri: 'https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-token'
+
+# MCP 工具：开发 Agent 用 maven-deps-server 查 Maven 依赖
+mcp:
+  maven:
+    mcpServers:
+      maven-deps-server:
+        command: npx
+        args:
+          - mcp-maven-deps

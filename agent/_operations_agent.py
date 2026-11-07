@@ -1,15 +1,23 @@
+import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, List, TypedDict, NotRequired
+from typing import Literal, List, TypedDict, NotRequired, Optional
 
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolCall, RemoveMessage, BaseMessage, \
     ToolMessage
+from langgraph.cache.sqlite import SqliteCache
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command, Send
+from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.postgres import AsyncPostgresStore
+from langgraph.types import Command, Send, Checkpointer
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
@@ -23,20 +31,23 @@ from SPO.operations_agent_state_model import (OperationsAndReconcileMainState,
 from SPO.postgresql_model import CheckLog, app_lease
 from Tools.operations_agent_tools import AGENT_NAME as OM_AGENT
 from Tools.log_settings import LogSetting
-from Tools.alarm_sender import send_warning_msg
+from Tools.alarm_sender import send_feishu_text, send_warning_msg
 from Tools.db import SessionLocal, AsyncSessionLocal
 from Tools.registry import get_tools, get_priority_tools
 from Tools.struct_analy import parse_route_message
-from load_config.config import config
+from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.compose import run_before_model, chain_model_call_wrappers, ComposedModelResult, run_after_model, \
     chain_tool_call_wrappers
 from middleware.fail_tool_middleware import ToolFailMarkMiddleware, fail_situation
 
 model_config = config.get("model")
+_postgres_conf = (config.get('databases') or {}).get('postgres') or {}
+_postgres_url = f"postgresql://{_postgres_conf.get('user')}:{_postgres_conf.get('password')}@{_postgres_conf.get('host')}:{_postgres_conf.get('port')}/{_postgres_conf.get('db')}?sslmode=disable"
+_pg_enabled = bool(_postgres_conf.get('enabled', True)) if _postgres_conf else False
 
 model = init_chat_model(
     model=model_config.get("name"),
-    **model_config.get("params")
+    **get_model_params(),
 )
 
 operations_middleware = [ToolFailMarkMiddleware()]
@@ -62,12 +73,19 @@ _operations_system_prompt = f"""
 """
 
 
-class HandoverMsgModel(TypedDict):
+class CodeErrorInfo(BaseModel):
+    """辅助于 HandoverMsgModel 类"""
+    pass
+
+
+class HandoverMsgModel(BaseModel):
     """当出现代码错误时，或者需要调优代码时，需要填写的参数"""
     # 错误详细描述
-    error_describe: str
+    error_describe: str = Field(description="错误详细描述")
     # 建议
-    suggest: str
+    suggest: str = Field(description="建议")
+    # 交给开发 Agent 的修复清单：逐条写明哪个文件/类/方法出的问题、要改什么
+    task_list: list[str] = Field(default_factory=list, description="修复清单，逐条写明问题位置与要改什么")
 
 
 class SummaryMsgModel(TypedDict):
@@ -104,7 +122,8 @@ class OperationsAndMaintenanceAgentOutModel(BaseModel):
                     "unsolvable_description 是可选的，是对你无法解决的错误的简单描述；"
                     "当你填入 handover 时，必须要填入 handover_info 参数，"
                     "其中，handover_info 参数中，error_describe 是错误详细描述，"
-                    "suggest 是建议。"
+                    "suggest 是建议，task_list 是交给开发 Agent 的修复清单"
+                    "（逐条写明哪个文件/类/方法出的问题、要改什么）。"
     )
 
 
@@ -290,9 +309,14 @@ def forward_node(
                 node.get("summary_info", {}),
             ))
         if node_name == "handover":
+            # app_type / app_file_path 模型不知道，由状态补上；app_name 从路径最后一段取
             send_list.append(Send(
                 "handover",
-                node.get("handover_info", {}),
+                {
+                    **(node.get("handover_info") or {}),
+                    "app_type": state.get("app_type"),
+                    "app_file_path": state.get("app_file_path"),
+                },
             ))
     return send_list
 
@@ -322,12 +346,12 @@ def app_summary(state: SummaryMsgModel) -> dict | None:
                     CheckLog.app_id == app_id
                 )
             )
-            check_logs = session.execute(stmt).fetchall()
-            for check_log in check_logs:
+            # 要用 scalars：execute(...).fetchall() 拿到的是 Row，不是 ORM 对象，
+            # 给 Row 赋属性会 AttributeError: can't set attribute
+            for check_log in session.scalars(stmt).all():
                 check_log.is_solved = True
                 check_log.status = "DONE"
                 check_log.update_time = datetime.now(timezone.utc)
-
             session.commit()
         return None
     except Exception as e:
@@ -337,9 +361,69 @@ def app_summary(state: SummaryMsgModel) -> dict | None:
         }
 
 
-async def app_handover(state: HandoverMsgModel) -> Literal["chat_end"] | Send:
-    # 暂时不写，因为 对应的开发 Agent 还没实现
-    pass
+async def app_handover(state: dict, runtime: Runtime) -> dict:
+    """把代码/调优问题转交开发 Agent：搬源码 -> 后台跑开发图 -> 飞书提醒"""
+    raw = dict(state or {})
+    app_type = str(raw.get("app_type") or "").upper()
+    app_file_path = str(raw.get("app_file_path") or "")
+
+    if app_type not in {"SPARK", "FLINK"}:
+        return {"type": "error",
+                "error_desc_text": f"应用类型 {app_type or '未知'} 不支持转交开发（只支持 SPARK/FLINK）"}
+    if not app_file_path or not Path(app_file_path).is_dir():
+        return {"type": "error",
+                "error_desc_text": f"没有可用的源码目录（app_file_path={app_file_path!r}），无法转交开发"}
+
+    # 延迟导入：Tasks.dev_handover -> agent.operations_agent_run -> 本模块，模块级导入会成环
+    from Tasks.dev_handover import prepare_project, start_handover
+
+    session_id = runtime.context.session_id
+    app_id = runtime.context.app_id
+    app_name = Path(app_file_path).name
+    try:
+        project_name, date = await asyncio.to_thread(prepare_project, app_file_path, app_type)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"转交开发前搬移源码失败: {type(exc).__name__}: {exc}")
+        return {"type": "error", "error_desc_text": f"搬移源码失败：{type(exc).__name__}: {exc}"}
+
+    error_describe = str(raw.get("error_describe") or "")
+    suggest = str(raw.get("suggest") or "")
+    task_list = [str(item) for item in (raw.get("task_list") or [])]
+    if not task_list:
+        # 模型偶尔漏填：用错误描述+建议兜底，别让整条转交白跑
+        task_list = [f"{error_describe}（建议：{suggest or '按错误描述修复'}）"]
+    handover = {
+        "app_id": app_id,
+        "app_type": app_type.lower(),
+        "app_name": app_name,
+        "project_name": project_name,
+        "date": date,
+        "source_path": app_file_path,
+        "session_id": session_id,
+        "error_describe": error_describe,
+        "suggest": suggest,
+        "task_list": task_list,
+    }
+    try:
+        thread_id = await start_handover(session_id=session_id, handover=handover)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"启动开发 Agent 失败: {type(exc).__name__}: {exc}")
+        return {"type": "error", "error_desc_text": f"启动开发 Agent 失败：{type(exc).__name__}: {exc}"}
+
+    await asyncio.to_thread(
+        send_feishu_text,
+        f"运维转交开发：应用 {app_id}（{app_name}，{app_type}）\n"
+        f"错误：{handover['error_describe']}\n开发会话：{thread_id}",
+    )
+    return {
+        "handover_dev_thread_id": thread_id,
+        "handover_app_name": app_name,
+        "handover_project_name": project_name,
+        "messages": [AIMessage(content=(
+            f"已转交开发 Agent 修复（开发会话 {thread_id}，项目 {project_name}）。\n"
+            f"错误描述：{handover['error_describe'] or '无'}"
+        ))],
+    }
 
 
 def _annotate_and_sort(tool_calls: list[ToolCall]) -> list[dict]:
@@ -478,32 +562,38 @@ async def chat_end(
         state: OperationsAndReconcileMainState,
         runtime: Runtime
 ) -> OperationsAndReconcileOutputState:
-    # 无论如何都要解锁
+    # 转交开发时不解锁：开发流程还没结束，运行记录/租约由 Tasks.dev_handover 收尾
+    handover_tid = state.get("handover_dev_thread_id")
     _tool_progress_savepoint.pop(runtime.context.session_id, None)
-    try:
-        async with AsyncSessionLocal() as session:
-            stmt = delete(app_lease).where(
-                and_(
-                    app_lease.c.app_id == runtime.context.app_id,
-                    app_lease.c.session_id == runtime.context.session_id
+    if not handover_tid:
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = delete(app_lease).where(
+                    and_(
+                        app_lease.c.app_id == runtime.context.app_id,
+                        app_lease.c.session_id == runtime.context.session_id
+                    )
                 )
+                await session.execute(stmt)
+                # AsyncSession 的上下文管理不会自动 commit；不提交 = delete 回滚，锁永远不释放
+                await session.commit()
+        except Exception as e:
+            logger.exception(f"在尝试解锁应用占用锁时出错 {type(e).__name__}: {e}")
+            return OperationsAndReconcileOutputState(
+                type="error",
+                out_msg=f"解锁应用占用锁时出错 {type(e).__name__}: {e}"
             )
-            await session.execute(stmt)
-    except Exception as e:
-        logger.exception(f"在尝试解锁应用占用锁时出错 {type(e).__name__}: {e}")
-        return OperationsAndReconcileOutputState(
-            type="error",
-            out_msg=f"解锁应用占用锁时出错 {type(e).__name__}: {e}"
-        )
 
     if state.get("type", "") == "error":
         return OperationsAndReconcileOutputState(
             type="error",
-            out_msg=state.get("error_desc_text", "")
+            out_msg=state.get("error_desc_text", ""),
+            handover_dev_thread_id=handover_tid or "",
         )
     return OperationsAndReconcileOutputState(
         type="info",
-        out_msg=state.get("messages")[-1].content
+        out_msg=state.get("messages")[-1].content,
+        handover_dev_thread_id=handover_tid or "",
     )
 
 
@@ -544,10 +634,69 @@ _builder.add_edge("summary", "chat_end")
 _builder.add_edge("handover", "chat_end")
 _builder.add_edge("chat_end", END)
 
-operations_agent = _builder.compile()
+operations_agent = None
+
+
+async def create_ops_graph(
+        graph_build: StateGraph,
+        store: Optional[BaseStore] = None,
+        check: Optional[Checkpointer] = None
+):
+    """
+    当 store 与 check 均为None时，默认使用InMemoryStore和InMemorySaver
+    """
+    global operations_agent
+    if store is None:
+        store = InMemoryStore()
+    if check is None:
+        check = InMemorySaver()
+    if hasattr(check, 'setup'):
+        await check.setup()
+    if hasattr(store, 'setup'):
+        await store.setup()
+    operations_agent = graph_build.compile(
+        checkpointer=check,
+        store=store,
+        cache=SqliteCache(path=ROOT_BASE_DIR_PATH / 'cache/ops_agent_cache.db')
+    )
+
+
+@asynccontextmanager
+async def ops_graph_scope():
+    """
+    和 main.py 的 _graph_scope 同款: 连接要活到 lifespan 结束
+
+    不能像旧 get_ops_agent 那样在 async with 里建完就退出 ——
+    退出时 saver/store 的连接会关闭, 编译出的图之后一用就失败。
+    """
+    global operations_agent
+    try:
+        if _pg_enabled:
+            async with AsyncPostgresSaver.from_conn_string(_postgres_url) as check, \
+                    AsyncPostgresStore.from_conn_string(_postgres_url) as store:
+                await create_ops_graph(_builder, store=store, check=check)
+                yield
+        else:
+            logger.warning("不建议未使用 PostgreSQL 时创建操作代理，因为这会导致数据丢失")
+            await create_ops_graph(_builder)
+            yield
+    finally:
+        # 连接已关, 不能再把这张图交出去
+        operations_agent = None
+
+
+def get_ops_agent():
+    """取已编译的图; 未初始化时直接抛错, 不把 None 传下去"""
+    if operations_agent is None:
+        raise RuntimeError(
+            "operations_agent 尚未初始化（应在 lifespan 的 ops_graph_scope 内启动）"
+        )
+    return operations_agent
+
 
 if __name__ == "__main__":
-    graph_png = operations_agent.get_graph(xray=True).draw_mermaid_png()
-    # print(graph_png)
-    with open("graph.png", "wb") as f:
-        f.write(graph_png)
+    # graph_png = get_ops_agent.get_graph(xray=True).draw_mermaid_png()
+    # # print(graph_png)
+    # with open("graph.png", "wb") as f:
+    #     f.write(graph_png)
+    pass
