@@ -79,7 +79,7 @@ async function connect() {
     return
   }
 
-  socket = openBackgroundSocket(ticket)
+  socket = openBackgroundSocket(ticket, props.threadId)
   socket.onopen = () => {
     status.value = 'open'
     retries = 0

@@ -35,6 +35,7 @@ from SPO.main_agent_state_model import CodeVerifyAgentInputState, CodeVerifyAgen
     DevelopGraphErrorState, MainStateContext
 from SPO.postgresql_model import AppFileIndex
 from Tasks.background_broker import background_broker, background_registry, background_thread_id
+from Tasks.verification_registry import VerificationReporter, verification_registry
 from Tasks.build_run_custom_tasks import TaskSupervisor
 from Tools import code_commit, node_ssh
 from Tools.log_settings import LogSetting
@@ -50,6 +51,7 @@ from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.code_verify_agent_middleware import PerceptionBackground
 from middleware.compose import chain_model_call_wrappers, ComposedModelResult, run_before_model, \
     chain_tool_call_wrappers
+from middleware.tool_trace_middleware import ToolTraceMiddleware
 
 model_config = config.get("model")
 _verify_model = init_chat_model(
@@ -92,7 +94,10 @@ CONNECT_TO_CLUSTER = bool((config.get("app") or {}).get("connect_to_cluster", Tr
 _hdfs_client = None if not CONNECT_TO_CLUSTER else InsecureClient(_hdfs_webhdfs_url, user=_hdfs_webhdfs_user)
 
 code_verify_agent_tools = get_tools(CVA)
-verify_agent_middleware = [PerceptionBackground(background_broker)]
+verify_agent_middleware = [
+    PerceptionBackground(background_broker),
+    ToolTraceMiddleware("code_verify"),
+]
 verify_agent_chain = chain_model_call_wrappers(verify_agent_middleware)
 
 
@@ -296,7 +301,45 @@ def _parse_command(command_list: list[dict]) -> list[str]:
     return commands
 
 
-async def _run_flink_test_command(commands: list[str], path: str, buffer: Any) -> list[dict]:
+def _emit_progress(on_event: Any, payload: dict[str, Any]) -> None:
+    """进度回调不能影响测试执行本身。"""
+    if not on_event:
+        return
+    try:
+        on_event(payload)
+    except Exception:  # noqa: BLE001
+        logger.exception("验证进度回调失败")
+
+
+async def _run_with_progress(
+        supervisor: Any,
+        coro: Any,
+        reporter: VerificationReporter,
+        buffer: Any,
+        interval: float = 5.0,
+) -> Any:
+    """跑 TaskSupervisor，同时每 interval 秒把 buffer 尾部作为心跳推给前端。"""
+    task = asyncio.create_task(supervisor.run(coro))
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            reporter.heartbeat(buffer.snapshot() if buffer else "")
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+    try:
+        return await task
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _run_flink_test_command(
+        commands: list[str], path: str, buffer: Any, on_event: Any = None
+) -> list[dict]:
     """逐条跑 mvn 命令，返回每条命令的返回码和输出尾部（原来只写 buffer、不返回结果）"""
     results: list[dict] = []
     for command in commands:
@@ -309,6 +352,12 @@ async def _run_flink_test_command(commands: list[str], path: str, buffer: Any) -
             "command": command,
             "returncode": res.get("returncode"),
             "output": output[-2000:],
+        })
+        _emit_progress(on_event, {
+            "name": command,
+            "test_file": "mvn",
+            "status": "passed" if res.get("returncode") == 0 else "failed",
+            "message": output[-1000:],
         })
     return results
 
@@ -357,7 +406,9 @@ def _parse_pytest_xml(xml_path: Path) -> list[dict]:
     return results
 
 
-async def _run_spark_test_command(commands: list[dict], path: str | Path, buffer: Any) -> list[dict]:
+async def _run_spark_test_command(
+        commands: list[dict], path: str | Path, buffer: Any, on_event: Any = None
+) -> list[dict]:
     """本机 pytest 执行器；返回按 testcase 展开的结果列表"""
     project_path = Path(path).resolve()
     project_name = project_path.name
@@ -373,6 +424,10 @@ async def _run_spark_test_command(commands: list[dict], path: str | Path, buffer
             msg = f"非法测试文件（必须在 src/tests 下且是 .py）: {test_file}"
             buffer.append(f"[spark-test] {msg}\n")
             results.append({"test_file": test_file, "status": "error", "message": msg})
+            _emit_progress(on_event, {
+                "name": test_file, "test_file": test_file,
+                "status": "error", "message": msg,
+            })
             continue
 
         test_name = command.get("test_name")
@@ -395,6 +450,10 @@ async def _run_spark_test_command(commands: list[dict], path: str | Path, buffer
             msg = f"启动 pytest 失败: {type(e).__name__}: {e}"
             buffer.append(f"[spark-test] {msg}\n")
             results.append({"test_file": test_file, "status": "error", "message": msg})
+            _emit_progress(on_event, {
+                "name": test_name or test_file, "test_file": test_file,
+                "status": "error", "message": msg,
+            })
             continue
 
         parsed = _parse_pytest_xml(xml_path)
@@ -408,6 +467,13 @@ async def _run_spark_test_command(commands: list[dict], path: str | Path, buffer
         for item in parsed:
             item.setdefault("test_file", test_file)
         results.extend(parsed)
+        failed = sum(1 for item in parsed if item.get("status") in ("failed", "error"))
+        _emit_progress(on_event, {
+            "name": test_name or test_file,
+            "test_file": test_file,
+            "status": "failed" if failed else "passed",
+            "message": f"{failed}/{len(parsed)} 个用例失败" if failed else "",
+        })
         buffer.append(f"[spark-test] 完成 {test_file}: {len(parsed)} 条结果\n")
 
     return results
@@ -1040,25 +1106,26 @@ def _verify_input_handler(state: CodeVerifyAgentInputState) -> CodeVerifyAgentMa
 async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) -> list[Command]:
     verify_agent_update = await run_before_model(verify_agent_middleware, state, runtime)
     result_msg = []
+    # 浅层结果在 ver_deep_exec 会被清空；只拼进当次 mags 的话，
+    # deep 轮就再也看不到浅层测试已经通过，因此这里要同步持久化到 state.messages。
+    persist_msg = []
     if sres := state.get("shallow_result"):
         # 正常结束
         if sres.status == "completed":
-            result_msg = [AIMessage(
-                content=f"所有命令执行完成，结果为：{json.dumps(sres.result)}",
-                name="shallow_command:result"
-            )]
+            content = f"所有命令执行完成，结果为：{json.dumps(sres.result)}"
         elif sres.status == "timeout":
             # 超时信息
-            result_msg = [AIMessage(
-                content=f"{sres.message}，终止之前返回的结果为：{json.dumps(sres.partial)}",
-                name="shallow_command:result"
-            )]
+            content = f"{sres.message}，终止之前返回的结果为：{json.dumps(sres.partial)}"
         else:
             # 剩余的就是错误了
-            result_msg = [AIMessage(
-                content=f"{sres.message}, 具体的错误为：{sres.error}",
-                name="shallow_command:result"
-            )]
+            content = f"{sres.message}, 具体的错误为：{sres.error}"
+        shallow_msg = AIMessage(
+            content=content,
+            name="shallow_command:result",
+            id="shallow_command:result",
+        )
+        result_msg = [shallow_msg]
+        persist_msg.append(shallow_msg)
     if dres := state.get("deep_result"):
         if dres.status in ("completed", "background_completed"):
             content = f"所有命令执行完成，结果为：{json.dumps(dres.result)}"
@@ -1125,7 +1192,10 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
     else:
         verify_result = ComposedModelResult(model_response=await verify_execute(verify_request))
 
-    commands: list[Command] = [Command(update={"messages": verify_result.model_response.result, **verify_agent_update})]
+    commands: list[Command] = [Command(update={
+        "messages": [*persist_msg, *verify_result.model_response.result],
+        **verify_agent_update,
+    })]
     commands.extend(verify_result.commands)
     return commands
 
@@ -1348,14 +1418,31 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
             action="cancel",
             context={"buffer": buf}
         )
-        final_result = await supervisor.run(
-            coro=_run_flink_test_command(
+        reporter = VerificationReporter(
+            thread_id=runtime.context.thread_id,
+            stage="shallow",
+            total=len(flink_shallow_test_commands),
+            project_name=p_name or "",
+            app_type=app_type,
+        )
+        reporter.start()
+        final_result = await _run_with_progress(
+            supervisor,
+            _run_flink_test_command(
                 flink_shallow_test_commands,
                 path=app_path,
-                buffer=buf
-            )
+                buffer=buf,
+                on_event=reporter.result,
+            ),
+            reporter,
+            buf,
         )
-        update_state = {"shallow_result": final_result, "status": "shallow"}
+        shallow_metrics = reporter.finish(final_result)
+        update_state = {
+            "shallow_result": final_result,
+            "shallow_metrics": shallow_metrics,
+            "status": "shallow",
+        }
         if final_result.status != "completed":
             if fail_num := state.get("fail_num"):
                 update_state["fail_num"] = fail_num + 1
@@ -1377,14 +1464,31 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
             action="cancel",
             context={"buffer": buf}
         )
-        final_result = await supervisor.run(
-            coro=_run_spark_test_command(
+        reporter = VerificationReporter(
+            thread_id=runtime.context.thread_id,
+            stage="shallow",
+            total=len(spark_commands),
+            project_name=p_name or "",
+            app_type=app_type,
+        )
+        reporter.start()
+        final_result = await _run_with_progress(
+            supervisor,
+            _run_spark_test_command(
                 spark_commands,
                 path=app_path,
-                buffer=buf
-            )
+                buffer=buf,
+                on_event=reporter.result,
+            ),
+            reporter,
+            buf,
         )
-        update_state = {"shallow_result": final_result, "status": "shallow"}
+        shallow_metrics = reporter.finish(final_result)
+        update_state = {
+            "shallow_result": final_result,
+            "shallow_metrics": shallow_metrics,
+            "status": "shallow",
+        }
         if final_result.status != "completed":
             update_state["fail_num"] = (state.get("fail_num") or 0) + 1
         return Command(
@@ -1538,15 +1642,30 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             sink=background_broker,
             status="deep",
         )
-        final_result = await supervisor.run(
-            coro=_run_flink_test_command(
+        reporter = VerificationReporter(
+            thread_id=runtime.context.thread_id,
+            stage="deep",
+            total=len(deep_commands),
+            project_name=p_name or "",
+            app_type=app_type,
+            prior=state.get("shallow_metrics"),
+        )
+        reporter.start()
+        final_result = await _run_with_progress(
+            supervisor,
+            _run_flink_test_command(
                 deep_commands,
                 path=app_path,
-                buffer=buf
-            )
+                buffer=buf,
+                on_event=reporter.result,
+            ),
+            reporter,
+            buf,
         )
+        deep_metrics = reporter.finish(final_result)
         update_state = {
             "deep_result": final_result,
+            "deep_metrics": deep_metrics,
             # 转后台时深层还没有结论：本轮只能收尾，等后台回流再 end
             "status": "done" if final_result.status == "handed_off" else "deep",
         }
@@ -1589,15 +1708,30 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             sink=background_broker,
             status="deep",
         )
-        final_result = await supervisor.run(
-            coro=_run_spark_test_command(
+        reporter = VerificationReporter(
+            thread_id=runtime.context.thread_id,
+            stage="deep",
+            total=len(deep_commands),
+            project_name=p_name or "",
+            app_type=app_type,
+            prior=state.get("shallow_metrics"),
+        )
+        reporter.start()
+        final_result = await _run_with_progress(
+            supervisor,
+            _run_spark_test_command(
                 deep_commands,
                 path=app_path,
-                buffer=buf
-            )
+                buffer=buf,
+                on_event=reporter.result,
+            ),
+            reporter,
+            buf,
         )
+        deep_metrics = reporter.finish(final_result)
         update_state = {
             "deep_result": final_result,
+            "deep_metrics": deep_metrics,
             # 转后台时深层还没有结论：本轮只能收尾，等后台回流再 end
             "status": "done" if final_result.status == "handed_off" else "deep",
         }
@@ -1719,6 +1853,24 @@ def _verify_end(state: dict, runtime: Runtime) -> Command:
     out_msg = (f"验证完毕，该项目的目录落于{ROOT_BASE_DIR_PATH / 'tmp_code' / app_type / date / p_name} 中。"
                f"\n对于验证Agent它表示：{verify_end_msg}"
                f"\n{submit_msg}")
+
+    verification = verification_registry.get_report(runtime.context.thread_id)
+    if verification is None:
+        shallow = state.get("shallow_metrics")
+        deep = state.get("deep_metrics")
+        if shallow or deep:
+            verification = {
+                "thread_id": runtime.context.thread_id,
+                "status": "completed" if deep and deep.get("status") in (
+                    "completed", "background_completed") else "running",
+                "passed": all(
+                    stage.get("failed", 0) == 0
+                    for stage in (shallow, deep) if isinstance(stage, dict)
+                ),
+                "shallow": shallow,
+                "deep": deep,
+            }
+
     if state.get("is_ops"):
         # 运维转交：结果直接交父图 work_end，由 dev_handover 写回 AgentRun
         return Command(
@@ -1732,6 +1884,7 @@ def _verify_end(state: dict, runtime: Runtime) -> Command:
                 "app_type": app_type,
                 "date": date,
                 "project_name": p_name,
+                **({"verification": verification} if verification else {}),
             },
         )
     return Command(
@@ -1739,6 +1892,7 @@ def _verify_end(state: dict, runtime: Runtime) -> Command:
         goto="dis_chat",
         update={
             "messages": [AIMessage(content=out_msg, name=f"ver:{from_}")],
+            **({"verification": verification} if verification else {}),
         }
     )
 

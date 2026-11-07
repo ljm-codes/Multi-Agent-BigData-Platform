@@ -22,7 +22,9 @@ from SPO.main_agent_state_model import MainStateContext, content_text
 from SPO.postgresql_model import AdminThread
 from SPO.route_results import RouteResponse, ResultCode
 from Tasks.background_broker import background_broker, background_registry
+from Tasks.verification_registry import verification_registry
 from Tools.log_settings import LogSetting
+from Tools.tool_trace_store import tool_trace_store
 from Tools.db import AsyncSessionLocal
 from Tools.share_check_tool import redis_con
 from Tools.ws_registry import register_ws, unregister_ws
@@ -932,6 +934,35 @@ async def list_background(
     return RouteResponse.ok(data=jsonable_encoder([asdict(record) for record in records]))
 
 
+@route.get("/tool-traces")
+async def list_tool_traces(
+        request: Request,
+        thread_id: str = Query(..., description="会话 id"),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+) -> RouteResponse:
+    """工具调用轨迹；历史直接查 PostgreSQL log.tool_trace。"""
+    admin_id = int(request.state.info.get("id"))
+    owner = await _thread_owner(thread_id)
+    if owner != admin_id:
+        return RouteResponse.error(msg="只能查看自己的会话", code=ResultCode.UNAUTHORIZED)
+    records = await tool_trace_store.list(thread_id, limit=limit, offset=offset)
+    return RouteResponse.ok(data=records)
+
+
+@route.get("/verification")
+async def get_verification(
+        request: Request,
+        thread_id: str = Query(..., description="会话 id"),
+) -> RouteResponse:
+    """当前 thread 的最新验证进度事件（刷新/WS 重连时的兜底）。"""
+    admin_id = int(request.state.info.get("id"))
+    owner = await _thread_owner(thread_id)
+    if owner != admin_id:
+        return RouteResponse.error(msg="只能查看自己的会话", code=ResultCode.UNAUTHORIZED)
+    return RouteResponse.ok(data=verification_registry.get(thread_id))
+
+
 def _generate_temp_key() -> str:
     raw_key = os.urandom(32)
     base64_key = base64.b64encode(raw_key).decode('utf-8')
@@ -978,8 +1009,12 @@ async def background_verify(
 
 
 @route.websocket("/ws/background")
-async def background_ws(websocket: WebSocket, ticket: str = Query(default="")):
-    """后台任务实时推送；WS 不经过 HTTP 中间件，这里验证来自 background_verify 的 Ticket"""
+async def background_ws(
+        websocket: WebSocket,
+        ticket: str = Query(default=""),
+        thread_id: str | None = Query(default=None),
+):
+    """后台任务/工具轨迹/验证进度实时推送；WS 不经过 HTTP 中间件，用 Ticket 校验。"""
     raw = redis_con.hget("temp_code", ticket)
     if not raw:
         await websocket.close(code=1008)
@@ -1011,21 +1046,87 @@ async def background_ws(websocket: WebSocket, ticket: str = Query(default="")):
         await websocket.close(code=4008)
         return
 
+    # 带 thread_id 时只允许订阅自己的会话，避免工具参数/输出串用户
+    if thread_id:
+        owner = await _thread_owner(thread_id)
+        if owner != int(user_id):
+            await websocket.close(code=4008)
+            return
+
     await websocket.accept()
     await register_ws(user_id, websocket, permission=permission)
-    queue = background_registry.subscribe()
+    bg_queue = background_registry.subscribe()
+    trace_queue = tool_trace_store.subscribe() if thread_id else None
+    ver_queue = verification_registry.subscribe() if thread_id else None
+
+    merged: asyncio.Queue = asyncio.Queue()
+
+    async def pump(queue: Any, kind: str) -> None:
+        while True:
+            item = await queue.get()
+            await merged.put((kind, item))
+
+    pumps: list[asyncio.Task] = [asyncio.create_task(pump(bg_queue, "background"))]
+    if trace_queue is not None:
+        pumps.append(asyncio.create_task(pump(trace_queue, "tool_trace")))
+    if ver_queue is not None:
+        pumps.append(asyncio.create_task(pump(ver_queue, "verification")))
+
     try:
         records = [asdict(record) for record in background_registry.list_for_user(user_id)]
         # 快照只发给刚连上的这一个连接
         await websocket.send_json({"type": "snapshot", "records": jsonable_encoder(records)})
+
+        if thread_id:
+            traces = await tool_trace_store.list(thread_id, limit=200)
+            await websocket.send_json({
+                "type": "tool_trace_snapshot",
+                "records": jsonable_encoder(traces),
+            })
+            await websocket.send_json({
+                "type": "verification_snapshot",
+                "record": jsonable_encoder(verification_registry.get(thread_id)),
+            })
+
         while True:
-            record = await queue.get()
-            if record.user_id != user_id:
-                continue
-            # 每个连接各自订阅 queue，所以只发给自己；多窗口不会互相收到重复消息
-            await websocket.send_json({"type": "update", "record": jsonable_encoder(asdict(record))})
+            kind, item = await merged.get()
+            if kind == "background":
+                record = item
+                if record.user_id != user_id:
+                    continue
+                await websocket.send_json({
+                    "type": "update",
+                    "record": jsonable_encoder(asdict(record)),
+                })
+            elif kind == "tool_trace":
+                record = (item or {}).get("record") or {}
+                if record.get("thread_id") != thread_id:
+                    continue
+                await websocket.send_json({
+                    "type": "tool_trace",
+                    "record": jsonable_encoder(record),
+                })
+            elif kind == "verification":
+                record = (item or {}).get("record") or {}
+                if record.get("thread_id") != thread_id:
+                    continue
+                await websocket.send_json({
+                    "type": "verification",
+                    "record": jsonable_encoder(record),
+                })
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
-        background_registry.unsubscribe(queue)
+        for task in pumps:
+            task.cancel()
+        for task in pumps:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        background_registry.unsubscribe(bg_queue)
+        if trace_queue is not None:
+            tool_trace_store.unsubscribe(trace_queue)
+        if ver_queue is not None:
+            verification_registry.unsubscribe(ver_queue)
         await unregister_ws(user_id, websocket)

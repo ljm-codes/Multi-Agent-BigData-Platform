@@ -401,6 +401,9 @@ def work_end(state: WorkEndState) -> dict[str, Any]:
         metadata_dict["thread_title"] = thread_title
     if request_text := state.get("request_text"):
         metadata_dict["request_text"] = request_text
+    # 验证子图回传的结构化报告；前端用它在最终消息里展示状态
+    if verification := state.get("verification"):
+        metadata_dict["verification"] = verification
     result = {
         "output_msg": desc_msg,
         "out_time": datetime.now(),

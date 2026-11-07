@@ -132,6 +132,8 @@ class DevelopAgentMainState(MessagesState):
     is_repair: NotRequired[bool]
     human_suggestion: NotRequired[str]
     is_submit: NotRequired[bool]
+    # 验证阶段的结构化报告；由 ver_end 回传，work_end 写进 metadata
+    verification: NotRequired[dict[str, Any]]
     # 验证阶段；后台回流时从 CodeVerify 的 TaskOutcome.ver_status
     status: NotRequired[Literal["preliminary", "shallow", "deep", "done"]]
     # work_end 的产出；event streaming v3 的 stream.output() 读的是 state values
@@ -197,6 +199,9 @@ class CodeVerifyAgentMainState(MessagesState):
     deep_timeout: NotRequired[float]
     shallow_result: NotRequired[TaskOutcome]
     deep_result: NotRequired[TaskOutcome]
+    # 结构化阶段指标；shallow_metrics 在进入 deep 后仍保留，供最终报告/前端卡片使用
+    shallow_metrics: NotRequired[dict[str, Any]]
+    deep_metrics: NotRequired[dict[str, Any]]
     fail_num: NotRequired[int]
     repair_num: NotRequired[int]
     is_repair: NotRequired[bool]

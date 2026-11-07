@@ -15,6 +15,7 @@ from Tasks.background_broker import (
     background_registry,
     outcome_notice,
 )
+from Tasks.verification_registry import publish_outcome
 
 
 def _with_notices(
@@ -63,6 +64,10 @@ class PerceptionBackground(AgentMiddleware):
         outcomes = self.broker.drain(thread_id, task_id=deep_task_id)
         if not outcomes:
             return await handler(request)
+
+        # 后台已经结束：先把最终状态推给前端卡片，再继续模型调用
+        for outcome in outcomes:
+            publish_outcome(outcome)
 
         notices = [outcome_notice(outcome) for outcome in outcomes]
         try:

@@ -19,6 +19,7 @@ from Tools.log_settings import LogSetting
 from Tools.data_develop_agent_tools import AGENT_NAME as DEVELOP_AGENT, run_mvn_command
 from Tools.registry import get_tools
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
+from middleware.tool_trace_middleware import ToolTraceMiddleware
 
 model_config = config.get("model")
 params = get_model_params(thinking={"type": "enabled"})
@@ -126,7 +127,7 @@ async def big_data_develop_code_agent(
     code_develop_agent = create_agent(
         model=code_develop_model,
         tools=[*maven_tool, *data_develop_tools],
-        middleware=[],
+        middleware=[ToolTraceMiddleware("data_develop")],
         system_prompt=_code_develop_system_prompt,
         context_schema=cast("ContextT", MainStateContext),
         state_schema=cast("StateT", CodeDevelopState),

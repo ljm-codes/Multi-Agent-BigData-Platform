@@ -3,9 +3,11 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { renderMarkdownLite } from '@/utils/text'
 import { renderMermaid } from '@/utils/mermaid'
 import InterruptPanel from '@/components/InterruptPanel.vue'
+import ToolTracePanel from '@/components/ToolTracePanel.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
+  toolTraces: { type: Array, default: () => [] },
   readOnly: { type: Boolean, default: false },
   interrupt: { type: Object, default: null },
   elapsed: { type: Number, default: 0 },
@@ -73,6 +75,21 @@ function assistantHtml(message) {
   return renderMarkdownLite(message.content)
 }
 
+function tracesForAgent(agent) {
+  if (!agent) return []
+  return props.toolTraces.filter((trace) => trace.agent === agent)
+}
+
+function isLastAgentMessage(index) {
+  const message = props.messages[index]
+  if (!message?.agent) return false
+  for (let i = props.messages.length - 1; i > index; i -= 1) {
+    const later = props.messages[i]
+    if (later.role === 'assistant' && later.agent === message.agent) return false
+  }
+  return true
+}
+
 function preview(text, size = 10) {
   const clean = String(text || '').replace(/\s+/g, ' ').trim()
   return clean.length > size ? `${clean.slice(0, size)}…` : clean
@@ -95,6 +112,10 @@ function preview(text, size = 10) {
       >
         <div v-if="message.role === 'assistant'" class="stack">
           <span v-if="message.agent" class="agent-name">{{ message.agent }}</span>
+          <ToolTracePanel
+            v-if="message.agent && isLastAgentMessage(index) && tracesForAgent(message.agent).length"
+            :traces="tracesForAgent(message.agent)"
+          />
           <div
             v-if="message.content || message.streaming"
             class="bubble"

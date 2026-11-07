@@ -22,6 +22,7 @@ from Tools.log_settings import LogSetting
 from Tools.data_analysis_agent_tools import AGENT_NAME as ANALYSIS_AGENT, analysis_business_files
 from Tools.registry import get_tools
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
+from middleware.tool_trace_middleware import ToolTraceMiddleware
 
 model_config = config.get("model")
 params = get_model_params(thinking={"type": "enabled"})
@@ -100,7 +101,7 @@ async def big_data_analysis_code_agent(
     code_analysis_agent = create_agent(
         model=data_analysis_model,
         tools=data_analysis_tools,
-        middleware=[],
+        middleware=[ToolTraceMiddleware("data_analysis")],
         system_prompt=_analysis_system_prompt,
         context_schema=cast("ContextT", MainStateContext),
         state_schema=cast("StateT", CodeAnalysisState),

@@ -26,6 +26,7 @@ from Tasks.background_broker import (
     background_registry,
     outcome_notice,
 )
+from Tasks.verification_registry import publish_outcome
 from Tools.log_settings import LogSetting
 
 logger = LogSetting.create(__name__)
@@ -51,6 +52,7 @@ class BackgroundResumeHandler:
         paused = False
         try:
             for index, outcome in enumerate(outcomes):
+                publish_outcome(outcome)
                 record = self._registry.get(outcome.task_id)
                 user_id = record.user_id if record else ""
                 notice = outcome_notice(outcome)

@@ -139,6 +139,43 @@ create table code.app_file_idx
 
 create unique index uk_app_file_app on code.app_file_idx (app_type, app_name);
 
+
+-- 工具调用轨迹：只存 UI 投影，完整审计仍在 LangGraph messages
+create table if not exists log.tool_trace
+(
+    id               bigserial primary key,
+    trace_id         text         not null, -- tool_call_id，缺失时由应用生成 uuid
+    thread_id        varchar(255) not null,
+    agent            varchar(32)  not null, -- code_verify / data_analysis / data_develop
+    tool             varchar(128) not null,
+    args             jsonb        not null default '{}'::jsonb,
+    output           text,
+    output_truncated boolean      not null default false,
+    status           varchar(16)  not null default 'running'
+        check (status in ('running', 'success', 'error')),
+    error            text,
+    started_at       timestamptz  not null default now(),
+    finished_at      timestamptz,
+    duration_ms      integer,
+    created_at       timestamptz  not null default now(),
+    constraint uk_tool_trace_thread_call unique (thread_id, trace_id)
+);
+
+create index if not exists idx_tool_trace_thread_time
+    on log.tool_trace (thread_id, started_at desc);
+
+create index if not exists idx_tool_trace_agent_time
+    on log.tool_trace (agent, started_at desc);
+
+-- 只索引运行中的，量很小
+create index if not exists idx_tool_trace_running
+    on log.tool_trace (thread_id) where status = 'running';
+
+-- 定期清理用
+create index if not exists idx_tool_trace_cleanup
+    on log.tool_trace (started_at);
+
+
 -- 以下 SQL 均为 未开发 完整
 -- create table log.AIOps_log
 -- (

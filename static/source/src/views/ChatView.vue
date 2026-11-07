@@ -10,6 +10,14 @@ import { getIdes, openFile } from '@/api/openApp'
 import BackgroundPanel from '@/components/BackgroundPanel.vue'
 import MessageList from '@/components/MessageList.vue'
 import ThreadItem from '@/components/ThreadItem.vue'
+import ToolTracePanel from '@/components/ToolTracePanel.vue'
+import VerificationCard from '@/components/VerificationCard.vue'
+import {
+  createTicket,
+  getVerification,
+  listToolTraces,
+  openBackgroundSocket,
+} from '@/api/background'
 
 /** 稳定的消息 id：不要用 index 当 key，列表增删时 Vue 会复用错 DOM */
 function uid() {
@@ -46,6 +54,14 @@ const selectedIds = ref([])
 const projectDir = ref('')
 const showBackground = ref(false)
 
+// 当前 thread 的工具调用轨迹 / 验证进度（WS 实时 + HTTP 历史兜底）
+const toolTraces = ref([])
+const verification = ref(null)
+let taskSocket = null
+let taskRetryTimer = null
+let taskRetries = 0
+let taskClosedByUs = false
+
 const ides = ref({})
 const currentIde = ref(localStorage.getItem('ide') || '')
 const theme = ref(localStorage.getItem('theme') || 'dark')
@@ -58,6 +74,10 @@ const title = computed(() =>
 )
 const canSend = computed(
   () => !sending.value && !paused.value && !readOnly.value && !interrupt.value && input.value.trim()
+)
+// 验证 Agent 的工具没有独立聊天气泡，统一放到底部验证卡片上方；数据分析/开发工具跟随各自消息
+const verificationTraces = computed(() =>
+  toolTraces.value.filter((trace) => trace.agent === 'code_verify')
 )
 const allSelected = computed(
   () => threadList.value.length > 0 && selectedIds.value.length === threadList.value.length
@@ -82,6 +102,13 @@ watch(currentThreadId, (id) => {
   if (id) localStorage.setItem(LAST_THREAD_KEY, id)
   else localStorage.removeItem(LAST_THREAD_KEY)
 })
+watch(currentThreadId, (threadId) => {
+  taskRetries = 0
+  toolTraces.value = []
+  verification.value = null
+  loadTaskState(threadId)
+  connectTaskSocket(threadId)
+}, { immediate: true })
 watch(sending, (active) => {
   if (sendingTimer) {
     clearInterval(sendingTimer)
@@ -97,6 +124,7 @@ watch(sending, (active) => {
 onBeforeUnmount(() => {
   if (sendingTimer) clearInterval(sendingTimer)
   clearTyping()
+  closeTaskSocket()
 })
 
 onMounted(async () => {
@@ -164,11 +192,103 @@ function newChat() {
   selectedIds.value = []
 }
 
+function upsertTrace(record) {
+  if (!record?.trace_id) return
+  const index = toolTraces.value.findIndex((item) => item.trace_id === record.trace_id)
+  if (index >= 0) toolTraces.value[index] = record
+  else toolTraces.value = [record, ...toolTraces.value]
+}
+
+async function loadTaskState(threadId) {
+  if (!threadId) {
+    toolTraces.value = []
+    verification.value = null
+    return
+  }
+  try {
+    const rows = await listToolTraces(threadId, 200)
+    if (currentThreadId.value === threadId) toolTraces.value = rows || []
+  } catch {
+    /* 历史接口失败不影响 WS 实时 */
+  }
+  try {
+    const latest = await getVerification(threadId)
+    if (currentThreadId.value === threadId && latest) verification.value = latest
+  } catch {
+    /* 验证进度不是强依赖 */
+  }
+}
+
+function closeTaskSocket() {
+  if (taskRetryTimer) {
+    clearTimeout(taskRetryTimer)
+    taskRetryTimer = null
+  }
+  if (!taskSocket) return
+  taskClosedByUs = true
+  taskSocket.onclose = null
+  taskSocket.onmessage = null
+  taskSocket.close()
+  taskSocket = null
+}
+
+function scheduleTaskReconnect(threadId) {
+  if (taskClosedByUs) return
+  if (taskRetryTimer) clearTimeout(taskRetryTimer)
+  const delay = Math.min(1000 * 2 ** taskRetries, 10000)
+  taskRetries += 1
+  taskRetryTimer = setTimeout(() => connectTaskSocket(threadId), delay)
+}
+
+async function connectTaskSocket(threadId) {
+  closeTaskSocket()
+  taskClosedByUs = false
+  if (!threadId) return
+
+  let ticket = ''
+  try {
+    ticket = (await createTicket())?.ticket || ''
+  } catch {
+    scheduleTaskReconnect(threadId)
+    return
+  }
+  if (!ticket) {
+    scheduleTaskReconnect(threadId)
+    return
+  }
+
+  taskSocket = openBackgroundSocket(ticket, threadId)
+  taskSocket.onmessage = (event) => {
+    let message
+    try {
+      message = JSON.parse(event.data)
+    } catch {
+      return
+    }
+    if (message.type === 'tool_trace_snapshot') {
+      toolTraces.value = message.records || []
+    } else if (message.type === 'tool_trace') {
+      upsertTrace(message.record)
+    } else if (message.type === 'verification_snapshot') {
+      if (message.record) verification.value = message.record
+    } else if (message.type === 'verification') {
+      verification.value = message.record
+    }
+  }
+  taskSocket.onclose = () => {
+    if (!taskClosedByUs) scheduleTaskReconnect(threadId)
+  }
+  taskSocket.onerror = () => {
+    // 交给 onclose 统一重连
+  }
+}
+
 async function loadHistory(threadId) {
   const data = await getHistory(threadId)
   const interrupted = Boolean(data?.interrupted ?? data?.manual_intervention)
   paused.value = interrupted
   projectDir.value = data?.project_dir || projectDir.value || ''
+  if (data?.metadata?.verification) verification.value = data.metadata.verification
   const rendered = []
   for (const m of data?.messages || []) {
     const type = String(m.type || '')
@@ -425,6 +545,7 @@ async function send() {
         },
         onDone: (data) => {
           // 最终答案已由 node=final 的 token 追加，这里只收尾
+          if (data?.metadata?.verification) verification.value = data.metadata.verification
           const finalBubble = bubbleMap.get('final')
           if (finalBubble) finalBubble.agent = normalizeAgent(data?.metadata?.from_)
           else if (String(data?.output_msg || '').trim()) {
@@ -776,12 +897,22 @@ function logout() {
           <MessageList
             ref="listRef"
             :messages="messages"
+            :tool-traces="toolTraces"
             :read-only="readOnly"
             :interrupt="readOnly ? null : interrupt"
             :elapsed="sendingSeconds"
             @open-ide="openIdeLink"
             @submit="submitAnswer"
           />
+
+          <div v-if="currentThreadId && (verificationTraces.length || verification)" class="task-dock">
+            <ToolTracePanel
+              v-if="verificationTraces.length"
+              :traces="verificationTraces"
+              :sticky-header="true"
+            />
+            <VerificationCard :record="verification" />
+          </div>
 
           <p v-if="error" class="error bar">{{ error }}</p>
           <p v-if="paused && !interrupt" class="error bar">该会话停在人工确认，但当前无法恢复确认面板；请新建对话或回到原窗口完成确认。</p>
@@ -979,6 +1110,14 @@ function logout() {
   flex-direction: column;
   flex: 1;
   min-width: 0;
+}
+
+.task-dock {
+  flex-shrink: 0;
+  max-height: 42vh;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
 }
 
 .bar {

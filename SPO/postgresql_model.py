@@ -3,7 +3,7 @@ from typing import Optional
 
 from sqlalchemy import (
     String, Boolean, TEXT, TIMESTAMP,
-    CheckConstraint, text, BIGINT, INTEGER, Table, MetaData, Column
+    CheckConstraint, UniqueConstraint, text, BIGINT, INTEGER, Table, MetaData, Column
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -253,3 +253,40 @@ app_lease = Table(
     Column("acquired_at", TIMESTAMP(timezone=True), nullable=False),
     Column("heartbeat_at", TIMESTAMP(timezone=True), nullable=False),
 )
+
+
+class ToolTraceInfo(Base):
+    """工具调用轨迹的 UI 投影；完整审计仍在 LangGraph messages 中。"""
+
+    __tablename__ = "tool_trace"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('running', 'success', 'error')",
+            name="tool_trace_status_check",
+        ),
+        UniqueConstraint("thread_id", "trace_id", name="uk_tool_trace_thread_call"),
+        {"schema": "log"},
+    )
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    trace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    agent: Mapped[str] = mapped_column(String(32), nullable=False)
+    tool: Mapped[str] = mapped_column(String(128), nullable=False)
+    args: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    output: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    output_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'running'"))
+    error: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(INTEGER, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
