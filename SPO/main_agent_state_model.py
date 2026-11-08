@@ -202,6 +202,9 @@ class CodeVerifyAgentMainState(MessagesState):
     # 结构化阶段指标；shallow_metrics 在进入 deep 后仍保留，供最终报告/前端卡片使用
     shallow_metrics: NotRequired[dict[str, Any]]
     deep_metrics: NotRequired[dict[str, Any]]
+    # 深层失败后的受控重试：最多 1 次，且必须改过测试文件
+    deep_retry_num: NotRequired[int]
+    deep_test_signature: NotRequired[str]
     fail_num: NotRequired[int]
     repair_num: NotRequired[int]
     is_repair: NotRequired[bool]

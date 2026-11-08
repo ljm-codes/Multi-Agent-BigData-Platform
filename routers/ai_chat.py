@@ -196,8 +196,51 @@ async def _final_frames(text: str, thread_id: str, *, chars: int = 6, delay: flo
         await asyncio.sleep(delay)
 
 
+def _stream_agent_key(message: Any, subgraph: Any = None) -> str | None:
+    """从 v3 message 的 node/namespace 或 subgraph path 识别 Agent。"""
+    parts: list[str] = []
+    if subgraph is not None:
+        parts.extend([str(getattr(subgraph, "graph_name", "") or "")])
+        parts.extend(str(x) for x in (getattr(subgraph, "path", ()) or ()))
+    parts.extend(str(x) for x in (getattr(message, "namespace", ()) or ()))
+    node = getattr(message, "node", None)
+    if node:
+        parts.append(str(node))
+    scope = " ".join(parts)
+    if "code_verify" in scope or "verify_agent" in scope or "ver_" in scope:
+        return "code_verify"
+    if "data_analysis" in scope:
+        return "data_analysis"
+    if "data_develop" in scope:
+        return "data_develop"
+    # 非数据 Agent 的子图（CVA 自定义子图）默认按质检处理
+    if subgraph is not None:
+        return "code_verify"
+    return None
+
+
+def _agent_from_dispatch(output: Any) -> str | None:
+    """从 dis_chat 的结构化输出里读出本轮下发给了谁；v3 的 model 消息本身没有 agent tag。"""
+    for call in (getattr(output, "tool_calls", None) or []):
+        args = call.get("args") if isinstance(call, dict) else getattr(call, "args", None)
+        if not isinstance(args, dict):
+            continue
+        for info in (args.get("send_info_list") or []):
+            if not isinstance(info, dict):
+                continue
+            send_to = info.get("send_to")
+            if send_to in ("data_analysis", "data_develop"):
+                return send_to
+            app_type = info.get("app_type")
+            if app_type == "spark":
+                return "data_analysis"
+            if app_type == "flink":
+                return "data_develop"
+    return None
+
+
 async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: Any, ctx: dict):
-    """一次流式图运行（astream messages）；负责该 thread 的 occupancy 释放"""
+    """v3 event streaming：自动消费子图消息，CVA 也能出现在 SSE 里。"""
     async with _lock_for(thread_id):
         try:
             await _wait_until_idle(thread_id)
@@ -205,70 +248,162 @@ async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: A
             yield "error", {"thread_id": thread_id, "detail": exc.detail, "status": exc.status_code}
             return
         background_broker.set_active(thread_id)
+        event_queue: asyncio.Queue = asyncio.Queue()
+        verification_queue = verification_registry.subscribe()
         last_tool_by_agent: dict[str, str] = {}
+        seen_messages: set[str] = set()
+        current_agent: str | None = None
+
+        async def emit_message(message: Any, subgraph: Any = None) -> None:
+            nonlocal current_agent
+            node = str(getattr(message, "node", "") or "")
+            if subgraph is not None and node in {"ver_handler", "__start__", "start"}:
+                # CVA 子图的输入消息（原任务 + 开发者回复）不重复塞进 code_verify 气泡
+                return
+            agent = _stream_agent_key(message, subgraph)
+            # 先把 text 消费掉，避免 v3 投影背压；Human/Tool 消息随后丢掉
+            text_parts: list[str] = []
+            try:
+                async for delta in message.text:
+                    if delta:
+                        text_parts.append(delta)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            try:
+                output = await message.output
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                output = None
+            if getattr(message, "node", None) == "dis_chat":
+                dispatched = _agent_from_dispatch(output)
+                if dispatched:
+                    current_agent = dispatched
+            if agent is None and subgraph is None and getattr(message, "node", None) == "model":
+                # create_agent 内部的模型消息 node 是 "model"，没有 agent tag；
+                # 用最近一次 dis_chat 的结构化输出补上归属。
+                agent = current_agent
+            if not agent or not isinstance(output, AIMessage):
+                return
+            msg_id = str(getattr(message, "message_id", "") or id(message))
+            if msg_id in seen_messages:
+                return
+            seen_messages.add(msg_id)
+            if text_parts:
+                await event_queue.put(("update", {
+                    "thread_id": thread_id, "node": agent, "agent": agent,
+                    "ns": [], "phase": "llm_start",
+                }, None))
+                for delta in text_parts:
+                    await event_queue.put(("token", {
+                        "thread_id": thread_id, "node": agent, "agent": agent,
+                        "ns": [], "content": delta,
+                    }, None))
+            # tool_calls 在 output 里是完整的；在工具真正执行前推一次状态即可
+            for call in (getattr(output, "tool_calls", None) or []):
+                name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+                if not name or name in {"VerifyAgentOutClass", "DevelopAgentOutState"}:
+                    continue
+                if last_tool_by_agent.get(agent) == name:
+                    continue
+                last_tool_by_agent[agent] = name
+                await event_queue.put(("status", {
+                    "thread_id": thread_id, "node": agent, "agent": agent,
+                    "text": f"正在调用工具：{name}",
+                }, None))
+
+        async def root_producer() -> None:
+            try:
+                async for message in stream.messages:
+                    await emit_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await event_queue.put(("error", exc, None))
+
+        async def subgraph_producer() -> None:
+            try:
+                async for subgraph in stream.subgraphs:
+                    async for message in subgraph.messages:
+                        await emit_message(message, subgraph)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await event_queue.put(("error", exc, None))
+
+        async def values_producer() -> None:
+            # v3 的 values 是原生 projection；不消费会背压住整条 stream
+            try:
+                async for _ in stream.values:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        async def lifecycle_producer() -> None:
+            try:
+                async for _ in stream.lifecycle:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        async def verification_producer() -> None:
+            try:
+                while True:
+                    record = await verification_queue.get()
+                    await event_queue.put(("verification", record, None))
+            except asyncio.CancelledError:
+                raise
+
+        stream = await graph.astream_events(
+            payload,
+            config={"configurable": {"thread_id": thread_id}},
+            context=MainStateContext(thread_id=thread_id, user_id=user_id),
+            version="v3",
+        )
+
+        async def driver() -> None:
+            try:
+                async with stream:
+                    await asyncio.gather(
+                        root_producer(), subgraph_producer(),
+                        values_producer(), lifecycle_producer(),
+                    )
+                    output = await stream.output() or {}
+                    interrupts = list(await stream.interrupts() or ())
+                    await event_queue.put(("done", (output, interrupts), None))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await event_queue.put(("error", exc, None))
+
+        driver_task = asyncio.create_task(driver())
+        verification_task = asyncio.create_task(verification_producer())
         try:
-            last_agent = None
-            async for chunk, metadata in graph.astream(
-                    payload,
-                    config={"configurable": {"thread_id": thread_id}},
-                    context=MainStateContext(thread_id=thread_id, user_id=user_id),
-                    stream_mode="messages",
-            ):
-                # handler 回传的 HumanMessage 也会出现在 messages 流里；
-                # 只认打了 agent:* tag 的 AIMessageChunk，避免把用户原文当成助手输出。
-                if not isinstance(chunk, AIMessageChunk):
+            while True:
+                kind, item, _meta = await event_queue.get()
+                if kind == "done":
+                    output, interrupts = item
+                    ctx["output"] = output or {}
+                    ctx["interrupted"] = bool(interrupts)
+                    if interrupts:
+                        ctx["interrupts"] = interrupts
+                        yield "interrupt", {"thread_id": thread_id, "interrupt": interrupts}
+                    break
+                if kind == "error":
+                    raise item
+                if kind == "verification":
+                    record = item.get("record") if isinstance(item, dict) and "record" in item else item
+                    if isinstance(record, dict) and record.get("thread_id") == thread_id:
+                        yield "verification", {"thread_id": thread_id, "record": record}
                     continue
-                metadata = metadata or {}
-                tags = metadata.get("tags") or ()
-                if isinstance(tags, str):
-                    tags = [tags]
-                agent = next(
-                    (tag.split(":", 1)[1] for tag in tags
-                     if isinstance(tag, str) and tag.startswith("agent:")),
-                    None,
-                )
-                if not agent:
-                    continue
-                # 工具调用期间没有正文 token，给前端一个"正在调用工具"的进度
-                if agent in {"data_analysis", "data_develop"}:
-                    for tool_call in (getattr(chunk, "tool_call_chunks", None) or ()):
-                        name = (tool_call.get("name") if isinstance(tool_call, dict)
-                                else getattr(tool_call, "name", None))
-                        if not name or name == last_tool_by_agent.get(agent):
-                            continue
-                        last_tool_by_agent[agent] = name
-                        yield "status", {
-                            "thread_id": thread_id,
-                            "node": agent,
-                            "agent": agent,
-                            "text": f"正在调用工具：{name}",
-                        }
-                delta = chunk.text
-                if not delta:
-                    continue
-                if agent != last_agent:
-                    yield "update", {
-                        "thread_id": thread_id,
-                        "node": agent,
-                        "agent": agent,
-                        "ns": [],
-                        "phase": "llm_start",
-                    }
-                    last_agent = agent
-                yield "token", {
-                    "thread_id": thread_id,
-                    "node": agent,
-                    "agent": agent,
-                    "ns": [],
-                    "content": delta,
-                }
-            snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
-            interrupts = list(snapshot.interrupts or ())
-            ctx["output"] = snapshot.values or {}
-            ctx["interrupted"] = bool(interrupts)
-            if interrupts:
-                ctx["interrupts"] = interrupts
-                yield "interrupt", {"thread_id": thread_id, "interrupt": interrupts}
+                if kind in ("update", "token", "status"):
+                    yield kind, item
         except asyncio.CancelledError:
             if ctx["interrupted"]:
                 background_broker.set_paused(thread_id)
@@ -279,6 +414,11 @@ async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: A
             background_broker.set_idle(thread_id)
             yield "error", {"thread_id": thread_id, "detail": str(exc)}
             return
+        finally:
+            driver_task.cancel()
+            verification_task.cancel()
+            verification_registry.unsubscribe(verification_queue)
+            await asyncio.gather(driver_task, verification_task, return_exceptions=True)
         if ctx["interrupted"]:
             background_broker.set_paused(thread_id)
         else:

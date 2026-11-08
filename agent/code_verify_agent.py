@@ -4,13 +4,16 @@
 """
 import ast
 import asyncio
+import hashlib
 import json
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -28,7 +31,7 @@ from langgraph.constants import START
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
-from langgraph.types import Command, Send, interrupt, CachePolicy
+from langgraph.types import Command, Send, interrupt
 from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import CodeVerifyAgentInputState, CodeVerifyAgentMainState, DevelopAgentMainState, \
@@ -51,6 +54,7 @@ from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.code_verify_agent_middleware import PerceptionBackground
 from middleware.compose import chain_model_call_wrappers, ComposedModelResult, run_before_model, \
     chain_tool_call_wrappers
+from middleware.tool_call_guard import repair_missing_tool_messages
 from middleware.tool_trace_middleware import ToolTraceMiddleware
 
 model_config = config.get("model")
@@ -86,6 +90,51 @@ SPARK_TEST_MASTER = (_daa_conf.get("spark_test_master") or "local[*]").strip()
 PYTEST_XML_DIR = ROOT_BASE_DIR_PATH / "tmp" / "pytest"
 logger = LogSetting.create(__name__)
 
+# 临时诊断锚点：只有 eval server 设置了 CVA_ANCHOR_DIR 才写文件；
+# 正常 run.py 不设这个环境变量，完全无副作用。分析完可整体删除。
+_ANCHOR_DIR = os.getenv("CVA_ANCHOR_DIR")
+
+
+def _anchor(name: str, **payload: Any) -> None:
+    if not _ANCHOR_DIR:
+        return
+    try:
+        anchor_dir = Path(_ANCHOR_DIR)
+        anchor_dir.mkdir(parents=True, exist_ok=True)
+        record = {"ts": datetime.now(timezone.utc).isoformat(), **payload}
+        with (anchor_dir / f"{name}.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # noqa: BLE001
+        logger.exception("写入诊断锚点失败")
+
+
+def _anchor_file(name: str, content: str, suffix: str = ".log") -> str:
+    if not _ANCHOR_DIR:
+        return ""
+    try:
+        anchor_dir = Path(_ANCHOR_DIR)
+        anchor_dir.mkdir(parents=True, exist_ok=True)
+        path = anchor_dir / f"{name}{suffix}"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+    except Exception:  # noqa: BLE001
+        logger.exception("写入诊断锚点文件失败")
+        return ""
+
+
+def _messages_payload(messages: Any) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for message in messages or []:
+        payload.append({
+            "type": type(message).__name__,
+            "name": getattr(message, "name", None),
+            "content": getattr(message, "content", ""),
+            "tool_calls": getattr(message, "tool_calls", None),
+            "invalid_tool_calls": getattr(message, "invalid_tool_calls", None),
+            "additional_kwargs": getattr(message, "additional_kwargs", None),
+        })
+    return payload
+
 with open(Path(__file__).parent / "prompt" / "code_verify_agent.md", "r", encoding="utf-8") as f:
     _verify_system_prompt = f.read()
 
@@ -103,7 +152,8 @@ verify_agent_chain = chain_model_call_wrappers(verify_agent_middleware)
 
 class BusinessVerifyCommand(TypedDict):
     target_class: str
-    target_method: NotRequired[str]
+    # 模型经常把“可选”写成显式 null；允许 None，_parse_command 会按“整类”处理
+    target_method: NotRequired[str | None]
     params: NotRequired[dict[str, str]]
 
 
@@ -205,7 +255,9 @@ class VerifyAgentOutClass(BaseModel):
                                                   "该字段的含义在于将前面的浅层测试结果与对应的数据进行汇总，方便人工进行观看。他会先进行人工审核再进行深度测试")
     end_chat: str = Field(
         default="",
-        description="验证结束后，你想说些什么（不用提问是否需要提交，系统会自动处理，你只要说明情况就行了），注意：当 goto 为 end 时生效")
+        description="验证结束后，你想说些什么（不用提问是否需要提交，系统会自动处理，你只要说明情况就行了），"
+                    "注意：当 goto 为 end 时生效。若本轮是异常收尾（无法写测试/命令或工具异常/无法继续），"
+                    "必须以「【CVA 异常】」开头说明原因和证据，不要输出自由文本或把错误放 content。")
 
 
 class TextBuffer:
@@ -229,6 +281,18 @@ class TextBuffer:
 
 
 # ---------------  utils ---------------
+def _short_model_text(message: Any, limit: int = 500) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        text = content
+    else:
+        try:
+            text = json.dumps(content, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(content)
+    return text[:limit].replace("\n", " ")
+
+
 def _parse_verify_agent_message(ver_res: BaseMessage) -> VerifyAgentOutClass | None:
     return parse_route_message(ver_res, VerifyAgentOutClass)
 
@@ -337,27 +401,172 @@ async def _run_with_progress(
             pass
 
 
+def _parse_surefire_xml(xml_path: Path) -> list[dict]:
+    """把一个 TEST-*.xml 展开成逐条测试结果（名字/状态/失败信息）"""
+    try:
+        root = ET.parse(xml_path).getroot()
+    except Exception as e:  # noqa: BLE001
+        return [{"status": "error", "report": xml_path.name,
+                 "message": f"解析 surefire XML 失败: {type(e).__name__}: {e}"}]
+    results: list[dict] = []
+    for case in root.iter("testcase"):
+        status, message = "passed", ""
+        for tag, st in (("failure", "failed"), ("error", "error"), ("skipped", "skipped")):
+            node = case.find(tag)
+            if node is not None:
+                status = st
+                message = (node.get("message") or node.text or "").strip()[:1000]
+                break
+        results.append({
+            "name": case.get("name"),
+            "classname": case.get("classname"),
+            "status": status,
+            "message": message,
+            "time": case.get("time"),
+            "report": xml_path.name,
+        })
+    return results
+
+
+def _collect_surefire_results(app_path: Path, since: float) -> list[dict]:
+    """只取本次命令之后更新的 surefire 报告，避免上一次命令的失败污染结果"""
+    report_dir = app_path / "target" / "surefire-reports"
+    if not report_dir.is_dir():
+        return []
+    results: list[dict] = []
+    for xml_path in sorted(report_dir.glob("TEST-*.xml")):
+        try:
+            if xml_path.stat().st_mtime < since - 1.0:
+                continue
+        except OSError:
+            continue
+        results.extend(_parse_surefire_xml(xml_path))
+    return results
+
+
+_COMPILE_ERROR_AREA = re.compile(r"[\\/]src[\\/](test|main)[\\/]")
+
+
+def _compile_error_area(output: str) -> str:
+    """从 mvn 编译输出里判断错在 src/test 还是 src/main"""
+    areas = {m.group(1) for m in _COMPILE_ERROR_AREA.finditer(output)}
+    if "test" in areas and "main" not in areas:
+        return "test"
+    if "main" in areas and "test" not in areas:
+        return "business"
+    if areas == {"test", "main"}:
+        return "test_and_business"
+    return "unknown"
+
+
+async def _flink_test_compile_gate(
+        app_path: Path, buffer: Any, on_event: Any = None
+) -> dict | None:
+    """跑 mvn test 前先 test-compile：编译不过就别进测试，把错误直接交给 CVA"""
+    command = "mvn -q test-compile"
+    gate_buf = TextBuffer()
+    res = await arun_mvn_command(command, buffer=gate_buf, path=str(app_path))
+    output = gate_buf.snapshot()
+    if buffer:
+        buffer.append(output)
+    returncode = res.get("returncode")
+    if _ANCHOR_DIR:
+        _anchor("test_compile", command=command, returncode=returncode,
+                output_path=_anchor_file(f"test-compile-{uuid.uuid4().hex}", output))
+    if returncode == 0:
+        return None
+    area = _compile_error_area(output)
+    if area == "business":
+        message = "业务代码编译未通过（CVA 不能改业务代码，请把错误证据交给开发者/人工）"
+    elif area == "test":
+        message = "测试代码编译未通过（请修改测试代码后重跑）"
+    else:
+        message = "编译未通过（未能判断是 src/test 还是 src/main）"
+    _emit_progress(on_event, {
+        "name": command, "test_file": "mvn", "status": "failed",
+        "message": f"{message}\n{output[-1000:]}",
+    })
+    return {
+        "command": command,
+        "stage": "test-compile",
+        "returncode": res.get("returncode"),
+        "compile_error_area": area,
+        "message": message,
+        "output": output[-3000:],
+    }
+
+
 async def _run_flink_test_command(
         commands: list[str], path: str, buffer: Any, on_event: Any = None
 ) -> list[dict]:
-    """逐条跑 mvn 命令，返回每条命令的返回码和输出尾部（原来只写 buffer、不返回结果）"""
+    """先做测试编译闸门，再逐条跑 mvn 命令；返回返回码、输出尾部和 surefire 逐条结果"""
+    app_path = Path(path)
     results: list[dict] = []
+    gate = await _flink_test_compile_gate(app_path, buffer, on_event)
+    if gate is not None:
+        return [gate]
     for command in commands:
         cmd_buf = TextBuffer()
+        started = time.time()
         res = await arun_mvn_command(command, buffer=cmd_buf, path=path)
         output = cmd_buf.snapshot()
         if buffer:
             buffer.append(output)
-        results.append({
-            "command": command,
-            "returncode": res.get("returncode"),
-            "output": output[-2000:],
-        })
+        tests = _collect_surefire_results(app_path, started)
+        returncode = res.get("returncode")
+        if _ANCHOR_DIR:
+            anchor_id = f"mvn-{uuid.uuid4().hex}"
+            output_path = _anchor_file(anchor_id, output)
+            surefire_dir = Path(_ANCHOR_DIR) / f"{anchor_id}-surefire"
+            surefire_files: list[str] = []
+            report_dir = app_path / "target" / "surefire-reports"
+            if report_dir.is_dir():
+                surefire_dir.mkdir(parents=True, exist_ok=True)
+                for xml_path in sorted(report_dir.glob("TEST-*.xml")):
+                    try:
+                        if xml_path.stat().st_mtime < started - 1.0:
+                            continue
+                        shutil.copy2(xml_path, surefire_dir / xml_path.name)
+                        surefire_files.append(xml_path.name)
+                    except OSError:
+                        continue
+            _anchor("mvn_test", command=command, returncode=returncode,
+                    output_path=output_path, output_chars=len(output),
+                    surefire_dir=str(surefire_dir), surefire_files=surefire_files,
+                    tests=tests)
+        failed = [t for t in tests if t.get("status") in ("failed", "error")]
+        if tests:
+            # 平铺成“一条测试一个结果”：VerificationReporter/build_stage_metrics 按条计数，
+            # CVA 也能直接看到 class#method 的失败原文。
+            for test in tests:
+                test.setdefault("test_file", "mvn")
+                test["command"] = command
+                test["returncode"] = returncode
+            results.extend(tests)
+            summary = (f"{len(tests)} 个测试："
+                       f"{len(tests) - len(failed)} 通过，{len(failed)} 失败/错误")
+        else:
+            results.append({
+                "name": command,
+                "test_file": "mvn",
+                "command": command,
+                "status": "passed" if returncode == 0 else "error",
+                "returncode": returncode,
+                "message": ("没有解析到 surefire 报告：检查 -Dtest 的类名/方法名是否真的存在"
+                            if returncode == 0 else output[-2000:]),
+                "output": output[-2000:],
+            })
+            summary = output[-1000:]
+        detail = ""
+        if failed:
+            first = failed[0]
+            detail = (f"{first.get('classname')}#{first.get('name')}: "
+                      f"{(first.get('message') or '')[:300]}")
         _emit_progress(on_event, {
             "name": command,
             "test_file": "mvn",
-            "status": "passed" if res.get("returncode") == 0 else "failed",
-            "message": output[-1000:],
+            "status": "passed" if returncode == 0 and not failed else "failed",
+            "message": detail or summary,
         })
     return results
 
@@ -406,6 +615,58 @@ def _parse_pytest_xml(xml_path: Path) -> list[dict]:
     return results
 
 
+def _spark_syntax_error(target: Path) -> str:
+    """pytest 之前先做纯语法检查，错误位置比 pytest 的收集堆栈更直观"""
+    try:
+        source = target.read_text(encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        return f"读取测试文件失败: {type(e).__name__}: {e}"
+    try:
+        compile(source, str(target), "exec")
+    except SyntaxError as e:
+        line_text = (e.text or "").rstrip()
+        return f"第 {e.lineno} 行：{e.msg}\n{' ' * 4}{line_text}"
+    except (ValueError, MemoryError, RecursionError) as e:
+        return f"编译失败{type(e).__name__}: {e}"
+    return ""
+
+
+async def _spark_collect_gate(
+        target: Path, project_path: Path, env: dict[str, str],
+        buffer: Any, on_event: Any = None, test_file: str = "",
+) -> dict | None:
+    """pytest --collect-only：没有 test_* 或者 import 失败时，不要进入真正的测试执行"""
+    command = [SPARK_TEST_PYTHON, "-m", "pytest", str(target), "--collect-only", "-q"]
+    gate_buf = TextBuffer()
+    try:
+        res = await arun_python_command(
+            command, path=str(project_path), env=env, buffer=gate_buf)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        msg = f"启动 pytest --collect-only 失败: {type(e).__name__}: {e}"
+        buffer.append(f"[spark-test] {msg}\n")
+        return {"test_file": test_file, "status": "error", "stage": "collect", "message": msg}
+    output = gate_buf.snapshot()
+    if buffer:
+        buffer.append(output)
+    returncode = res.get("returncode")
+    if returncode == 0:
+        return None
+    if returncode == 5:
+        message = "测试文件里没有可收集的 test_* 用例（禁止占位/空测试）"
+        status = "no_tests"
+    else:
+        message = f"pytest 收集失败(rc={returncode})：{output.strip()[-2000:]}"
+        status = "error"
+    _emit_progress(on_event, {
+        "name": test_file, "test_file": test_file,
+        "status": status, "message": message,
+    })
+    return {"test_file": test_file, "status": status, "stage": "collect",
+            "returncode": returncode, "message": message}
+
+
 async def _run_spark_test_command(
         commands: list[dict], path: str | Path, buffer: Any, on_event: Any = None
 ) -> list[dict]:
@@ -440,6 +701,23 @@ async def _run_spark_test_command(
         env["PYSPARK_PYTHON"] = SPARK_TEST_PYTHON
         env["PYSPARK_DRIVER_PYTHON"] = SPARK_TEST_PYTHON
         env["SPARK_TEST_MASTER"] = command.get("master") or SPARK_TEST_MASTER
+
+        syntax_error = _spark_syntax_error(target)
+        if syntax_error:
+            msg = f"测试代码语法错误：{syntax_error}"
+            buffer.append(f"[spark-test] {msg}\n")
+            results.append({"test_file": test_file, "status": "error",
+                            "stage": "syntax", "message": msg})
+            _emit_progress(on_event, {
+                "name": test_name or test_file, "test_file": test_file,
+                "status": "error", "message": msg,
+            })
+            continue
+        gate = await _spark_collect_gate(
+            target, project_path, env, buffer, on_event, test_file)
+        if gate is not None:
+            results.append(gate)
+            continue
         buffer.append(f"[spark-test] 运行: {' '.join(cmd)}\n")
 
         try:
@@ -767,6 +1045,9 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     command_list.append(f"hdfs://{target_dir}/{jar_file.name}")
     command_list += app_args
     complete_command = shlex.join(command_list)
+    _anchor("submit_flink", app_path=str(app_path), jar=str(jar_file),
+            jar_name=jar_file.name, app_name=yarn_app_name,
+            command=complete_command)
     # 本地留一份 cmd，再按集群开关决定是否上传
     cmd_local = Path(app_path) / f"{yarn_app_name}.cmd"
     cmd_local.write_text(complete_command, encoding="utf-8")
@@ -777,7 +1058,7 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
         project_dir=Path(app_path),
     )
     # 源码登记后，对Redis中的注册信息进行移除
-    redis_con.hdel(f"{prefix}:{project_name}")
+    redis_con.delete(f"{prefix}:{project_name}")
 
     # 运行
     if not CONNECT_TO_CLUSTER:
@@ -966,7 +1247,7 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
             project_dir=app_path,
         )
         # 源码登记后，对Redis中的注册信息进行移除，避免占用资源
-        redis_con.hdel(key)
+        redis_con.delete(key)
 
         if not CONNECT_TO_CLUSTER:
             return {"type": "info",
@@ -1137,6 +1418,21 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
         else:
             content = f"{dres.message}, 具体的错误为：{dres.error}"
         result_msg = [AIMessage(content=content, name="deep_command:result")]
+    if _ANCHOR_DIR:
+        _anchor(
+            "cva_result_to_model",
+            status=state.get("status"),
+            result_msg=[getattr(m, "content", "") for m in result_msg],
+            shallow_status=getattr(state.get("shallow_result"), "status", None),
+            deep_status=getattr(state.get("deep_result"), "status", None),
+            messages_path=_anchor_file(
+                f"cva-messages-{uuid.uuid4().hex}",
+                json.dumps(_messages_payload(state.get("messages")),
+                           ensure_ascii=False, default=str),
+                ".json",
+            ),
+        )
+
     verify_request = ModelRequest(
         model=_verify_model,
         messages=state.get("messages"),
@@ -1149,15 +1445,39 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
     async def verify_execute(ver_request: ModelRequest) -> ModelResponse:
         mags = ([ver_request.system_message]
                 if ver_request.system_message else []) + ver_request.messages + result_msg
+        # 工具被取消/异常时，历史里会留下没有 ToolMessage 的 tool_call；下一次模型调用会 400
+        mags = [*mags, *repair_missing_tool_messages(mags)]
         tools = [VerifyAgentOutClass, *ver_request.tools]
         model_ = ver_request.model.bind_tools(tools)
 
-        ver_res = await model_.ainvoke(mags)
-        if isinstance(ver_res, AIMessage) and getattr(ver_res, "invalid_tool_calls", None):
-            repaired = _repair_invalid_tool_calls(ver_res)
-            if repaired is not None:
-                ver_res = repaired
+        async def _invoke(messages: list[BaseMessage]):
+            res = await model_.ainvoke(messages, config={"tags": ["agent:code_verify"]})
+            if isinstance(res, AIMessage) and getattr(res, "invalid_tool_calls", None):
+                repaired = _repair_invalid_tool_calls(res)
+                if repaired is not None:
+                    res = repaired
+            return res
+
+        ver_res = await _invoke(mags)
         ver_out = _parse_verify_agent_message(ver_res)
+        # 模型偶尔把“无法继续”的自由文本塞进 content；只重试一次，并明确要求写到 end_chat。
+        if ver_out is None and not (
+                isinstance(ver_res, AIMessage) and ver_res.tool_calls):
+            raw = _short_model_text(ver_res)
+            retry_msg = HumanMessage(content=(
+                f"上一次输出无法解析为 VerifyAgentOutClass。原始输出：{raw}\n"
+                "请立即调用 VerifyAgentOutClass。若无法继续/发生异常，必须设置 goto='end'，"
+                "并在 end_chat 中以『【CVA 异常】』开头说明原因；"
+                "不要把错误信息写在自由文本 content 里。"
+            ))
+            ver_res = await _invoke([*mags, retry_msg])
+            ver_out = _parse_verify_agent_message(ver_res)
+        if _ANCHOR_DIR:
+            _anchor("cva_model_output", status=state.get("status"),
+                    parsed=ver_out is not None,
+                    content=getattr(ver_res, "content", ""),
+                    tool_calls=getattr(ver_res, "tool_calls", None),
+                    invalid_tool_calls=getattr(ver_res, "invalid_tool_calls", None))
         if ver_out is None:
             # 调用工具时
             if isinstance(ver_res, AIMessage) and ver_res.tool_calls:
@@ -1165,20 +1485,28 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
                     update={"additional_kwargs": {**ver_res.additional_kwargs}}
                 )
                 return ModelResponse(result=[ver_response])
-            fallback = AIMessage(
-                content="",
-                additional_kwargs={
-                    "error": DevelopGraphErrorState(
-                        from_="verify_agent",
-                        thread_id=runtime.context.thread_id,
-                        desc=f"无法处理结果返回的消息：{ver_res}",
-                        goto_="work_end",
-                        original_task_list=[],
-                    )
+            # 两次都解析不了：仍然走结构化 execute，goto=end + end_chat，
+            # 让 dis_chat 看到“【CVA 异常】”，而不是把它当成 CVA 的验证结论。
+            raw = _short_model_text(ver_res)
+            fallback_execute = {
+                "goto": "end",
+                "end_chat": (f"【CVA 异常】结构化输出两次都无法解析；本轮不能视为验证通过。"
+                             f"原始输出摘要：{raw}。请按异常处理并告知用户。"),
+                "flink_command": {},
+                "spark_command": {},
+                "first_timeout": 300.0,
+                "hard_timeout": 600.0,
+                "code_summary": {
+                    "data_result": "CVA 结构化输出解析失败",
+                    "mermaid_flowgraph": "",
+                    "snippets": [],
                 },
-            )
-            return ModelResponse(result=[fallback])
+                "cva_error": True,
+            }
+            return ModelResponse(result=[AIMessage(
+                content="", additional_kwargs={"execute": fallback_execute})])
         execute_dict = ver_out.model_dump()
+        _anchor("cva_execute", status=state.get("status"), execute=execute_dict)
         out_ai_msg = AIMessage(
             content="",
             additional_kwargs={
@@ -1257,6 +1585,100 @@ def _verify_warn_node(state: dict) -> Command:
     )
 
 
+def _deep_test_file_problem(app_type: str, app_path: Path, deep_command: list[dict]) -> str:
+    """深层命令必须指向已经写好、确实存在的测试类/文件"""
+    if not deep_command:
+        return ("深层命令为空：请先写好深层测试文件，再把 target_class/target_method "
+                "（Flink）或 test_file（Spark）填进 deep_command。")
+    problems: list[str] = []
+    if app_type == "flink":
+        for command in deep_command:
+            target_class = (command.get("target_class") or "").strip()
+            if not target_class:
+                problems.append("flink_deep_command 里有 target_class 为空")
+                continue
+            rel = "src/test/java/" + target_class.replace(".", "/") + ".java"
+            test_path = app_path / rel
+            if not test_path.is_file():
+                problems.append(f"找不到深层测试类 {target_class}（期望 {rel}）")
+                continue
+            if "@Test" not in test_path.read_text(encoding="utf-8", errors="replace"):
+                problems.append(f"深层测试类 {target_class} 没有 @Test 方法")
+    elif app_type == "spark":
+        tests_dir = (app_path / "src" / "tests").resolve()
+        for command in deep_command:
+            test_file = (command.get("test_file") or "").strip().replace("\\", "/")
+            test_path = (app_path / test_file).resolve() if test_file else None
+            if (test_path is None or not test_path.is_relative_to(tests_dir)
+                    or not test_path.is_file()):
+                problems.append(f"找不到深层测试文件 {test_file or '(空)'}")
+                continue
+            if not re.search(r"^\s*def\s+test_\w+\s*\(",
+                             test_path.read_text(encoding="utf-8", errors="replace"),
+                             re.MULTILINE):
+                problems.append(f"深层测试文件 {test_file} 没有 test_* 函数")
+    return "；".join(problems)
+
+
+def _test_files_signature(app_type: str, app_path: Path) -> str:
+    """测试目录内容哈希；用来判断深层失败后测试是否真的改过"""
+    if app_type == "flink":
+        test_dir = app_path / "src" / "test" / "java"
+        pattern = "*.java"
+    elif app_type == "spark":
+        test_dir = app_path / "src" / "tests"
+        pattern = "*.py"
+    else:
+        return ""
+    if not test_dir.is_dir():
+        return ""
+    digest = hashlib.sha256()
+    try:
+        files = sorted(test_dir.rglob(pattern))
+    except OSError:
+        return ""
+    for file in files:
+        if not file.is_file():
+            continue
+        try:
+            digest.update(file.relative_to(app_path).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(file.read_bytes())
+            digest.update(b"\0")
+        except OSError:
+            continue
+    return digest.hexdigest()
+
+
+def _deep_has_failures(deep: Any) -> bool:
+    """上一次深层是否有失败/异常结论；后台仍在跑时不能重试"""
+    if deep is None:
+        return False
+    if isinstance(deep, dict):
+        deep_status = deep.get("status")
+        deep_result = deep.get("result")
+    else:
+        deep_status = getattr(deep, "status", None)
+        deep_result = getattr(deep, "result", None)
+    if deep_status in ("handed_off", "running"):
+        return False
+    if deep_status in ("timeout", "background_timeout", "error", "background_error"):
+        return True
+    if deep_status not in ("completed", "background_completed"):
+        return True
+    items = deep_result if isinstance(deep_result, list) else []
+    if not items:
+        return True
+    for item in items:
+        if not isinstance(item, dict):
+            return True
+        if item.get("stage") in ("test-compile", "collect", "syntax"):
+            return True
+        if item.get("status") in ("failed", "error", "no_tests"):
+            return True
+    return False
+
+
 def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> Send | Literal["tools"]:
     """中转站"""
     last_ai_msg = None
@@ -1287,6 +1709,27 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
     first_timeout = execute_info.get("first_timeout") or 300
     hard_timeout = execute_info.get("hard_timeout") or 600
     goto = execute_info.get("goto")
+    if _ANCHOR_DIR:
+        _anchor("dispatch", status=state.get("status"), goto=goto,
+                deep_retry_num=state.get("deep_retry_num"),
+                deep_test_signature=state.get("deep_test_signature"),
+                flink_command=flink_command, spark_command=spark_command)
+
+    # CVA 自己解析失败时状态可能还是 preliminary/shallow；不能走 ver_warn 死循环，
+    # 必须直接把“【CVA 异常】...”作为 end_chat 交给 ver_end -> dis_chat。
+    if execute_info.get("cva_error") or (
+            goto == "end" and str(execute_info.get("end_chat") or "").startswith("【CVA 异常】")
+    ):
+        return Send(
+            "ver_end",
+            {
+                "verify_end_msg": execute_info.get("end_chat"),
+                "from_": "ver_dispatch",
+                "date": date,
+                "project_name": p_name,
+                "app_type": app_type,
+            },
+        )
 
     deep_result = state.get("deep_result")
     deep_status = (deep_result.get("status") if isinstance(deep_result, dict)
@@ -1337,11 +1780,27 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
         )
     elif goto == "deep" and status == "shallow":
         if app_type == "flink":
-            deep_commands = _parse_command(flink_command.get("flink_deep_command") or [])
+            deep_raw = flink_command.get("flink_deep_command") or []
+            deep_commands = _parse_command(deep_raw)
         elif app_type == "spark":
-            deep_commands = _parse_spark_command(spark_command.get("spark_deep_command") or [])
+            deep_raw = spark_command.get("spark_deep_command") or []
+            deep_commands = _parse_spark_command(deep_raw)
         else:
             return _route_error_send(state, f"不支持的应用类型: {app_type}")
+        app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+        deep_problem = _deep_test_file_problem(app_type, app_path, deep_raw)
+        if deep_problem:
+            return Send(
+                "ver_warn",
+                {
+                    "status": status,
+                    "messages": [HumanMessage(content=(
+                        f"深层命令未执行：{deep_problem}\n"
+                        "请先写好对应的测试，或修正 deep_command 后重新调用 "
+                        "VerifyAgentOutClass(goto='deep')。deep 命令会立即执行。"
+                    ))],
+                },
+            )
         code_summary = {
             "type": "info",
             **(execute_info.get("code_summary") or {}),
@@ -1360,6 +1819,81 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
         return Send(
             "ver_manual",
             code_summary
+        )
+
+    elif goto == "deep" and status == "deep":
+        # 深层失败后的受控重试：必须改过测试文件、最多 1 次；不跳步、不回退。
+        # 重试直接进 ver_deep_exec，不经过 ver_manual：人工确认是独立节点，
+        # 只在第一次 shallow→deep 时出现；重试是修测试代码，不是人的决策。
+        retry_num = state.get("deep_retry_num") or 0
+        if retry_num >= 1:
+            return Send(
+                "ver_warn",
+                {
+                    "status": status,
+                    "messages": [HumanMessage(content=(
+                        "深层重试次数已用尽（最多 1 次）。请调用 VerifyAgentOutClass(goto='end') "
+                        "如实汇报失败原因，不要再重跑。"
+                    ))],
+                },
+            )
+        if not _deep_has_failures(state.get("deep_result")):
+            return Send(
+                "ver_warn",
+                {
+                    "status": status,
+                    "messages": [HumanMessage(content=(
+                        "上一次深层没有失败用例（或仍在后台运行），不需要重跑；请 goto='end'。"
+                    ))],
+                },
+            )
+        app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+        current_sig = _test_files_signature(app_type, app_path)
+        prev_sig = state.get("deep_test_signature")
+        if not prev_sig or not current_sig or current_sig == prev_sig:
+            return Send(
+                "ver_warn",
+                {
+                    "status": status,
+                    "messages": [HumanMessage(content=(
+                        "测试文件没有变化，不能原样重跑 deep。请先根据 surefire 失败原文"
+                        "修改失败用例，再只带着失败方法调用 VerifyAgentOutClass(goto='deep')；"
+                        "如果确认是业务代码问题，直接 goto='end' 交人工。"
+                    ))],
+                },
+            )
+        if app_type == "flink":
+            deep_raw = flink_command.get("flink_deep_command") or []
+            deep_commands = _parse_command(deep_raw)
+        elif app_type == "spark":
+            deep_raw = spark_command.get("spark_deep_command") or []
+            deep_commands = _parse_spark_command(deep_raw)
+        else:
+            return _route_error_send(state, f"不支持的应用类型: {app_type}")
+        deep_problem = _deep_test_file_problem(app_type, app_path, deep_raw)
+        if deep_problem:
+            return Send(
+                "ver_warn",
+                {
+                    "status": status,
+                    "messages": [HumanMessage(content=(
+                        f"深层重试命令未执行：{deep_problem}\n"
+                        "请修正 deep_command 后重新调用 VerifyAgentOutClass(goto='deep')。"
+                    ))],
+                },
+            )
+        return Send(
+            "ver_deep_exec",
+            {
+                **state,
+                "deep_commands": deep_commands,
+                "deep_timeout": hard_timeout,
+                "shallow_timeout": first_timeout,
+                "deep_retry_num": retry_num + 1,
+                "deep_test_signature": current_sig,
+                "shallow_result": None,
+                "deep_result": None,
+            },
         )
 
     elif goto == "end" and status == "deep":
@@ -1405,6 +1939,9 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
     shallow_timeout = state.get("shallow_timeout") or 300
     if shallow_timeout > 300:
         shallow_timeout = 300
+    if _ANCHOR_DIR:
+        _anchor("shallow_start", app_type=app_type,
+                commands=state.get("shallow_commands"), timeout=shallow_timeout)
 
     if app_type == "flink":
         flink_shallow_test_commands = state.get("shallow_commands", [])
@@ -1438,6 +1975,7 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
             buf,
         )
         shallow_metrics = reporter.finish(final_result)
+        _anchor("shallow_result", status=final_result.status, result=final_result.result)
         update_state = {
             "shallow_result": final_result,
             "shallow_metrics": shallow_metrics,
@@ -1484,6 +2022,7 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
             buf,
         )
         shallow_metrics = reporter.finish(final_result)
+        _anchor("shallow_result", status=final_result.status, result=final_result.result)
         update_state = {
             "shallow_result": final_result,
             "shallow_metrics": shallow_metrics,
@@ -1625,9 +2164,13 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
         shallow_timeout = 300
     if deep_timeout < shallow_timeout:
         shallow_timeout = deep_timeout / 2
+    if _ANCHOR_DIR:
+        _anchor("deep_start", app_type=app_type, commands=state.get("deep_commands"),
+                timeout=deep_timeout, retry_num=state.get("deep_retry_num"))
     if app_type == "flink":
         deep_commands = state.get("deep_commands", [])
         app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+        deep_signature = _test_files_signature(app_type, app_path)
         buf = TextBuffer()
         deep_task_id = f"deep-{uuid.uuid4()}"
         supervisor = TaskSupervisor(
@@ -1663,9 +2206,12 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             buf,
         )
         deep_metrics = reporter.finish(final_result)
+        _anchor("deep_result", status=final_result.status, result=final_result.result)
         update_state = {
             "deep_result": final_result,
             "deep_metrics": deep_metrics,
+            "deep_retry_num": state.get("deep_retry_num") or 0,
+            "deep_test_signature": deep_signature,
             # 转后台时深层还没有结论：本轮只能收尾，等后台回流再 end
             "status": "done" if final_result.status == "handed_off" else "deep",
         }
@@ -1694,6 +2240,7 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
     elif app_type == "spark":
         deep_commands = state.get("deep_commands", [])
         app_path = ROOT_BASE_DIR_PATH / "tmp_code" / "spark" / date / p_name
+        deep_signature = _test_files_signature(app_type, app_path)
         buf = TextBuffer()
         deep_task_id = f"deep-{uuid.uuid4()}"
         supervisor = TaskSupervisor(
@@ -1729,9 +2276,12 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             buf,
         )
         deep_metrics = reporter.finish(final_result)
+        _anchor("deep_result", status=final_result.status, result=final_result.result)
         update_state = {
             "deep_result": final_result,
             "deep_metrics": deep_metrics,
+            "deep_retry_num": state.get("deep_retry_num") or 0,
+            "deep_test_signature": deep_signature,
             # 转后台时深层还没有结论：本轮只能收尾，等后台回流再 end
             "status": "done" if final_result.status == "handed_off" else "deep",
         }
@@ -1905,22 +2455,16 @@ _verify_builder = StateGraph(
     output_schema=cast("OutputT", DevelopAgentMainState),
 )
 _verify_builder.add_node("ver_handler", cast("StateNode", _verify_input_handler))
-_verify_builder.add_node("ver_chat", cast("StateNode", _verify_agent_chat), cache_policy=CachePolicy(
-    ttl=2 * 60 * 60
-))
+_verify_builder.add_node("ver_chat", cast("StateNode", _verify_agent_chat))
 _verify_builder.add_node("ver_error", cast("StateNode", _verify_error_node))
 _verify_builder.add_node("ver_warn", cast("StateNode", _verify_warn_node))
-_verify_builder.add_node("ver_com_exec", cast("StateNode", _verify_shallow_execute), cache_policy=CachePolicy(
-    ttl=1 * 60 * 60
-))
+_verify_builder.add_node("ver_com_exec", cast("StateNode", _verify_shallow_execute))
 _verify_builder.add_node("ver_manual", cast("StateNode", _verify_manual))
 _verify_builder.add_node("ver_deep_exec", cast("StateNode", _verify_deep_execute))
 _verify_builder.add_node("ver_submit", cast("StateNode", _verify_submit))
 _verify_builder.add_node("tools", ToolNode(
     tools=code_verify_agent_tools,
     awrap_tool_call=chain_tool_call_wrappers(verify_agent_middleware)
-), cache_policy=CachePolicy(
-    ttl=3 * 60 * 60
 ))
 _verify_builder.add_node("ver_end", cast("StateNode", _verify_end))
 
@@ -1929,7 +2473,8 @@ _verify_builder.add_edge("ver_handler", "ver_chat")
 _verify_builder.add_conditional_edges(
     "ver_chat",
     _verify_msg_dispatch,
-    ["ver_com_exec", "ver_manual", "ver_submit", "tools", "ver_error", "ver_warn", "ver_end"]
+    ["ver_com_exec", "ver_manual", "ver_submit", "ver_deep_exec",
+     "tools", "ver_error", "ver_warn", "ver_end"]
 )
 _verify_builder.add_edge("tools", "ver_chat")
 verify_agent = _verify_builder.compile()

@@ -31,6 +31,9 @@ function dispatch({ event, data }, handlers) {
     case 'status':
       handlers.onStatus?.(data)
       break
+    case 'verification':
+      handlers.onVerification?.(data)
+      break
     case 'token':
       handlers.onToken?.(data)
       break

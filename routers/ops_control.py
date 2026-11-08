@@ -17,7 +17,7 @@ from SPO.operations_agent_state_model import OperationsAndReconcileContext
 from SPO.postgresql_model import AgentRun, CheckLog
 from SPO.route_results import RouteResponse, ResultCode
 from agent.operations_agent_run import (_finish_agent_run, _mark_run_running,
-                                        _release_lease)
+                                        _release_lease, resolve_pending_errors)
 from Tools.alarm_sender import send_warning_msg
 from Tools.db import AsyncSessionLocal
 from Tools.job_command import normalize_answer, split as split_command, validate_command
@@ -392,6 +392,10 @@ async def _resume_ops_session(ops_agent: Any, session_id: str, answer: Any) -> d
                 finished=False)
         else:
             await asyncio.to_thread(
+                resolve_pending_errors, app_id, solved=False,
+                note=f"resume exception: {type(exc).__name__}: {exc}"
+            )
+            await asyncio.to_thread(
                 _finish_agent_run, session_id, "ERROR", "",
                 f"{type(exc).__name__}: {exc}")
             await asyncio.to_thread(_release_lease, app_id, session_id)
@@ -404,12 +408,19 @@ async def _resume_ops_session(ops_agent: Any, session_id: str, answer: Any) -> d
             _finish_agent_run, session_id, "PAUSED", "等待人工审核", "",
             finished=False)
     elif result.get("type", "") == "error":
+        await asyncio.to_thread(
+            resolve_pending_errors, app_id, solved=False, note=f"resume error: {out_msg[:200]}"
+        )
         await asyncio.to_thread(_finish_agent_run, session_id, "ERROR", "", out_msg)
         await asyncio.to_thread(_release_lease, app_id, session_id)
         await asyncio.to_thread(
             send_warning_msg, app_id=app_id,
             description=f"程序运行出错了：{out_msg}", error_id=None)
     else:
+        # 恢复后正常结束：solved 行已由 app_summary 标 DONE，剩余 PENDING 不再自动重试
+        await asyncio.to_thread(
+            resolve_pending_errors, app_id, solved=False, note="resume left PENDING"
+        )
         await asyncio.to_thread(_finish_agent_run, session_id, "DONE", out_msg, "")
         await asyncio.to_thread(_release_lease, app_id, session_id)
 

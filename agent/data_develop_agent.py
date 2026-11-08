@@ -15,10 +15,13 @@ from langgraph.types import Send
 
 from SPO.main_agent_state_model import AgentDevelopInputState, MainStateContext, CodeVerifyAgentInputState, \
     DevelopGraphErrorState, AllocateErrorInfo, content_text, WorkEndState
+from Tools.app_name import validate_app_name
 from Tools.log_settings import LogSetting
 from Tools.data_develop_agent_tools import AGENT_NAME as DEVELOP_AGENT, run_mvn_command
 from Tools.registry import get_tools
+from Tools.share_check_tool import redis_con
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
+from middleware.tool_call_guard import ToolCallHistoryGuard
 from middleware.tool_trace_middleware import ToolTraceMiddleware
 
 model_config = config.get("model")
@@ -42,6 +45,13 @@ class CodeDevelopState(AgentState):
     project_name: str
     is_repair: bool
     repair_num: NotRequired[int]
+
+
+def _has_java_code(app_path: Path) -> bool:
+    try:
+        return any(app_path.glob("src/main/java/**/*.java"))
+    except Exception:
+        return False
 
 
 async def big_data_develop_code_agent(
@@ -127,7 +137,10 @@ async def big_data_develop_code_agent(
     code_develop_agent = create_agent(
         model=code_develop_model,
         tools=[*maven_tool, *data_develop_tools],
-        middleware=cast("AgentMiddleware", [ToolTraceMiddleware("data_develop")]),
+        middleware=cast("AgentMiddleware", [
+            ToolTraceMiddleware("data_develop"),
+            ToolCallHistoryGuard("data_develop"),
+        ]),
         system_prompt=_code_develop_system_prompt,
         context_schema=cast("ContextT", MainStateContext),
         state_schema=cast("StateT", CodeDevelopState),
@@ -142,6 +155,8 @@ async def big_data_develop_code_agent(
         config={
             "configurable": {"thread_id": runtime.context.thread_id},
             "tags": ["agent:data_develop"],
+            # 并行 Send 工具调用容易留下半批 ToolMessage；图级串行执行
+            "max_concurrency": 1,
         },
         context=cast(
             "ContextT",
@@ -153,6 +168,45 @@ async def big_data_develop_code_agent(
             )
         ),
     )
+    # 模型有时只回一句“我先初始化…”就结束（没有 tool_call），必须做业务代码后置校验。
+    project_dir = result.get("project_name") or in_state["project_name"]
+    app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / project_dir
+    if not _has_java_code(app_path):
+        logger.warning(f"开发 Agent 未写 Java 代码，重试一次: {app_path}")
+        retry_text = (
+            f"你还没有写任何业务代码：{app_path / 'src' / 'main' / 'java' / 'com' / 'fm'} 下没有 .java 文件。"
+            "项目已经初始化，不要再次调用 initialize_project。请立即调用 write_big_data_app_code "
+            "写出完整、可编译的实现，然后调用 verify_big_data_app_code；不要只回复计划。"
+        )
+        retry_state = {
+            "messages": [*result.get("messages", []), HumanMessage(content=retry_text)],
+            "project_name": project_dir,
+            "is_repair": True,
+        }
+        result = await code_develop_agent.ainvoke(
+            cast("InputT", retry_state),
+            config={
+                "configurable": {"thread_id": runtime.context.thread_id},
+                "tags": ["agent:data_develop"],
+                "max_concurrency": 1,
+            },
+            context=cast(
+                "ContextT",
+                MainStateContext(thread_id=thread_id, user_id=user_id,
+                                 app_type=app_type, date=date),
+            ),
+        )
+        project_dir = result.get("project_name") or project_dir
+        app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / project_dir
+        if not _has_java_code(app_path):
+            return DevelopGraphErrorState(
+                from_="data_develop_agent",
+                thread_id=thread_id,
+                desc=(f"项目 {app_path} 下仍然没有业务 Java 代码；"
+                      f"开发 Agent 连续两次只初始化/未写代码，终止。"),
+                goto_="work_end",
+                original_task_list=task_list,
+            )
     # logger.info(f"大数据开发Agent的完整回复为：{result}")
     final_text = ""
     for message in reversed(result.get("messages", [])):
@@ -165,7 +219,7 @@ async def big_data_develop_code_agent(
         source='data_develop_agent',
         source_msg=final_text or content_text(result["messages"][-1].content),
         app_type=app_type,
-        project_name=result.get("project_name"),
+        project_name=project_dir,
         date=date,
         original_task_list=task_list,
         is_repair=state.get("is_repair", False),
@@ -181,6 +235,25 @@ async def big_data_develop_code_agent(
             "messages": [AIMessage(content=f"来自大数据开发Agent的回复：\n{final_text}", name="data_develop")],
         }
     return code_verify_in_state
+
+
+def _submit_registration_error(project_name: str | None, is_submit: bool) -> str:
+    """data_develop 的下一节点复查：注册了就必须是合法 app_name；提交任务必须有注册。"""
+    if not project_name:
+        return ""
+    try:
+        raw_name = redis_con.hget(f"DDA:{project_name}", "app_name")
+    except Exception as e:  # noqa: BLE001
+        return f"读取提交注册信息失败{type(e).__name__}: {e}"
+    if isinstance(raw_name, bytes):
+        raw_name = raw_name.decode("utf-8")
+    if raw_name:
+        error = validate_app_name(raw_name)
+        return f"注册的 app_name 不合法：{error}" if error else ""
+    if is_submit:
+        return ("没有找到提交注册信息（register_submit_command 未调用或失败）；"
+                "提交任务必须先注册合法的 app_name")
+    return ""
 
 
 def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState) -> Send:
@@ -200,8 +273,6 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
     project_name = state.get("project_name")
     date = state.get("date")
     app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / project_name
-    res_code, res_out = run_mvn_command("mvn clean compile", path=str(app_path))
-
     repair_num = state.get("repair_num", 1)
     if repair_num > 3:
         return Send(
@@ -214,6 +285,27 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
                 app_type="flink",
             )
         )
+
+    registration_error = _submit_registration_error(
+        project_name, bool(state.get("is_submit")),
+    )
+    if registration_error:
+        return Send(
+            "data_develop",
+            {
+                "project_name": project_name,
+                "date": date,
+                "app_type": app_type,
+                "error_msg": registration_error,
+                "task_list": state.get("original_task_list"),
+                "is_repair": True,
+                "repair_num": 1 if not state.get("repair_num") else state.get("repair_num") + 1,
+                "is_ops": state.get("is_ops", False),
+                "ops_handover": state.get("ops_handover"),
+            }
+        )
+
+    res_code, res_out = run_mvn_command("mvn clean compile", path=str(app_path))
     if res_code != 0:
         return Send(
             "data_develop",

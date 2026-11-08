@@ -4,6 +4,12 @@ Multi-Agent BigData Platform（多智能体大数据平台）
 
 **⚠️ 注意：本项目目前是 Demo 版本，功能可用但仍在持续完善。**
 
+## 系统化评测报告
+
+9 个用例、六维评分、逐例证据与限制说明：
+
+[system_eval_docs/system-eval-report-2026-11-08.md](system_eval_docs/system-eval-report-2026-11-08.md)
+
 ## 项目介绍
 
 ### 它是什么
@@ -32,9 +38,11 @@ Multi-Agent BigData Platform 是一个以 `Agent` 为主、`大数据` 为背景
 
 ## 架构与思想
 
-![项目架构图（手绘）](Multi-agent-BigData-Platform.drawio.png)
+![项目架构总图（手绘）](./imgs/Multi-agent-BigData-Platform-总图.drawio.png)
 
 ### 开发链路
+
+![对应的开发链路图（手绘）](./imgs/Multi-agent-BigData-Platform-主图.drawio.png)
 
 ```
 用户消息                              运维 Agent handover
@@ -52,6 +60,8 @@ Multi-Agent BigData Platform 是一个以 `Agent` 为主、`大数据` 为背景
 ```
 
 ### 运维链路
+
+![对应的运维链路图（手绘）](./imgs/Multi-agent-BigData-Platform-ops图.drawio.png)
 
 ```
 YARN 运行中的应用
@@ -102,7 +112,8 @@ YARN 运行中的应用
   时启用）：“错误列表”和“Agent 记录”两个 tab，实时事件通过 `/ops/ws/perception/error` 推送。
 - “历史”抽屉展示某个 `session_id` 的运维消息、工具调用和中断；`job_restart` 类中断可以直接在抽屉里改命令/通过/拒绝。
 - 如果这次运维把问题转交给了开发：抽屉底部会出现红边红字的“查看开发 Agent”按钮（颜色跟随主题：亮色暗红、暗色亮红）。
-  点击后**在同一个抽屉里**切换到开发会话（`ops:{session_id}`），消息、人工确认和 `resume` 都在这里完成；左上角“← 返回运维消息”回到运维内容。
+  点击后**在同一个抽屉里**切换到开发会话（`ops:{session_id}`），消息、人工确认和 `resume` 都在这里完成；左上角“←
+  返回运维消息”回到运维内容。
 - 开发视图通过 WS 的 `kind=handover` 事件刷新（started / paused / running / done / error），历史查看接口仍然保留。
 - WebSocket 换票走 `POST /ai/background/verify`，必须带 `source`（`main` / `ops`）：ops 功能未开启时 `source=ops` 会被直接拒绝，避免在
   Redis 里留下永远没人消费的 ticket。

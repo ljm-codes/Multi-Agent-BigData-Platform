@@ -134,6 +134,46 @@ def _release_lease(aid: str, sid: str):
         logger.error(f"兜底释放应用占用锁失败 {aid}: {type(e).__name__}: {e}")
 
 
+def resolve_pending_errors(aid: str, *, solved: bool, note: str = "") -> int:
+    """
+    把该 app 仍 PENDING/PROCESSING 的错误清账，防止同一错误每轮被重新入队、
+    worker 反复 lease 同一个 app。
+
+    solved=True  -> DONE + is_solved=True（修复/验证成功，或人工确认已解决）
+    solved=False -> ESCALATED + is_solved=False（保留可见，但不再自动入队）
+    """
+    status = "DONE" if solved else "ESCALATED"
+    # 成功时也把之前因重试失败而 ESCALATED 的行一起收口；失败时只动待处理行。
+    source_statuses = ("PENDING", "PROCESSING", "ESCALATED") if solved else ("PENDING", "PROCESSING")
+    try:
+        with SessionLocal() as session:
+            result = session.execute(
+                update(CheckLog).where(
+                    and_(
+                        CheckLog.app_id == aid,
+                        CheckLog.status.in_(source_statuses),
+                    )
+                ).values(
+                    status=status,
+                    is_solved=solved,
+                    update_time=func.now(),
+                )
+            )
+            session.commit()
+            count = int(result.rowcount or 0)
+        # 清掉 Redis 里可能已经排队的旧 app id，避免清账后又被一个空任务 lease 一次
+        try:
+            redis_con.zrem(key, aid)
+        except Exception:
+            pass
+        if count:
+            logger.info(f"应用 {aid} 的 {count} 条待处理错误已标记为 {status}；{note}")
+        return count
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"清理应用 {aid} 的待处理错误失败: {type(e).__name__}: {e}")
+        return 0
+
+
 def _start_agent_run(aid: str, sid: str, app_type: str, error_count: int):
     try:
         with SessionLocal() as session:
@@ -414,6 +454,17 @@ async def worker_handle(aid: str, sid: str):
                 repeat_count=error_info["repeat_count"],
             ))
 
+        if not error_list:
+            # 清账/ESCALATED 之后队列里可能还残留这个 app 的旧成员；直接跳过，
+            # 不要再跑一个没有错误的空图（C1 第二轮的 "无法处理结果返回的消息" 就是这种）。
+            logger.info(f"应用 {aid} 没有可处理的 PENDING 错误，跳过空任务")
+            try:
+                redis_con.zrem(key, aid)
+            except Exception:
+                pass
+            run_finished = True
+            return None
+
         await asyncio.to_thread(_start_agent_run, aid, sid, app_type, len(error_list))
         # 先按 code.app_file_idx 把源码准备到 tmp/target/...；没有索引或拉取失败都不阻塞图
         app_file_path = await asyncio.to_thread(_prepare_app_file, aid, app_type)
@@ -443,6 +494,9 @@ async def worker_handle(aid: str, sid: str):
             held = True
             logger.info(f"应用 {aid} 已转交开发: {handover_tid}")
         elif result.get("type", "") == "error":
+            await asyncio.to_thread(
+                resolve_pending_errors, aid, solved=False, note=f"ops error: {out_msg[:200]}"
+            )
             await asyncio.to_thread(_finish_agent_run, sid, "ERROR", "", out_msg)
             run_finished = True
             await asyncio.to_thread(
@@ -450,12 +504,31 @@ async def worker_handle(aid: str, sid: str):
                 description=f"程序运行出错了：{out_msg}",
                 error_id=None
             )
+        elif not str(out_msg or "").strip():
+            # 图结束但没有 summary/out_msg：不能判 DONE，否则错误一直 PENDING，
+            # 下一轮 worker 又会 lease 同一个 app。
+            await asyncio.to_thread(
+                resolve_pending_errors, aid, solved=False, note="empty out_msg"
+            )
+            await asyncio.to_thread(
+                _finish_agent_run, sid, "ERROR", "", "运维图结束但没有返回 out_msg"
+            )
+            run_finished = True
         else:
+            # app_summary 已经把 solve_error_ids 标 DONE；仍 PENDING 的（如 unsolvable）
+            # 标 ESCALATED，保留可见但不自动重试。
+            await asyncio.to_thread(
+                resolve_pending_errors, aid, solved=False, note="left PENDING after run"
+            )
             await asyncio.to_thread(_finish_agent_run, sid, "DONE", out_msg, "")
             run_finished = True
 
     except Exception as e:
         if not run_finished:
+            await asyncio.to_thread(
+                resolve_pending_errors, aid, solved=False,
+                note=f"worker exception: {type(e).__name__}: {e}",
+            )
             await asyncio.to_thread(_finish_agent_run, sid, "ERROR", "", f"{type(e).__name__}: {e}")
             run_finished = True
         logger.error(f"在尝试解决应用 {aid} 中的错误信息时出错 {type(e).__name__}: {e}")
@@ -463,6 +536,7 @@ async def worker_handle(aid: str, sid: str):
     finally:
         # 取消/强杀路径也要留一条可查记录；chat_end 正常跑过时会先删锁
         if not run_finished:
+            resolve_pending_errors(aid, solved=False, note="worker cancelled or terminated")
             _finish_agent_run(sid, "ABANDONED", "", "worker cancelled or terminated")
         # 转交开发期间不解锁：开发流程结束（成功/失败）时由 dev_handover 解锁
         if not paused and not held:

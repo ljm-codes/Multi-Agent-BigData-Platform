@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast, List, Literal
@@ -8,16 +9,16 @@ from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AI
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
-from langgraph.types import Command, Send, CachePolicy
+from langgraph.types import Command, Send
 from pydantic import BaseModel, Field
 
 from SPO.main_agent_state_model import DevelopAgentMainState, DevelopAgentOutputState, DevelopAgentInputState, \
     DevelopGraphErrorState, AgentDevelopInputState, WorkEndState, MainStateContext, CodeVerifyAgentInputState, \
-    agent_label
+    agent_label, content_text
 from Tasks.background_broker import background_registry
 from Tools.log_settings import LogSetting
 from Tools.struct_analy import parse_route_message
-from agent.code_verify_agent import verify_agent
+from agent.code_verify_agent import verify_agent, _repair_invalid_tool_calls
 from agent.data_analysis_agent import big_data_analysis_code_agent, preliminary_verify as preliminary_analysis_verify
 from agent.data_develop_agent import big_data_develop_code_agent, preliminary_verify
 from load_config.config import config, get_model_params
@@ -115,6 +116,17 @@ def develop_msg_handler(state: DevelopAgentInputState) -> DevelopAgentMainState:
         if handover := state.get("ops_handover"):
             update["ops_handover"] = handover
     return update
+
+
+def _wants_submit(text: str) -> bool:
+    """用户原话是否明确要求提交到集群；否定表达优先。"""
+    text = (text or "").lower()
+    if any(k in text for k in ("不要提交", "先不要提交", "不提交", "无需提交", "别提交")):
+        return False
+    return any(k in text for k in (
+        "提交到集群", "提交到 yarn", "提交到yarn", "提交集群",
+        "提交运行", "提交到集群运行", "部署上线",
+    ))
 
 
 def _last_human_text(state: DevelopAgentMainState) -> str:
@@ -231,6 +243,12 @@ async def dispatch_chat(state: DevelopAgentMainState, runtime: Runtime) -> List[
         model_ = dis_req.model.bind_tools(tools, tool_choice=tool_choice)
 
         dis_res = await model_.ainvoke(mags, config={"tags": ["agent:dis_chat"]})
+        # 和 CVA 一样：模型偶尔把 true/false/null 写成 Python 字面量，LangChain 放进
+        # invalid_tool_calls；先修复，不要直接结束整轮。
+        if isinstance(dis_res, AIMessage) and getattr(dis_res, "invalid_tool_calls", None):
+            repaired = _repair_invalid_tool_calls(dis_res)
+            if repaired is not None:
+                dis_res = repaired
         route = _parse_route_message(dis_res)
         if route is None:
             if isinstance(dis_res, AIMessage) and dis_res.tool_calls:
@@ -271,6 +289,45 @@ async def dispatch_chat(state: DevelopAgentMainState, runtime: Runtime) -> List[
     await run_after_model(dispatch_middleware, {**state, 'messages': dis_result.model_response.result}, runtime)
 
     return commands
+
+
+def _ver_submit_footer(messages: list[BaseMessage]) -> str:
+    """从当前用户轮次之后的 ver_end 消息里提取确定性的提交状态。"""
+    last_human = -1
+    for i, message in enumerate(messages):
+        if isinstance(message, HumanMessage):
+            last_human = i
+    for message in reversed(messages[last_human + 1:]):
+        if not isinstance(message, AIMessage):
+            continue
+        if not str(getattr(message, "name", "") or "").startswith("ver:"):
+            continue
+        text = content_text(message.content)
+        if "作业没有进行提交" in text:
+            return "提交状态：未提交（CVA 返回：作业没有进行提交）"
+        if "对于提交返回的结果" in text:
+            matched = re.search(
+                r"类型为\s*(info|warn|error)\s*[，,]\s*该类型的详细描述为：\s*(.*)",
+                text, re.S,
+            )
+            if matched:
+                submit_type, desc = matched.group(1), matched.group(2).strip()
+                if submit_type == "error":
+                    return f"提交状态：提交失败（{desc}）"
+                return f"提交状态：已提交（{desc}）"
+            return "提交状态：提交结果见上方 CVA 返回"
+    return ""
+
+
+def _append_submit_footer(text: str, messages: list[BaseMessage]) -> str:
+    footer = _ver_submit_footer(messages)
+    if not footer:
+        return text
+    conflict = footer.startswith("提交状态：未提交") and any(
+        keyword in text for keyword in ("已安排提交", "已提交", "提交成功")
+    )
+    prefix = "注意：正文与验证结果不一致，以下方提交状态为准。\n" if conflict else ""
+    return f"{prefix}{text.rstrip()}\n\n{footer}"
 
 
 def distribute_task_to_agent(state: DevelopAgentMainState, runtime: Runtime) -> List[Send] | Literal["tool"] | Send:
@@ -329,6 +386,8 @@ def distribute_task_to_agent(state: DevelopAgentMainState, runtime: Runtime) -> 
     send_info_list = send_info.get("send_info_list", [])
     to_user_msg = send_info.get("out_to_user", "")
     if to_user_msg:
+        # CVA 的 submit_desc 是事实；主模型不能自己编“已安排提交”
+        to_user_msg = _append_submit_footer(to_user_msg, state.get("messages", []))
         return Send(
             "work_end",
             WorkEndState(
@@ -339,6 +398,7 @@ def distribute_task_to_agent(state: DevelopAgentMainState, runtime: Runtime) -> 
             )
         )
     send_list = []
+    user_text = _last_human_text(state)
     send_info_dict = {send_i.get("send_to"): send_i for send_i in send_info_list}
     for send_info in list(send_info_dict.values()):
         send_to = send_info.get("send_to")
@@ -357,6 +417,12 @@ def distribute_task_to_agent(state: DevelopAgentMainState, runtime: Runtime) -> 
                 )
             )
         task_list = send_info.get("task_list", [])
+        submit_flag = bool(send_info.get("is_submit", False))
+        if not submit_flag and _wants_submit(user_text):
+            # 主模型偶尔忽略“提交到 YARN”的指令；这里做确定性兜底，
+            # 仍会经过 CVA 的提交确认，不会绕过人工。
+            submit_flag = True
+            logger.info("用户明确要求提交，自动将 is_submit 置 true")
         send_list.append(
             Send(
                 send_to,
@@ -365,7 +431,7 @@ def distribute_task_to_agent(state: DevelopAgentMainState, runtime: Runtime) -> 
                     task_list=task_list,
                     task_num=len(task_list),
                     app_type=app_type,
-                    is_submit=send_info.get("is_submit", False),
+                    is_submit=submit_flag,
                 ),
             )
         )
@@ -426,19 +492,11 @@ builder = StateGraph(
 
 builder.add_node("handler", cast("StateNode", develop_msg_handler))
 # 添加缓存策略，缓存2小时
-builder.add_node("dis_chat", cast("StateNode", dispatch_chat), cache_policy=CachePolicy(
-    ttl=2 * 60 * 60
-))
-builder.add_node("data_develop", cast("StateNode", big_data_develop_code_agent), cache_policy=CachePolicy(
-    ttl=2 * 60 * 60
-))
-builder.add_node("data_analysis", cast("StateNode", big_data_analysis_code_agent), cache_policy=CachePolicy(
-    ttl=2 * 60 * 60
-))
+builder.add_node("dis_chat", cast("StateNode", dispatch_chat))
+builder.add_node("data_develop", cast("StateNode", big_data_develop_code_agent))
+builder.add_node("data_analysis", cast("StateNode", big_data_analysis_code_agent))
 # 直接挂编译好的 CVA 子图：子图里的 Command(graph=PARENT) / interrupt 才会生效
-builder.add_node("code_verify", cast("StateNode", verify_agent), cache_policy=CachePolicy(
-    ttl=2 * 60 * 60
-))
+builder.add_node("code_verify", cast("StateNode", verify_agent))
 builder.add_node("work_end", cast("StateNode", work_end))
 
 builder.add_edge(START, "handler")

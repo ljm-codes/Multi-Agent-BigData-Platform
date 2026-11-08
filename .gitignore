@@ -56,3 +56,13 @@ Maven/mcp/maven_mcp_source_code.js
 # Docker 部署用离线安装包（构建时可选，不入库）
 docker/cluster/vendor/*.tar.gz
 docker/cluster/vendor/*.tgz
+
+# 系统化评测报告（与 metrics 分开，数据只留在本地）
+tests/system_eval_data
+
+# 评测 fixture 的 Maven 构建产物
+tests/system_eval/fixtures/*/target/
+
+# 本地 Spark/Hive 测试产生的 Derby 元数据
+derby.log
+metastore_db/

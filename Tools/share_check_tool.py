@@ -156,6 +156,14 @@ def get_flink_rest_base(app_id: str) -> str:
     return f"{proxy}/proxy/{app_id}"
 
 
+def _flink_jobs(app_id: str) -> List[Dict[str, Any]]:
+    """取 /jobs/overview 的工作列表；应用结束时代理可能返回空/HTML，按无数据处理。"""
+    overview_info = request_get(f"{get_flink_rest_base(app_id)}/jobs/overview")
+    if not overview_info:
+        return []
+    return [job for job in overview_info.get("jobs", []) if job.get("jid")]
+
+
 def get_running_flink_job_ids(app_id: str) -> List[str]:
     """
     取该 Flink 应用中正在运行的工作 ID 列表, 并清理已结束工作的水位线记录
@@ -163,19 +171,31 @@ def get_running_flink_job_ids(app_id: str) -> List[str]:
     原实现走 {flink_manager}/applications/{app_id} 再自行过滤, 现改用 /jobs/overview:
     它直接带 state 字段, 一个请求即可, 也省去了与 /jobs/overview 的二次比对。
     """
-    overview_info = request_get(f"{get_flink_rest_base(app_id)}/jobs/overview")
-    if not overview_info:
-        return []
-    jobs = overview_info.get("jobs", [])
+    jobs = _flink_jobs(app_id)
     running_job_ids = [
         job.get("jid", "") for job in jobs
-        if job.get("jid", "") and job.get("state", "") == "RUNNING"
+        if job.get("state", "") == "RUNNING"
     ]
     # 不论成功还是失败, 但凡不是正在运行的工作都清理, 避免水位线记录只增不减
-    all_job_ids = {job.get("jid", "") for job in jobs if job.get("jid", "")}
+    all_job_ids = {job.get("jid", "") for job in jobs}
     for finished_job_id in all_job_ids - set(running_job_ids):
         redis_con.delete(f"watermarks:{finished_job_id}")
     return running_job_ids
+
+
+def get_active_flink_job_ids(app_id: str) -> List[str]:
+    """
+    取所有尚未终结的 Flink job（RUNNING / RESTARTING / FAILED / RECONCILING 等）。
+
+    check_flink_other_abnormal 必须用这个集合：作业抛出 NumberFormatException 后
+    会进入 RESTARTING，/jobs/overview 里 state != RUNNING；只扫 RUNNING 会完全漏检。
+    FINISHED / CANCELED 的 job 不再看。
+    """
+    terminal = {"FINISHED", "CANCELED", "CANCELLED"}
+    return [
+        job.get("jid", "") for job in _flink_jobs(app_id)
+        if job.get("state", "") not in terminal
+    ]
 
 
 def pick_stage_info(stage_infos: Any) -> Any:

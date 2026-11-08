@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import JsonView from '@/components/JsonView.vue'
+import MarkdownText from '@/components/MarkdownText.vue'
 import JobRestartReview from '@/components/JobRestartReview.vue'
 import InterruptPanel from '@/components/InterruptPanel.vue'
 import {
@@ -144,6 +145,12 @@ function liveDesc(item) {
   else if (meta.check_data) text = JSON.stringify(meta.check_data)
   if (text.length > 180) text = `${text.slice(0, 180)}…`
   return text || '收到一条新的错误通知'
+}
+
+function isMarkdownMessage(message) {
+  // AI/Human 的正文是 Markdown；ToolMessage/JSON 仍走 JsonView 或 pre
+  const type = String(message?.type || '')
+  return type.includes('AI') || type.includes('Human')
 }
 
 function parseJson(value) {
@@ -852,7 +859,7 @@ onBeforeUnmount(() => {
           <p v-if="devLoading" class="muted">加载中…</p>
           <p v-else-if="devError" class="error">{{ devError }}</p>
           <template v-else-if="devData">
-            <p v-if="devData.output_msg" class="out-msg">{{ devData.output_msg }}</p>
+            <MarkdownText v-if="devData.output_msg" class="out-msg" :text="String(devData.output_msg)" />
             <div v-if="!devData.messages.length" class="muted">没有消息</div>
             <div class="messages">
               <article
@@ -864,8 +871,12 @@ onBeforeUnmount(() => {
                   <strong>{{ message.type }}</strong>
                   <span v-if="message.name" class="muted">{{ message.name }}</span>
                 </div>
+                <MarkdownText
+                  v-if="isMarkdownMessage(message) && typeof message.content === 'string' && !parseJson(message.content)"
+                  :text="message.content"
+                />
                 <JsonView
-                  v-if="parseJson(message.content)"
+                  v-else-if="parseJson(message.content)"
                   :data="parseJson(message.content)"
                 />
                 <pre v-else-if="message.content">{{ typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2) }}</pre>
@@ -890,7 +901,7 @@ onBeforeUnmount(() => {
           <p v-if="historyLoading" class="muted">加载中…</p>
           <p v-else-if="historyError" class="error">{{ historyError }}</p>
           <template v-else-if="historyData">
-            <p v-if="historyData.out_msg" class="out-msg">{{ historyData.out_msg }}</p>
+            <MarkdownText v-if="historyData.out_msg" class="out-msg" :text="String(historyData.out_msg)" />
             <p v-if="historyData.error_desc_text" class="error">{{ historyData.error_desc_text }}</p>
             <p v-if="reviewNotice" class="bar notice">{{ reviewNotice }}</p>
             <JobRestartReview
@@ -914,8 +925,12 @@ onBeforeUnmount(() => {
                   <strong>{{ message.type }}</strong>
                   <span v-if="message.name" class="muted">{{ message.name }}</span>
                 </div>
+                <MarkdownText
+                  v-if="isMarkdownMessage(message) && typeof message.content === 'string' && !parseJson(message.content)"
+                  :text="message.content"
+                />
                 <JsonView
-                  v-if="parseJson(message.content)"
+                  v-else-if="parseJson(message.content)"
                   :data="parseJson(message.content)"
                 />
                 <pre v-else-if="message.content">{{ typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2) }}</pre>

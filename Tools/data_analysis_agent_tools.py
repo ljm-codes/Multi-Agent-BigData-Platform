@@ -19,6 +19,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
 
+from Tools.app_name import validate_app_name
 from Tools.log_settings import LogSetting
 from Tools.code_analysis import PyAnalyzer, find_definition, find_module_path
 from Tools.registry import register_tool
@@ -832,12 +833,10 @@ def register_submit_command(
     project_path = _project_path(runtime)
     if project_path is None:
         return "项目未初始化，请先调用工具 initialize_project 进行初始化"
+    app_name_error = validate_app_name(app_name)
+    if app_name_error:
+        return app_name_error
     app_name = (app_name or "").strip()
-    if not app_name:
-        return "app_name 不能为空"
-    # app_name 会同时用作 HDFS 目录名和 cmd 文件名，不能带路径分隔符/控制字符
-    if app_name in (".", "..") or "/" in app_name or "\\" in app_name or any(ord(ch) < 32 for ch in app_name):
-        return "app_name 不能包含路径分隔符、控制字符，也不能是 . 或 .."
     main_path = _app_file(project_path, main_file)
     if isinstance(main_path, str):
         return main_path

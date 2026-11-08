@@ -10,8 +10,8 @@ import time
 from datetime import datetime, timezone
 
 from SPO.check_result import CheckResult, FlinkOtherAbnormalInfo
-from Tools.share_check_tool import (get_all_running_apps, get_flink_rest_base,
-                                    get_running_flink_job_ids, is_flink_app,
+from Tools.share_check_tool import (get_active_flink_job_ids, get_all_running_apps,
+                                    get_flink_rest_base, is_flink_app,
                                     request_get, poll_interval)
 
 # 每条规则包含: 描述、异常类名正则、堆栈文本正则
@@ -132,7 +132,9 @@ def check_flink_other_abnormal(app_id: str):
     检查 Flink 应用的其它异常情况
     """
     base = get_flink_rest_base(app_id)
-    jobs_list = get_running_flink_job_ids(app_id)
+    # 必须包含 RESTARTING/FAILED：作业在异常后重启期间不是 RUNNING，
+    # 只扫 RUNNING 会让 number format 这类异常完全漏检。
+    jobs_list = get_active_flink_job_ids(app_id)
     if not jobs_list:
         return None
     other_error_list = []

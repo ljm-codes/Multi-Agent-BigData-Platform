@@ -511,6 +511,10 @@ async function send() {
           bubble.status = data.text
           scrollToBottom()
         },
+        onVerification: (data) => {
+          // CVA 的 token 不在根图 messages 流里；后端推 verification 进度事件
+          if (data?.record) verification.value = data.record
+        },
         onToken: (data) => {
           if (!data?.content) return
           // 旧后端会把 handler 回传的 HumanMessage 当成 token 发出来

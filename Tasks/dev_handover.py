@@ -23,7 +23,8 @@ from Tasks.background_broker import background_broker
 from Tools.db import SessionLocal
 from Tools.log_settings import LogSetting
 from Tools.ws_registry import send_json_to_all
-from agent.operations_agent_run import _finish_agent_run, _release_lease
+from agent.operations_agent_run import (_finish_agent_run, _release_lease,
+                                         resolve_pending_errors)
 from load_config.config import ROOT_BASE_DIR_PATH
 
 logger = LogSetting.create(__name__)
@@ -125,6 +126,12 @@ def _finish_ops_run(session_id: str, status: str, out_msg: str, error: str) -> N
     _finish_agent_run(session_id, status, out_msg, error)
     aid = _run_app_id(session_id)
     if aid:
+        # 开发流程成功 = 该 app 的错误已被修复/验证，标 DONE；失败标 ESCALATED。
+        # 否则 checker 行仍是 PENDING，下一轮 worker 会再次 handover 同一个 app。
+        resolve_pending_errors(
+            aid, solved=(status == "DONE"),
+            note=f"dev_handover {status}: {(out_msg or error)[:200]}",
+        )
         _release_lease(aid, session_id)
 
 

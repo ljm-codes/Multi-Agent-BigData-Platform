@@ -22,6 +22,7 @@ from langgraph.types import Command
 from langgraph.prebuilt import ToolRuntime
 from lxml import etree
 
+from Tools.app_name import validate_app_name
 from Tools.jar.parse_jar import check_jar_class, check_java_api_roughly_info, check_java_code
 from Tools.log_settings import LogSetting
 from Tools.registry import register_tool
@@ -980,6 +981,13 @@ def register_submit_command(
     # 同样，以 p_name 为 key, "date" 为 field, 存储当前日期
     if parallelism <= 0:
         return f"并行度必须大于0，当前值为{parallelism}"
+    app_name_error = validate_app_name(app_name)
+    if app_name_error:
+        return app_name_error
+    if ynm:
+        ynm_error = validate_app_name(ynm)
+        if ynm_error:
+            return f"ynm（YARN 应用名）不合法：{ynm_error}"
     app_type = runtime.context.app_type
     p_name = runtime.state.get("project_name")
     date = runtime.context.date
