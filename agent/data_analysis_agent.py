@@ -101,7 +101,7 @@ async def big_data_analysis_code_agent(
     code_analysis_agent = create_agent(
         model=data_analysis_model,
         tools=data_analysis_tools,
-        middleware=[ToolTraceMiddleware("data_analysis")],
+        middleware=cast("AgentMiddleware", [ToolTraceMiddleware("data_analysis")]),
         system_prompt=_analysis_system_prompt,
         context_schema=cast("ContextT", MainStateContext),
         state_schema=cast("StateT", CodeAnalysisState),

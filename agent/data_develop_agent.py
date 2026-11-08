@@ -127,7 +127,7 @@ async def big_data_develop_code_agent(
     code_develop_agent = create_agent(
         model=code_develop_model,
         tools=[*maven_tool, *data_develop_tools],
-        middleware=[ToolTraceMiddleware("data_develop")],
+        middleware=cast("AgentMiddleware", [ToolTraceMiddleware("data_develop")]),
         system_prompt=_code_develop_system_prompt,
         context_schema=cast("ContextT", MainStateContext),
         state_schema=cast("StateT", CodeDevelopState),

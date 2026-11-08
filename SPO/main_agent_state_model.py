@@ -229,3 +229,4 @@ class WorkEndState(TypedDict):
     thread_action: NotRequired[Literal["continue", "new_task"]]
     thread_title: NotRequired[str]
     request_text: NotRequired[str]
+    verification: NotRequired[Any]
