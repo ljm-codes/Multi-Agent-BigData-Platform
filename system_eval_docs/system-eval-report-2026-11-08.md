@@ -254,11 +254,11 @@ xychart-beta
 | CVA 结果可见性 | 解析 `target/surefire-reports/TEST-*.xml`，把 `class#method + message` 交给 CVA，不再只看到 Maven 尾部 |
 | CVA 测试闸门  | Flink `mvn test-compile`；Spark 语法 + `pytest --collect-only`；编译/收集失败不进入测试                 |
 | CVA 测试管理  | `verify_test_code`、`list_test_files`、`delete_test_code`；不再每次写测试都自动编译                     |
-| 应用名校验     | 注册工具校验 `/ \ : * ? " < >                                                                  |` 等路径/文件名字符；data_develop/data_analysis 的下一跳再次校验；提交节点保留最后防线 |
+| 应用名校验     | 注册工具校验路径分隔符、Windows 非法字符等；data_develop/data_analysis 的下一跳再次校验；提交节点保留最后防线 |
 | 深层失败重试    | 深层失败且测试文件确实改过时，允许最多 1 次重试；重试直接进 `ver_deep_exec`，不再走人工确认                                  |
 | 工具调用历史    | `ToolCallHistoryGuard` 补齐缺失 ToolMessage；`max_concurrency=1` 串行 Send 工具任务                 |
 | 评测工具      | Kafka connector 精确检测并复制 kafka-clients 3.4.0；producer 在应用 RUNNING 后再发数据                   |
-| 诊断锚点      | eval server 下可写 `anchors/`（Maven 原文、surefire 原文、CVA 输入/模型输出、dispatch）；正常 `run.py` 不启用    |
+| 诊断锚点      | 临时锚点已移除；历史数据仍保留在本地 `tests/system_eval_data/`（gitignore），不进入产品代码 |
 
 ---
 
@@ -288,6 +288,6 @@ xychart-beta
 - 本轮关键目录：
     - `eval_final_B2B3/cases/B2/`、`eval_final_B2B3/cases/B3/`
     - `eval_c3_full/cases/C3/`
-    - `eval_anchor_B2/anchors/`（工具调用与 surefire 原始锚点）
+    - `eval_anchor_B2/`（历史诊断数据，位于本地 gitignore 目录）
 - 报告生成时间：2026-11-08
 - 说明：本报告不修改任何测试数据；所有分数来自对应 run 的 `rubric.json`。

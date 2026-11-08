@@ -90,51 +90,6 @@ SPARK_TEST_MASTER = (_daa_conf.get("spark_test_master") or "local[*]").strip()
 PYTEST_XML_DIR = ROOT_BASE_DIR_PATH / "tmp" / "pytest"
 logger = LogSetting.create(__name__)
 
-# 临时诊断锚点：只有 eval server 设置了 CVA_ANCHOR_DIR 才写文件；
-# 正常 run.py 不设这个环境变量，完全无副作用。分析完可整体删除。
-_ANCHOR_DIR = os.getenv("CVA_ANCHOR_DIR")
-
-
-def _anchor(name: str, **payload: Any) -> None:
-    if not _ANCHOR_DIR:
-        return
-    try:
-        anchor_dir = Path(_ANCHOR_DIR)
-        anchor_dir.mkdir(parents=True, exist_ok=True)
-        record = {"ts": datetime.now(timezone.utc).isoformat(), **payload}
-        with (anchor_dir / f"{name}.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except Exception:  # noqa: BLE001
-        logger.exception("写入诊断锚点失败")
-
-
-def _anchor_file(name: str, content: str, suffix: str = ".log") -> str:
-    if not _ANCHOR_DIR:
-        return ""
-    try:
-        anchor_dir = Path(_ANCHOR_DIR)
-        anchor_dir.mkdir(parents=True, exist_ok=True)
-        path = anchor_dir / f"{name}{suffix}"
-        path.write_text(content, encoding="utf-8")
-        return str(path)
-    except Exception:  # noqa: BLE001
-        logger.exception("写入诊断锚点文件失败")
-        return ""
-
-
-def _messages_payload(messages: Any) -> list[dict[str, Any]]:
-    payload: list[dict[str, Any]] = []
-    for message in messages or []:
-        payload.append({
-            "type": type(message).__name__,
-            "name": getattr(message, "name", None),
-            "content": getattr(message, "content", ""),
-            "tool_calls": getattr(message, "tool_calls", None),
-            "invalid_tool_calls": getattr(message, "invalid_tool_calls", None),
-            "additional_kwargs": getattr(message, "additional_kwargs", None),
-        })
-    return payload
-
 with open(Path(__file__).parent / "prompt" / "code_verify_agent.md", "r", encoding="utf-8") as f:
     _verify_system_prompt = f.read()
 
@@ -470,9 +425,6 @@ async def _flink_test_compile_gate(
     if buffer:
         buffer.append(output)
     returncode = res.get("returncode")
-    if _ANCHOR_DIR:
-        _anchor("test_compile", command=command, returncode=returncode,
-                output_path=_anchor_file(f"test-compile-{uuid.uuid4().hex}", output))
     if returncode == 0:
         return None
     area = _compile_error_area(output)
@@ -514,26 +466,6 @@ async def _run_flink_test_command(
             buffer.append(output)
         tests = _collect_surefire_results(app_path, started)
         returncode = res.get("returncode")
-        if _ANCHOR_DIR:
-            anchor_id = f"mvn-{uuid.uuid4().hex}"
-            output_path = _anchor_file(anchor_id, output)
-            surefire_dir = Path(_ANCHOR_DIR) / f"{anchor_id}-surefire"
-            surefire_files: list[str] = []
-            report_dir = app_path / "target" / "surefire-reports"
-            if report_dir.is_dir():
-                surefire_dir.mkdir(parents=True, exist_ok=True)
-                for xml_path in sorted(report_dir.glob("TEST-*.xml")):
-                    try:
-                        if xml_path.stat().st_mtime < started - 1.0:
-                            continue
-                        shutil.copy2(xml_path, surefire_dir / xml_path.name)
-                        surefire_files.append(xml_path.name)
-                    except OSError:
-                        continue
-            _anchor("mvn_test", command=command, returncode=returncode,
-                    output_path=output_path, output_chars=len(output),
-                    surefire_dir=str(surefire_dir), surefire_files=surefire_files,
-                    tests=tests)
         failed = [t for t in tests if t.get("status") in ("failed", "error")]
         if tests:
             # 平铺成“一条测试一个结果”：VerificationReporter/build_stage_metrics 按条计数，
@@ -1045,9 +977,6 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     command_list.append(f"hdfs://{target_dir}/{jar_file.name}")
     command_list += app_args
     complete_command = shlex.join(command_list)
-    _anchor("submit_flink", app_path=str(app_path), jar=str(jar_file),
-            jar_name=jar_file.name, app_name=yarn_app_name,
-            command=complete_command)
     # 本地留一份 cmd，再按集群开关决定是否上传
     cmd_local = Path(app_path) / f"{yarn_app_name}.cmd"
     cmd_local.write_text(complete_command, encoding="utf-8")
@@ -1418,20 +1347,6 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
         else:
             content = f"{dres.message}, 具体的错误为：{dres.error}"
         result_msg = [AIMessage(content=content, name="deep_command:result")]
-    if _ANCHOR_DIR:
-        _anchor(
-            "cva_result_to_model",
-            status=state.get("status"),
-            result_msg=[getattr(m, "content", "") for m in result_msg],
-            shallow_status=getattr(state.get("shallow_result"), "status", None),
-            deep_status=getattr(state.get("deep_result"), "status", None),
-            messages_path=_anchor_file(
-                f"cva-messages-{uuid.uuid4().hex}",
-                json.dumps(_messages_payload(state.get("messages")),
-                           ensure_ascii=False, default=str),
-                ".json",
-            ),
-        )
 
     verify_request = ModelRequest(
         model=_verify_model,
@@ -1472,12 +1387,6 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
             ))
             ver_res = await _invoke([*mags, retry_msg])
             ver_out = _parse_verify_agent_message(ver_res)
-        if _ANCHOR_DIR:
-            _anchor("cva_model_output", status=state.get("status"),
-                    parsed=ver_out is not None,
-                    content=getattr(ver_res, "content", ""),
-                    tool_calls=getattr(ver_res, "tool_calls", None),
-                    invalid_tool_calls=getattr(ver_res, "invalid_tool_calls", None))
         if ver_out is None:
             # 调用工具时
             if isinstance(ver_res, AIMessage) and ver_res.tool_calls:
@@ -1506,7 +1415,6 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
             return ModelResponse(result=[AIMessage(
                 content="", additional_kwargs={"execute": fallback_execute})])
         execute_dict = ver_out.model_dump()
-        _anchor("cva_execute", status=state.get("status"), execute=execute_dict)
         out_ai_msg = AIMessage(
             content="",
             additional_kwargs={
@@ -1709,11 +1617,6 @@ def _verify_msg_dispatch(state: CodeVerifyAgentMainState, runtime: Runtime) -> S
     first_timeout = execute_info.get("first_timeout") or 300
     hard_timeout = execute_info.get("hard_timeout") or 600
     goto = execute_info.get("goto")
-    if _ANCHOR_DIR:
-        _anchor("dispatch", status=state.get("status"), goto=goto,
-                deep_retry_num=state.get("deep_retry_num"),
-                deep_test_signature=state.get("deep_test_signature"),
-                flink_command=flink_command, spark_command=spark_command)
 
     # CVA 自己解析失败时状态可能还是 preliminary/shallow；不能走 ver_warn 死循环，
     # 必须直接把“【CVA 异常】...”作为 end_chat 交给 ver_end -> dis_chat。
@@ -1939,9 +1842,6 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
     shallow_timeout = state.get("shallow_timeout") or 300
     if shallow_timeout > 300:
         shallow_timeout = 300
-    if _ANCHOR_DIR:
-        _anchor("shallow_start", app_type=app_type,
-                commands=state.get("shallow_commands"), timeout=shallow_timeout)
 
     if app_type == "flink":
         flink_shallow_test_commands = state.get("shallow_commands", [])
@@ -1975,7 +1875,6 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
             buf,
         )
         shallow_metrics = reporter.finish(final_result)
-        _anchor("shallow_result", status=final_result.status, result=final_result.result)
         update_state = {
             "shallow_result": final_result,
             "shallow_metrics": shallow_metrics,
@@ -2022,7 +1921,6 @@ async def _verify_shallow_execute(state: CodeVerifyAgentMainState, runtime: Runt
             buf,
         )
         shallow_metrics = reporter.finish(final_result)
-        _anchor("shallow_result", status=final_result.status, result=final_result.result)
         update_state = {
             "shallow_result": final_result,
             "shallow_metrics": shallow_metrics,
@@ -2164,9 +2062,6 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
         shallow_timeout = 300
     if deep_timeout < shallow_timeout:
         shallow_timeout = deep_timeout / 2
-    if _ANCHOR_DIR:
-        _anchor("deep_start", app_type=app_type, commands=state.get("deep_commands"),
-                timeout=deep_timeout, retry_num=state.get("deep_retry_num"))
     if app_type == "flink":
         deep_commands = state.get("deep_commands", [])
         app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
@@ -2206,7 +2101,6 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             buf,
         )
         deep_metrics = reporter.finish(final_result)
-        _anchor("deep_result", status=final_result.status, result=final_result.result)
         update_state = {
             "deep_result": final_result,
             "deep_metrics": deep_metrics,
@@ -2276,7 +2170,6 @@ async def _verify_deep_execute(state: CodeVerifyAgentMainState, runtime: Runtime
             buf,
         )
         deep_metrics = reporter.finish(final_result)
-        _anchor("deep_result", status=final_result.status, result=final_result.result)
         update_state = {
             "deep_result": final_result,
             "deep_metrics": deep_metrics,

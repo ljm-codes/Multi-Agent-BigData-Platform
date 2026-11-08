@@ -10,10 +10,6 @@ tool_call_id 的 ToolMessage。工具被取消/异常/没有进入 ToolNode 时�
 """
 from __future__ import annotations
 
-import json
-import os
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -77,21 +73,6 @@ def _record_missing(agent: str, thread_id: str, missing: list[tuple[str, str]]) 
         "工具调用历史缺 ToolMessage agent=%s thread=%s missing=%s",
         agent, thread_id, missing,
     )
-    anchor_dir = os.getenv("CVA_ANCHOR_DIR")
-    if not anchor_dir:
-        return
-    try:
-        path = Path(anchor_dir) / "tool_call_guard.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "agent": agent,
-                "thread_id": thread_id,
-                "missing": [{"tool_call_id": cid, "tool": name} for cid, name in missing],
-            }, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001
-        logger.exception("记录工具调用守卫锚点失败")
 
 
 class ToolCallHistoryGuard(AgentMiddleware):

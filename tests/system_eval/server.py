@@ -152,10 +152,6 @@ def main() -> int:
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     _alerts_path = data_dir / "alerts.jsonl"
-    # 临时诊断锚点：只在 eval server 进程里生效，正常 run.py 不受影响
-    anchor_dir = data_dir / "anchors"
-    anchor_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["CVA_ANCHOR_DIR"] = str(anchor_dir)
 
     _patch_alerts_before_import()
     import run  # noqa: E402  —— 必须在事件循环策略与告警 patch 之后
