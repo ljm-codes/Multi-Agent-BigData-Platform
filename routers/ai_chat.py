@@ -12,7 +12,7 @@ import jwt
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, Body
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, false, true, delete, update, func
