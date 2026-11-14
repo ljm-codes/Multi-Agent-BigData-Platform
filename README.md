@@ -124,7 +124,7 @@ YARN 运行中的应用
 |-------|------------------------------------------------------------------------|
 | Web   | FastAPI 0.135 + Uvicorn 0.42                                           |
 | Agent | LangGraph 1.2（StateGraph / interrupt / checkpointer / store）           |
-| 模型    | DeepSeek（`deepseek-flash`），支持 thinking 模式                              |
+| 模型    | 任意支持`init_chat_model`的模型（如DeepSeek，`deepseek-flash`），支持 thinking 模式    |
 | 数据    | PostgreSQL（会话状态 + 业务表）、Redis（JWT 密钥、运维队列）                              |
 | 集群    | YARN REST、Flink REST、HDFS WebHDFS、节点侧 SSH                              |
 | 前端    | Vue 3 + Vite 6 + Pinia + vue-router + markdown-it + Mermaid            |
@@ -269,6 +269,7 @@ python scripts/mock_backend.py   # 假后端，127.0.0.1:8010
 | POST     | `/ai/chat/stream`                | 流式对话（SSE）                                  |
 | POST     | `/ai/chat`                       | 非流式对话                                      |
 | POST     | `/ai/resume`                     | 回复 interrupt                               |
+| POST     | `/ai/resume/stream`              | 流式回复 interrupt（SSE）                        |
 | GET      | `/ai/threads`                    | 会话列表                                       |
 | GET      | `/ai/history`                    | 会话历史                                       |
 | PUT      | `/ai/thread/change`、`/top`       | 重命名 / 置顶                                   |
