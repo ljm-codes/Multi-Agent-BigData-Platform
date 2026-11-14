@@ -9,6 +9,8 @@ const props = defineProps({
   archived: { type: Boolean, default: false },
   selectable: { type: Boolean, default: false },
   selected: { type: Boolean, default: false },
+  running: { type: Boolean, default: false },
+  projectName: { type: String, default: '' },
 })
 
 const emit = defineEmits(['select', 'rename', 'pin', 'archive', 'remove', 'toggle'])
@@ -79,8 +81,14 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick))
       @keydown.esc.prevent="cancelRename"
       @blur="commitRename"
     />
-    <span v-else class="title">
-      <span v-if="pinned" class="pin">★</span>{{ title }}
+    <span v-else class="title-wrap">
+      <span class="title">
+        <span v-if="running" class="run-dot"></span>
+        <span v-if="pinned" class="pin">★</span>{{ title }}
+      </span>
+      <span v-if="running" class="run-sub" :title="projectName || '运行中'">
+        {{ projectName ? `运行中 · ${projectName}` : '运行中' }}
+      </span>
     </span>
 
     <button v-if="!selectable && !editing" class="more" title="更多" @click.stop="open = !open">
@@ -130,12 +138,50 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick))
   border-color: var(--primary);
 }
 
-.title {
+.title-wrap {
+  display: flex;
   flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.title {
+  display: block;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+
+.run-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  vertical-align: middle;
+  background: var(--primary);
+  border-radius: 50%;
+  animation: run-pulse 1.2s ease-in-out infinite;
+}
+
+.run-sub {
+  overflow: hidden;
+  font-size: 10.5px;
+  color: var(--primary);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+@keyframes run-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
 .pin {
   margin-right: 4px;
   color: var(--primary);

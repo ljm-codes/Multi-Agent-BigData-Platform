@@ -4,6 +4,7 @@ import { renderMarkdownLite } from '@/utils/text'
 import { renderMermaid } from '@/utils/mermaid'
 import InterruptPanel from '@/components/InterruptPanel.vue'
 import ToolTracePanel from '@/components/ToolTracePanel.vue'
+import UsageChip from '@/components/UsageChip.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -11,6 +12,8 @@ const props = defineProps({
   readOnly: { type: Boolean, default: false },
   interrupt: { type: Object, default: null },
   elapsed: { type: Number, default: 0 },
+  // 本轮开始时间；0 表示历史加载，不按时间过滤
+  turnStartedAt: { type: Number, default: 0 },
 })
 
 const emit = defineEmits(['open-ide', 'submit'])
@@ -43,6 +46,13 @@ function scrollToBottom() {
   if (el) el.scrollTop = el.scrollHeight
 }
 
+/** 流式/轮询刷新时，只有用户本来就贴着底部才自动跟随；翻历史时不打断 */
+function isNearBottom(threshold = 120) {
+  const el = root.value
+  if (!el) return true
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold
+}
+
 function jumpTo(index) {
   const el = root.value?.querySelector(`[data-index="${index}"]`)
   if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -58,7 +68,7 @@ function hideTip() {
   hovered.value = null
 }
 
-defineExpose({ scrollToBottom, jumpTo })
+defineExpose({ scrollToBottom, jumpTo, isNearBottom })
 
 function onClick(event) {
   const target = event.target
@@ -75,9 +85,18 @@ function assistantHtml(message) {
   return renderMarkdownLite(message.content)
 }
 
+/** 只取本轮开始后的工具轨迹，避免上一轮的工具挂到这一轮的新气泡上 */
 function tracesForAgent(agent) {
   if (!agent) return []
-  return props.toolTraces.filter((trace) => trace.agent === agent)
+  const cutoff = Number(props.turnStartedAt) || 0
+  return props.toolTraces.filter((trace) => {
+    if (trace.agent !== agent) return false
+    if (!cutoff) return true
+    // 按工具开始时间归属：上一轮启动、这一轮才结束的工具仍算上一轮
+    const ts = Date.parse(trace.started_at || trace.finished_at || '')
+    // 时间缺失时不隐藏；留 5 秒容忍客户端/服务端的小幅时钟差
+    return !Number.isFinite(ts) || ts >= cutoff - 5000
+  })
 }
 
 function isLastAgentMessage(index) {
@@ -130,6 +149,11 @@ function preview(text, size = 10) {
             <span v-if="message.streaming && message.content" class="caret"></span>
           </div>
 
+          <!-- 每个 Agent 完成时后端会单独推 usage；最终 done 再覆盖一次 -->
+          <div v-if="message.usage" class="bubble-foot">
+            <UsageChip :usage="message.usage" variant="bubble" />
+          </div>
+
           <details v-if="message.tools && message.tools.length" class="tools">
             <summary>工具调用结果 · {{ message.tools.length }} 条</summary>
             <pre v-for="(tool, toolIndex) in message.tools" :key="toolIndex">{{ tool }}</pre>
@@ -142,7 +166,7 @@ function preview(text, size = 10) {
       </div>
 
       <InterruptPanel
-        v-if="interrupt"
+        v-if="interrupt && interrupt.kind !== 'inquiry'"
         :interrupt="interrupt"
         @submit="emit('submit', $event)"
         @open-ide="emit('open-ide', $event)"
@@ -227,6 +251,12 @@ function preview(text, size = 10) {
   font-weight: 600;
   color: var(--text-muted);
   letter-spacing: 0.02em;
+}
+.bubble-foot {
+  display: flex;
+  align-items: center;
+  padding: 0 2px;
+  margin-top: -2px;
 }
 
 .tools {

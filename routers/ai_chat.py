@@ -22,9 +22,17 @@ from SPO.main_agent_state_model import MainStateContext, content_text
 from SPO.postgresql_model import AdminThread
 from SPO.route_results import RouteResponse, ResultCode
 from Tasks.background_broker import background_broker, background_registry
+from Tasks.project_registry import admin_id_of, project_registry
 from Tasks.verification_registry import verification_registry
 from Tools.log_settings import LogSetting
 from Tools.tool_trace_store import tool_trace_store
+from Tools.usage_metrics import (
+    merge_usage,
+    normalize_usage,
+    usage_by_turns,
+    usage_from_messages,
+    usage_since_last_human,
+)
 from Tools.db import AsyncSessionLocal
 from Tools.share_check_tool import redis_con
 from Tools.ws_registry import register_ws, unregister_ws
@@ -50,9 +58,10 @@ class ThreadRequest(BaseModel):
 class ResumeRequest(BaseModel):
     user_id: str = Field(default="default", description="用户 id")
     thread_id: str = Field(description="停在 interrupt 的会话 id")
-    # CVA 人工确认的格式：{"pass": true/false, "msg": "...", "force_terminate": true/false}
-    answer: dict[str, Any] | Literal["yes", "y", "no", "n"] = Field(
-        description="人工回复，必须与 interrupt 的 payload 对应")
+    # CVA 人工确认：{"pass": true/false, "msg": "...", "force_terminate": true/false}
+    # info_inquiry 追问：list[{"question": "...", "reply": "..."}]
+    answer: dict[str, Any] | list[dict[str, Any]] | Literal["yes", "y", "no", "n"] = Field(
+        description="人工回复；CVA 为 dict，info_inquiry 为 question/reply 列表")
 
 
 class ChatResponse(BaseModel):
@@ -68,6 +77,9 @@ class ChatResponse(BaseModel):
     interrupt: Any = None
     # 本轮对应的项目目录（tmp_code/{app_type}/{date}/{project_name}），没有就是 None
     project_dir: str | None = None
+    # 本轮各 Agent 的 token 用量；usage_total 为整个 thread 的累计
+    usage: Any = None
+    usage_total: Any = None
 
 
 _thread_locks: dict[str, asyncio.Lock] = {}
@@ -124,16 +136,117 @@ def _is_interrupted(result: Any) -> bool:
     return isinstance(result, dict) and bool(result.get("__interrupt__"))
 
 
-def _project_dir(metadata: dict) -> str | None:
-    """由 metadata 拼出项目目录；任一字段缺失或路径越界都返回 None"""
-    app_type = metadata.get("app_type")
-    date = metadata.get("date")
-    p_name = metadata.get("project_name")
+async def _usage_payload(graph: Any, thread_id: str) -> dict[str, Any]:
+    """从 checkpoint 读本轮与线程累计用量；读取失败不影响对话。"""
+    try:
+        snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        messages = (snapshot.values or {}).get("messages", []) if snapshot.values else []
+        return {
+            "turn": usage_since_last_human(messages),
+            "total": usage_from_messages(messages)["total"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 token 用量失败：%s: %s", type(exc).__name__, exc)
+        return {"turn": None, "total": None}
+
+
+async def _finalize_project_turn(graph: Any, thread_id: str, user_id: str, interrupted: bool) -> None:
+    """一轮结束：更新项目状态/摘要/对话区间，供跨会话回跳与 RAG 使用。"""
+    admin_id = admin_id_of(user_id)
+    if not admin_id:
+        return
+    try:
+        snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        values = snapshot.values or {}
+        project_id = str(values.get("project_id") or "")
+        start_id = str(values.get("project_turn_start_id") or "")
+        if not project_id or not start_id:
+            return
+        messages = values.get("messages") or []
+        end_id = str(getattr(messages[-1], "id", "") or "") if messages else ""
+        metadata = values.get("metadata") or {}
+        summary = str(values.get("project_summary") or "").strip() or str(values.get("output_msg") or "").strip()
+        verification = metadata.get("verification") or values.get("verification")
+        # CVA 已经先落过 verify_status：这里拿不到结论时不要用 unknown 覆盖它
+        verify_status: str | None = None
+        status = "active" if interrupted else (
+            "failed" if metadata.get("type") == "error" else "completed"
+        )
+        if isinstance(verification, dict):
+            v_status = verification.get("status")
+            passed = verification.get("passed")
+            if v_status in ("running", "handed_off"):
+                # 深层验证还在后台跑：项目不能算 completed
+                status = "active"
+            elif passed is True:
+                verify_status, status = "passed", "completed"
+            elif passed is False:
+                verify_status, status = "failed", "failed"
+            elif v_status in ("failed", "error"):
+                verify_status, status = "error", "failed"
+        await project_registry.finalize_turn(
+            project_id=project_id,
+            admin_id=admin_id,
+            thread_id=thread_id,
+            start_message_id=start_id,
+            end_message_id=end_id,
+            summary=summary,
+            status=status,
+            verify_status=verify_status,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("项目收尾落库失败：%s: %s", type(exc).__name__, exc)
+
+
+def _project_dir(metadata: dict, values: dict | None = None) -> str | None:
+    """由 state/metadata 拼出项目目录；目录不存在或路径越界返回 None
+
+    优先级：state 顶层的 app_type/date/project_name（data_develop 回传后有），
+    再退到 metadata；只返回真实存在的目录，避免前端“打开项目”点开一个不存在的路径。
+    """
+    values = values or {}
+    app_type = values.get("app_type") or metadata.get("app_type")
+    date = values.get("date") or metadata.get("date")
+    p_name = values.get("project_name") or metadata.get("project_name")
     if not (app_type and date and p_name):
         return None
     root = (ROOT_BASE_DIR_PATH / "tmp_code").resolve()
     path = (root / str(app_type) / str(date) / str(p_name)).resolve()
-    return str(path) if root in path.parents else None
+    return str(path) if root in path.parents and path.is_dir() else None
+
+
+def _find_project_dir(project_name: str, values: dict | None = None) -> str | None:
+    """没有完整 state 时，用项目名在 tmp_code 下按 应用类型/日期 扫描目录。"""
+    name = str(project_name or "")
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        return None
+    root = (ROOT_BASE_DIR_PATH / "tmp_code").resolve()
+    if not root.is_dir():
+        return None
+    values = values or {}
+    app_type = values.get("app_type")
+    date = values.get("date")
+    if app_type and date:
+        candidate = (root / str(app_type) / str(date) / name).resolve()
+        if root in candidate.parents and candidate.is_dir():
+            return str(candidate)
+    candidates: list[Any] = []
+    try:
+        for app_dir in root.iterdir():
+            if not app_dir.is_dir():
+                continue
+            for date_dir in app_dir.iterdir():
+                if not date_dir.is_dir():
+                    continue
+                candidate = date_dir / name
+                if candidate.is_dir():
+                    candidates.append(candidate)
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return str(candidates[0])
 
 
 def _response(result: dict, thread_id: str, **extra: Any) -> RouteResponse:
@@ -149,7 +262,7 @@ def _response(result: dict, thread_id: str, **extra: Any) -> RouteResponse:
         "thread_title": metadata.get("thread_title"),
         "interrupted": interrupted,
         "interrupt": jsonable_encoder(result.get("__interrupt__")),
-        "project_dir": _project_dir(metadata),
+        "project_dir": _project_dir(metadata, result),
     }
     fields.update(extra)
     out_data = ChatResponse(**fields).model_dump()
@@ -178,7 +291,7 @@ def _done_payload(
         else metadata.get("thread_action", "continue"),
         "thread_title": thread_title or metadata.get("thread_title"),
         "previous_thread_id": previous_thread_id,
-        "project_dir": _project_dir(metadata),
+        "project_dir": _project_dir(metadata, output),
     }
 
 
@@ -196,6 +309,13 @@ async def _final_frames(text: str, thread_id: str, *, chars: int = 6, delay: flo
         await asyncio.sleep(delay)
 
 
+def _final_already_streamed(ctx: dict, output: dict) -> bool:
+    """最终答案已经作为一条 AIMessage 流过时，不要再发一遍 final 帧。"""
+    final_text = str((output or {}).get("output_msg") or "").strip()
+    last_text = str((ctx or {}).get("last_ai_text") or "").strip()
+    return bool(final_text) and final_text == last_text
+
+
 def _stream_agent_key(message: Any, subgraph: Any = None) -> str | None:
     """从 v3 message 的 node/namespace 或 subgraph path 识别 Agent。"""
     parts: list[str] = []
@@ -209,6 +329,8 @@ def _stream_agent_key(message: Any, subgraph: Any = None) -> str | None:
     scope = " ".join(parts)
     if "code_verify" in scope or "verify_agent" in scope or "ver_" in scope:
         return "code_verify"
+    if "dis_chat" in scope:
+        return "dis_chat"
     if "data_analysis" in scope:
         return "data_analysis"
     if "data_develop" in scope:
@@ -229,7 +351,7 @@ def _agent_from_dispatch(output: Any) -> str | None:
             if not isinstance(info, dict):
                 continue
             send_to = info.get("send_to")
-            if send_to in ("data_analysis", "data_develop"):
+            if send_to in ("data_analysis", "data_develop", "code_verify"):
                 return send_to
             app_type = info.get("app_type")
             if app_type == "spark":
@@ -239,23 +361,42 @@ def _agent_from_dispatch(output: Any) -> str | None:
     return None
 
 
-async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: Any, ctx: dict):
+async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: Any, ctx: dict,
+                            *, resume: bool = False):
     """v3 event streaming：自动消费子图消息，CVA 也能出现在 SSE 里。"""
     async with _lock_for(thread_id):
-        try:
-            await _wait_until_idle(thread_id)
-        except HTTPException as exc:
-            yield "error", {"thread_id": thread_id, "detail": exc.detail, "status": exc.status_code}
-            return
+        if resume:
+            if background_broker.occupancy(thread_id) == "active":
+                yield "error", {"thread_id": thread_id, "detail": "该会话正在运行", "status": 409}
+                return
+        else:
+            try:
+                await _wait_until_idle(thread_id)
+            except HTTPException as exc:
+                yield "error", {"thread_id": thread_id, "detail": exc.detail, "status": exc.status_code}
+                return
         background_broker.set_active(thread_id)
         event_queue: asyncio.Queue = asyncio.Queue()
         verification_queue = verification_registry.subscribe()
         last_tool_by_agent: dict[str, str] = {}
         seen_messages: set[str] = set()
         current_agent: str | None = None
+        # 流式阶段的按 Agent 用量：Agent 切换（即上一个 Agent 完成）就推一次
+        usage_by_agent: dict[str, dict[str, Any]] = {}
+        usage_meta = {"provider": "", "model": ""}
+        usage_last_agent: str | None = None
+
+        def usage_payload(agent: str) -> dict[str, Any]:
+            return {
+                "thread_id": thread_id,
+                "agent": agent,
+                "usage": dict(usage_by_agent.get(agent) or {}),
+                "provider": usage_meta["provider"],
+                "model": usage_meta["model"],
+            }
 
         async def emit_message(message: Any, subgraph: Any = None) -> None:
-            nonlocal current_agent
+            nonlocal current_agent, usage_last_agent
             node = str(getattr(message, "node", "") or "")
             if subgraph is not None and node in {"ver_handler", "__start__", "start"}:
                 # CVA 子图的输入消息（原任务 + 开发者回复）不重复塞进 code_verify 气泡
@@ -285,13 +426,43 @@ async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: A
                 # create_agent 内部的模型消息 node 是 "model"，没有 agent tag；
                 # 用最近一次 dis_chat 的结构化输出补上归属。
                 agent = current_agent
-            if not agent or not isinstance(output, AIMessage):
+            if not isinstance(output, AIMessage):
                 return
+            # CVA 收尾回传父图的 AIMessage 名字是 ver:xxx；把它归到 code_verify，
+            # 否则它的工具轨迹会被当成“没有归属的 Agent”堆到顶部
+            if agent is None and str(getattr(output, "name", "") or "").startswith("ver:"):
+                agent = "code_verify"
             msg_id = str(getattr(message, "message_id", "") or id(message))
             if msg_id in seen_messages:
                 return
             seen_messages.add(msg_id)
+
+            # ---- 按 Agent 累计用量；Agent 一换就把上一个 Agent 的用量推给前端 ----
+            usage_agent = agent
+            if usage_agent is None:
+                if node == "dis_chat":
+                    usage_agent = "dis_chat"
+                elif node == "model":
+                    usage_agent = current_agent or "dis_chat"
+                elif subgraph is not None:
+                    usage_agent = "code_verify"
+            if usage_agent and getattr(output, "usage_metadata", None):
+                normalized = normalize_usage(output.usage_metadata)
+                if normalized is not None:
+                    if usage_last_agent and usage_last_agent != usage_agent:
+                        await event_queue.put(("usage", usage_payload(usage_last_agent), None))
+                    usage_last_agent = usage_agent
+                    usage_by_agent[usage_agent] = merge_usage(
+                        usage_by_agent.get(usage_agent), normalized
+                    )
+                    meta = getattr(output, "response_metadata", None) or {}
+                    usage_meta["provider"] = str(meta.get("model_provider") or usage_meta["provider"])
+                    usage_meta["model"] = str(meta.get("model_name") or usage_meta["model"])
+
+            if not agent:
+                return
             if text_parts:
+                ctx["last_ai_text"] = "".join(text_parts)
                 await event_queue.put(("update", {
                     "thread_id": thread_id, "node": agent, "agent": agent,
                     "ns": [], "phase": "llm_start",
@@ -402,7 +573,7 @@ async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: A
                     if isinstance(record, dict) and record.get("thread_id") == thread_id:
                         yield "verification", {"thread_id": thread_id, "record": record}
                     continue
-                if kind in ("update", "token", "status"):
+                if kind in ("update", "token", "status", "usage"):
                     yield kind, item
         except asyncio.CancelledError:
             if ctx["interrupted"]:
@@ -423,6 +594,13 @@ async def _stream_user_turn(graph: Any, thread_id: str, user_id: str, payload: A
             background_broker.set_paused(thread_id)
         else:
             background_broker.set_idle(thread_id)
+        # 流结束时把每个 Agent 的最终累计量再推一次（前端以最新值覆盖）
+        for agent in list(usage_by_agent):
+            yield "usage", usage_payload(agent)
+        usage = await _usage_payload(graph, thread_id)
+        ctx["usage"] = usage["turn"]
+        ctx["usage_total"] = usage["total"]
+        await _finalize_project_turn(graph, thread_id, user_id, bool(ctx["interrupted"]))
 
 
 async def _thread_owner(thread_id: str) -> int | None:
@@ -510,20 +688,28 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
                     return
             if ctx2["interrupted"]:
                 return
-            async for event, data in _final_frames(
-                    (ctx2["output"] or {}).get("output_msg", ""), new_thread_id):
-                yield _sse(event, data)
-            yield _sse("done", _done_payload(
+            if not _final_already_streamed(ctx2, ctx2["output"] or {}):
+                async for event, data in _final_frames(
+                        (ctx2["output"] or {}).get("output_msg", ""), new_thread_id):
+                    yield _sse(event, data)
+            payload = _done_payload(
                 ctx2["output"], new_thread_id,
                 thread_action="new_task",
                 thread_title=metadata.get("thread_title"),
                 previous_thread_id=thread_id,
-            ))
+            )
+            payload["usage"] = ctx2.get("usage")
+            payload["usage_total"] = ctx2.get("usage_total")
+            yield _sse("done", payload)
             return
 
-        async for event, data in _final_frames(output.get("output_msg", ""), thread_id):
-            yield _sse(event, data)
-        yield _sse("done", _done_payload(output, thread_id))
+        if not _final_already_streamed(ctx, output):
+            async for event, data in _final_frames(output.get("output_msg", ""), thread_id):
+                yield _sse(event, data)
+        payload = _done_payload(output, thread_id)
+        payload["usage"] = ctx.get("usage")
+        payload["usage_total"] = ctx.get("usage_total")
+        yield _sse("done", payload)
 
     return StreamingResponse(
         event_stream(),
@@ -553,8 +739,10 @@ async def chat(req: ChatRequest, request: Request) -> RouteResponse:
         return RouteResponse.error(msg=msg, code=code)
 
     result = await _run_user_turn(graph, thread_id, req.user_id, {"input_msg": human_msg})
+    usage = await _usage_payload(graph, thread_id)
+    await _finalize_project_turn(graph, thread_id, req.user_id, _is_interrupted(result))
     if _is_interrupted(result):
-        return _response(result, thread_id)
+        return _response(result, thread_id, usage=usage["turn"], usage_total=usage["total"])
 
     metadata = result.get("metadata") or {}
     if metadata.get("thread_action") == "new_task":
@@ -567,15 +755,19 @@ async def chat(req: ChatRequest, request: Request) -> RouteResponse:
             code, msg = failure
             return RouteResponse.error(msg=msg, code=code)
         new_result = await _run_user_turn(graph, new_thread_id, req.user_id, {"input_msg": request_text})
+        new_usage = await _usage_payload(graph, new_thread_id)
+        await _finalize_project_turn(graph, new_thread_id, req.user_id, _is_interrupted(new_result))
         return _response(
             new_result,
             new_thread_id,
             thread_action="new_task",
             thread_title=metadata.get("thread_title"),
             previous_thread_id=thread_id,
+            usage=new_usage["turn"],
+            usage_total=new_usage["total"],
         )
 
-    return _response(result, thread_id)
+    return _response(result, thread_id, usage=usage["turn"], usage_total=usage["total"])
 
 
 @route.post("/resume", response_model=RouteResponse)
@@ -620,7 +812,56 @@ async def resume(req: ResumeRequest, request: Request) -> RouteResponse:
                     background_registry.update(
                         record.task_id, status="completed", result=output_msg, interrupt=None
                     )
-        return _response(result, thread_id)
+        usage = await _usage_payload(graph, thread_id)
+        await _finalize_project_turn(graph, thread_id, req.user_id, _is_interrupted(result))
+        return _response(result, thread_id, usage=usage["turn"], usage_total=usage["total"])
+
+
+@route.post("/resume/stream")
+async def resume_stream(req: ResumeRequest, request: Request):
+    """人工确认后继续跑图，并按 token/status/verification 流式返回。"""
+    graph = getattr(request.app.state, "main_graph", None)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="主图尚未初始化")
+
+    admin_id = int(request.state.info.get("id"))
+    req.user_id = str(admin_id)
+    thread_id = req.thread_id
+
+    owner = await _thread_owner(thread_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if owner != admin_id:
+        raise HTTPException(status_code=401, detail="只能操作自己的会话")
+
+    async def event_stream():
+        yield _sse("meta", {"thread_id": thread_id})
+        ctx: dict[str, Any] = {"output": {}, "interrupted": False}
+        async for event, data in _stream_user_turn(
+                graph, thread_id, req.user_id, Command(resume=req.answer), ctx, resume=True):
+            yield _sse(event, data)
+            if event == "error":
+                return
+        if ctx["interrupted"]:
+            return
+        output = ctx["output"] or {}
+        if not _final_already_streamed(ctx, output):
+            async for event, data in _final_frames(output.get("output_msg", ""), thread_id):
+                yield _sse(event, data)
+        payload = _done_payload(output, thread_id)
+        payload["usage"] = ctx.get("usage")
+        payload["usage_total"] = ctx.get("usage_total")
+        yield _sse("done", payload)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @route.get("/history")
@@ -673,21 +914,74 @@ async def history(request: Request, thread_id: str = Query(..., description="只
                 "content": text,
             })
         metadata = values.get('metadata') or {}
+        raw_messages = values.get('messages', [])
         return RouteResponse.ok(data={
             'thread_id': thread_id,
             'is_archive': is_archive,
             'manual_intervention': bool(interrupts),
             'interrupted': bool(interrupts),
             'interrupt': jsonable_encoder(interrupts),
-            'project_dir': _project_dir(metadata),
+            'project_dir': _project_dir(metadata, values),
             # 旧会话兜底；新会话最终正文已经在 messages 里，前端会去重
             'output_msg': '' if interrupts else values.get('output_msg', ''),
             'metadata': metadata,
             'messages': messages,
+            # 用量直接来自 checkpoint：total 是整个 thread 的累计，turns 按用户轮切分
+            'usage': {
+                'total': usage_from_messages(raw_messages)['total'],
+                'turns': usage_by_turns(raw_messages),
+            },
         })
     except Exception as exc:
         logger.error(f"获取会话历史记录失败：{exc}")
         return RouteResponse.error(msg=f"获取会话历史记录失败：{exc}", code=ResultCode.SERVER_ERROR)
+
+
+@route.get("/project/path")
+async def project_path(
+        request: Request,
+        thread_id: str = Query(..., description="会话 id"),
+) -> RouteResponse:
+    """解析会话对应的项目目录；优先 state，其次工具轨迹 + tmp_code 扫描。"""
+    try:
+        admin_id = int(request.state.info.get("id"))
+    except (TypeError, ValueError):
+        return RouteResponse.error(msg="token 解析错误", code=ResultCode.INVALID_VALUE_ERROR)
+    thread_id = thread_id.strip()
+    if not thread_id:
+        return RouteResponse.error(msg="thread_id 不能为空", code=ResultCode.INVALID_VALUE_ERROR)
+    owner = await _thread_owner(thread_id)
+    if owner is None:
+        return RouteResponse.error(msg="会话不存在", code=ResultCode.NOT_FOUND)
+    if owner != admin_id:
+        return RouteResponse.error(msg="只能查看自己的会话", code=ResultCode.UNAUTHORIZED)
+    graph = getattr(request.app.state, "main_graph", None)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="主图尚未初始化")
+    try:
+        snapshot = await graph.aget_state({'configurable': {'thread_id': thread_id}})
+        values = snapshot.values or {}
+        metadata = values.get("metadata") or {}
+        project_name = str(values.get("project_name") or "")
+        project_dir = _project_dir(metadata, values)
+        if not project_dir:
+            traces = await tool_trace_store.list(thread_id, limit=500)
+            for trace in traces:
+                if trace.get("tool") != "initialize_project":
+                    continue
+                name = (trace.get("args") or {}).get("project_name")
+                if name:
+                    project_name = str(name)
+                    break
+            project_dir = _find_project_dir(project_name, values)
+        return RouteResponse.ok(data={
+            "thread_id": thread_id,
+            "project_name": project_name or None,
+            "project_dir": project_dir,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"解析项目目录失败：{exc}")
+        return RouteResponse.error(msg=f"解析项目目录失败：{exc}", code=ResultCode.SERVER_ERROR)
 
 
 @route.get("/threads")
@@ -1169,7 +1463,7 @@ async def background_ws(
 
     # Ticket 一次性：不论校验成败都先消费掉，避免重放
     tmp_key = redis_con.hget("jwt_key", f"background:temp-{user_id}")
-    redis_con.hdel("temp_code", short_code)
+    redis_con.hdel("temp_code", ticket)
     redis_con.hdel("jwt_key", f"background:temp-{user_id}")
 
     try:

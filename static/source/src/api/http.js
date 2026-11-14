@@ -43,7 +43,7 @@ async function toJson(resp) {
 /**
  * 统一请求：自动带 token、解 {code, msg, data} 信封、401 时清掉本地 token
  */
-export async function request(path, { method = 'GET', body, auth = true, raw = false } = {}) {
+export async function request(path, { method = 'GET', body, auth = true, raw = false, expectJson = false } = {}) {
   const headers = {}
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (auth && getToken()) headers.Authorization = AUTH_PREFIX + getToken()
@@ -61,6 +61,15 @@ export async function request(path, { method = 'GET', body, auth = true, raw = f
   }
   if (!resp.ok) {
     throw new ApiError(payload?.msg || `请求失败（HTTP ${resp.status}）`, payload?.code ?? resp.status)
+  }
+  if (expectJson && (!payload || typeof payload !== 'object')) {
+    const contentType = resp.headers.get('content-type') || ''
+    throw new ApiError(
+      contentType.includes('text/html')
+        ? '后端接口未生效（返回了 HTML，可能后端还没重启）'
+        : '后端接口返回格式异常',
+      502
+    )
   }
   // 业务信封：code 为 0 才算成功
   if (payload && typeof payload === 'object' && 'code' in payload && payload.code !== 0) {

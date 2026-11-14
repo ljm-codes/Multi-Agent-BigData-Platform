@@ -44,7 +44,10 @@ export function roleOf(type) {
 export function normalizeAgent(name) {
   const raw = String(name || '').trim()
   if (!raw) return ''
-  if (raw === 'code_verify' || raw === 'verify_agent' || raw.startsWith('ver_')) return 'code_verify'
+  // CVA 的 ver_end 回传消息名是 ver:xxx；live SSE 用 code_verify，这里保持两端口径一致
+  if (raw === 'code_verify' || raw === 'verify_agent' || raw.startsWith('ver_') || raw.startsWith('ver:')) {
+    return 'code_verify'
+  }
   if (raw === 'data_analysis' || raw === 'data_analysis_agent') return 'data_analysis'
   if (raw === 'data_develop' || raw === 'data_develop_agent') return 'data_develop'
   if (['work_end', 'dis_chat', 'handler', 'distribute_task_to_agent'].includes(raw)) return 'dis_chat'

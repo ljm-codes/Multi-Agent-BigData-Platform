@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import TypedDict, NotRequired, Literal, Any
 
 from langgraph.graph import MessagesState
+from pydantic import BaseModel, Field
 
 OutcomeStatus = Literal[
     "completed",
@@ -67,11 +68,11 @@ class OpsHandoverState(TypedDict):
     """运维转交开发时带过来的上下文（不经过 dis_chat 直接进开发节点）"""
     app_id: str
     app_type: Literal["spark", "flink"]
-    app_name: str          # 运维拉取目录里的原始应用名
-    project_name: str      # 搬进 tmp_code 后的目录名（重名时带前缀）
-    date: str              # tmp_code 下使用的当前日期
-    source_path: str       # 原来的 tmp/target/... 路径
-    session_id: str        # 运维会话 id，开发 thread_id = f"ops:{session_id}"
+    app_name: str  # 运维拉取目录里的原始应用名
+    project_name: str  # 搬进 tmp_code 后的目录名（重名时带前缀）
+    date: str  # tmp_code 下使用的当前日期
+    source_path: str  # 原来的 tmp/target/... 路径
+    session_id: str  # 运维会话 id，开发 thread_id = f"ops:{session_id}"
     error_describe: str
     suggest: str
     task_list: list[str]
@@ -96,6 +97,10 @@ class AgentDevelopInputState(TypedDict):
     app_type: Literal["spark", "flink"]
     date: NotRequired[str]
     project_name: NotRequired[str]
+    # 项目登记表里的唯一键；initialize_project 成功后用它回填真实坐标
+    project_id: NotRequired[str]
+    # 调度前系统校验的目录状态：{exists, has_code}，避免 Agent 先调工具才知道
+    project_check: NotRequired[dict[str, Any]]
     error_msg: NotRequired[str]
     human_suggestion: NotRequired[str]
     repair_num: NotRequired[int]
@@ -140,6 +145,12 @@ class DevelopAgentMainState(MessagesState):
     output_msg: NotRequired[str]
     out_time: NotRequired[datetime]
     metadata: NotRequired[dict[str, Any]]
+    # 项目登记：当前项目 + 本轮项目对话起点/摘要，供项目表和收尾落库使用
+    project_id: NotRequired[str]
+    project_title: NotRequired[str]
+    project_desc: NotRequired[str]
+    project_summary: NotRequired[str]
+    project_turn_start_id: NotRequired[str]
 
 
 class DevelopAgentOutputState(TypedDict):
@@ -182,6 +193,8 @@ class CodeVerifyAgentInputState(TypedDict):
     is_submit: NotRequired[bool]
     is_ops: NotRequired[bool]
     status: NotRequired[Literal["preliminary", "shallow", "deep", "done"]]
+    # 项目登记键；直连验证时从调度带进来，便于用量/状态落库关联
+    project_id: NotRequired[str]
 
 
 class CodeVerifyAgentMainState(MessagesState):
@@ -217,6 +230,17 @@ class CodeVerifyAgentMainState(MessagesState):
     submit_desc: NotRequired[str]
     from_: NotRequired[str]
     thread_id: NotRequired[str]
+    id: NotRequired[str | None]
+    project_id: NotRequired[str]
+    usage_metadata: NotRequired[dict[str, Any]]
+    response_metadata: NotRequired[dict[str, Any]]
+    # 工具网关：本批未执行的调用、临时 AIMessage、动作工具结果去重
+    remaining_tool_calls: NotRequired[list[dict[str, Any]]]
+    temp_ai_ids: NotRequired[list[str]]
+    processed_action_tool_ids: NotRequired[list[str]]
+    pending_deep_tool_call_id: NotRequired[str]
+    pending_deep_call: NotRequired[dict[str, Any]]
+    code_summary: NotRequired[dict[str, Any]]
 
 
 # 结束状态
@@ -233,3 +257,33 @@ class WorkEndState(TypedDict):
     thread_title: NotRequired[str]
     request_text: NotRequired[str]
     verification: NotRequired[Any]
+    usage_metadata: NotRequired[dict[str, Any]]
+    response_metadata: NotRequired[dict[str, Any]]
+    id: NotRequired[str | None]
+
+
+class InfoInquiry(BaseModel):
+    """
+    详细需要追加的信息
+    """
+    # 问题
+    question: str = Field(description="需要向用户追问的问题，比如说：kafka的topic名称")
+    # 建议
+    suggestion: list[str] = Field(
+        default_factory=list,
+        description="该问题的建议（可选，可以提出多个建议），比如说：整体采用滚动窗口，整个窗口7天，每次滚动3天"
+    )
+    # 你建议采用哪个
+    suggestion_index: int | None = Field(default=None, description="你建议采用哪个建议（可选）")
+
+
+class NeedAddInfo(BaseModel):
+    """
+    大模型当接受用户不详细描述时，可以通过这个类进行追问
+    """
+    # 整体追问的标题
+    title: str = Field(default="", description="整体追问的标题（可选）")
+    # 标题的描述
+    description: str = Field(description="整体追问的描述")
+    # 详细的数据
+    info_inquiry: list[InfoInquiry] = Field(default_factory=list, description="详细需要追加的信息")

@@ -18,11 +18,13 @@ from langgraph.types import Send
 
 from SPO.main_agent_state_model import AgentDevelopInputState, MainStateContext, CodeVerifyAgentInputState, \
     DevelopGraphErrorState, WorkEndState, content_text
+from Tasks.project_registry import admin_id_of, project_registry
 from Tools.app_name import validate_app_name
 from Tools.log_settings import LogSetting
 from Tools.data_analysis_agent_tools import AGENT_NAME as ANALYSIS_AGENT, analysis_business_files
 from Tools.registry import get_tools
 from Tools.share_check_tool import redis_con
+from Tools.usage_metrics import last_response_metadata, merged_raw_usage_of_messages, usage_ledger_message
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.tool_call_guard import ToolCallHistoryGuard
 from middleware.tool_trace_middleware import ToolTraceMiddleware
@@ -43,6 +45,7 @@ with open(Path(__file__).parent / "prompt" / "data_analysis_agent.md", "r", enco
 
 class CodeAnalysisState(AgentState):
     project_name: str
+    project_id: NotRequired[str]
     is_repair: bool
     repair_num: NotRequired[int]
 
@@ -93,11 +96,18 @@ async def big_data_analysis_code_agent(
         handle_msg = HumanMessage(
             content=f"经人工核对，代码开发不符合业务需求（系统已自动锁定该项目）。人工建议为：\n{human_suggestion}"
         )
+    if check := state.get("project_check"):
+        handle_msg = HumanMessage(content=(
+            f"项目目录状态：exists={bool(check.get('exists'))}，"
+            f"has_code={bool(check.get('has_code'))}。\n{handle_msg.content}"
+        ))
     in_state = {
         "messages": [handle_msg],
         "project_name": state.get("project_name") or str(uuid4()),
         "is_repair": state.get("is_repair", False),
     }
+    if project_id := state.get("project_id"):
+        in_state["project_id"] = project_id
     repair_num = state.get("repair_num")
     if repair_num and repair_num >= 4:
         return DevelopGraphErrorState(
@@ -157,6 +167,8 @@ async def big_data_analysis_code_agent(
             "project_name": project_dir,
             "is_repair": True,
         }
+        if project_id := state.get("project_id"):
+            retry_state["project_id"] = project_id
         result = await code_analysis_agent.ainvoke(
             cast("InputT", retry_state),
             config={
@@ -173,7 +185,13 @@ async def big_data_analysis_code_agent(
         project_dir = result.get("project_name") or project_dir
         app_path = ROOT_BASE_DIR_PATH / "tmp_code" / "spark" / date / project_dir
         if not _has_python_code(app_path):
-            return DevelopGraphErrorState(
+            # 报错终止也要把两次分析 run 的消耗记进父图 checkpoint
+            ledger = usage_ledger_message(
+                "data_analysis",
+                merged_raw_usage_of_messages(result.get("messages", [])),
+                last_response_metadata(result.get("messages", [])),
+            )
+            error = DevelopGraphErrorState(
                 from_="data_analysis_agent",
                 thread_id=thread_id,
                 desc=(f"项目 {app_path} 下仍然没有业务 Python 代码；"
@@ -181,13 +199,28 @@ async def big_data_analysis_code_agent(
                 goto_="work_end",
                 original_task_list=task_list,
             )
+            return {**error, **({"messages": [ledger]} if ledger else {})}
+    # initialize_project 没被调用时也能回填坐标；set_coordinates 本身幂等
+    project_id = state.get("project_id")
+    admin_id = admin_id_of(user_id)
+    if project_id and admin_id:
+        await project_registry.set_coordinates(
+            str(project_id), admin_id=admin_id, app_type="spark",
+            project_date=str(date or ""), project_name=str(project_dir or ""),
+        )
     # logger.info(f"数据分析Agent的完整回复为：{result}")
     final_text = ""
+    # 分析 Agent 内部可能跑了很多轮工具调用；整个 run 的用量合并后一次性回传父图
+    usage_metadata = merged_raw_usage_of_messages(result.get("messages", []))
+    response_metadata = None
+    analysis_id = None
     for message in reversed(result.get("messages", [])):
         if isinstance(message, AIMessage):
             text = content_text(message.content)
             if text.strip():
                 final_text = text
+                response_metadata = message.response_metadata or {}
+                analysis_id = message.id
                 break
     code_verify_in_state = CodeVerifyAgentInputState(
         source='data_analysis_agent',
@@ -202,13 +235,22 @@ async def big_data_analysis_code_agent(
     )
     if repair_num:
         code_verify_in_state["repair_num"] = repair_num
+    if project_id := state.get("project_id"):
+        code_verify_in_state["project_id"] = project_id
     if final_text.strip():
         # 把用户可见的最终回复写回父图 messages；Send 的临时输入不受影响
         return {
             **code_verify_in_state,
-            "messages": [AIMessage(content=f"来自数据分析Agent的回复：\n{final_text}", name="data_analysis")],
+            "messages": [AIMessage(
+                content=f"来自数据分析Agent的回复：\n{final_text}", name="data_analysis",
+                id=analysis_id, usage_metadata=usage_metadata, response_metadata=response_metadata)],
         }
-    return code_verify_in_state
+    # 没有正文也要记账，否则这次 run 的消耗到了验证 Agent 就看不见了
+    ledger = usage_ledger_message(
+        "data_analysis", usage_metadata,
+        response_metadata or last_response_metadata(result.get("messages", [])),
+    )
+    return {**code_verify_in_state, **({"messages": [ledger]} if ledger else {})}
 
 
 def _submit_registration_error(project_name: str | None, is_submit: bool) -> str:
@@ -278,6 +320,7 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
                 "repair_num": 1 if not state.get("repair_num") else state.get("repair_num") + 1,
                 "is_ops": state.get("is_ops", False),
                 "ops_handover": state.get("ops_handover"),
+                "project_id": state.get("project_id"),
             }
         )
     py_files, _ = analysis_business_files(app_path)
@@ -316,6 +359,7 @@ def preliminary_verify(state: CodeVerifyAgentInputState | DevelopGraphErrorState
                 # 修复重入也要保留运维模式，否则验证结束会回到 dis_chat
                 "is_ops": state.get("is_ops", False),
                 "ops_handover": state.get("ops_handover"),
+                "project_id": state.get("project_id"),
             }
         )
     return Send(
