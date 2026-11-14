@@ -30,7 +30,7 @@ def check_jar_class(
     """
     if not jar_path.is_file():
         return False, f"jar包路径不存在: {jar_path}"
-    return_code, jar_class_out_str = run_java_command(f"jar tf {jar_path}")
+    return_code, jar_class_out_str = run_java_command(f'jar tf "{jar_path}"')
     if return_code != 0:
         return False, f"查看jar包类名失败，错误信息: {jar_class_out_str}"
     capture = r"(?<![\w$/])([\w/]+)" if not inner_class else r".*?"

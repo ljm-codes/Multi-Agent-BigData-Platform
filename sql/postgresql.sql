@@ -69,9 +69,11 @@ create table if not exists log.agent_runs
 );
 
 -- 已有库不会因为 create table if not exists 更新约束，单独迁移一次
-alter table log.agent_runs drop constraint if exists agent_run_status_check;
-alter table log.agent_runs add constraint agent_run_status_check
-    check (status in ('RUNNING', 'PAUSED', 'DONE', 'ERROR', 'ABANDONED'));
+alter table log.agent_runs
+    drop constraint if exists agent_run_status_check;
+alter table log.agent_runs
+    add constraint agent_run_status_check
+        check (status in ('RUNNING', 'PAUSED', 'DONE', 'ERROR', 'ABANDONED'));
 
 create index if not exists idx_agent_runs_app_time on log.agent_runs (app_id, started_at desc);
 create index if not exists idx_agent_runs_status_time on log.agent_runs (status, started_at desc);
@@ -175,9 +177,57 @@ create index if not exists idx_tool_trace_running
 create index if not exists idx_tool_trace_cleanup
     on log.tool_trace (started_at);
 
+-- 项目/任务登记：模型只接触 project_id，真实目录由 app_type/project_date/project_name 解析
+create table if not exists admin_project
+(
+    id               bigserial primary key,
+    project_id       varchar(36)  not null unique,
+    admin_id         bigint       not null,
+    thread_id        varchar(255) not null,
+    title            varchar(128) not null,
+    description      text         not null default '',
+    summary          text         not null default '',
+    app_type         varchar(16)  not null
+        check (app_type in ('spark', 'flink')),
+    project_date     varchar(10),
+    project_name     varchar(255),
+    start_message_id varchar(64),
+    end_message_id   varchar(64),
+    status           varchar(16)  not null default 'active'
+        check (status in ('active', 'completed', 'failed', 'missing', 'archived')),
+    verify_status    varchar(16)  not null default 'unknown'
+        check (verify_status in ('unknown', 'passed', 'failed', 'error')),
+    created_at       timestamptz  not null default now(),
+    updated_at       timestamptz  not null default now(),
+    constraint uk_admin_project_coords unique (admin_id, app_type, project_date, project_name)
+);
+
+create index if not exists idx_admin_project_owner_time
+    on admin_project (admin_id, updated_at desc);
+
+-- 项目在某个会话里的对话区间；跨会话续聊新增一条
+create table if not exists admin_project_conversation
+(
+    id               bigserial primary key,
+    project_id       varchar(36)  not null,
+    thread_id        varchar(255) not null,
+    start_message_id varchar(64)  not null,
+    end_message_id   varchar(64),
+    created_at       timestamptz  not null default now(),
+    updated_at       timestamptz  not null default now(),
+    constraint uk_project_conversation_segment unique (project_id, thread_id, start_message_id)
+);
+
+create index if not exists idx_admin_project_conversation_project
+    on admin_project_conversation (project_id, updated_at desc);
 
 -- 以下 SQL 均为 未开发 完整
--- create table log.AIOps_log
--- (
---
--- )
+create table log.AIOps_log
+(
+    id       bigserial primary key,
+    app_type varchar(20) check ( app_type in ('SPARK', 'FLINK'))            not null,
+    status   varchar(16) check ( status in ('running', 'success', 'error')) not null,
+)
+
+
+

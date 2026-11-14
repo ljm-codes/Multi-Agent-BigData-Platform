@@ -50,7 +50,24 @@ async function copyTrace(trace) {
       if (copied.value === trace.trace_id) copied.value = ''
     }, 1200)
   } catch {
-    window.prompt('复制工具调用内容', text)
+    // 不用 window.prompt：后台窗口弹出模态框会把浏览器拉到前台
+    const area = document.createElement('textarea')
+    area.value = text
+    area.setAttribute('readonly', '')
+    area.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0'
+    document.body.appendChild(area)
+    area.select()
+    try {
+      document.execCommand('copy')
+      copied.value = trace.trace_id
+      setTimeout(() => {
+        if (copied.value === trace.trace_id) copied.value = ''
+      }, 1200)
+    } catch {
+      /* 复制失败就静默，不弹窗 */
+    } finally {
+      area.remove()
+    }
   }
 }
 </script>

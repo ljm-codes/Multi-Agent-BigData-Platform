@@ -66,3 +66,6 @@ tests/system_eval/fixtures/*/target/
 # 本地 Spark/Hive 测试产生的 Derby 元数据
 derby.log
 metastore_db/
+
+video/
+daily-test/

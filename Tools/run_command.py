@@ -19,11 +19,14 @@
 import asyncio
 import codecs
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import threading
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any
 
 from Tools.log_settings import LogSetting
@@ -32,8 +35,8 @@ from load_config.config import ROOT_BASE_DIR_PATH
 logger = LogSetting.create(__name__)
 # 检查 mvn 是否在环境变量中（Linux 没有 where，用 shutil.which 跨平台）
 _project_mvn = (
-    ROOT_BASE_DIR_PATH / "Maven" / "mvn-3.9.9" / "bin"
-    / ("mvn.cmd" if os.name == "nt" else "mvn")
+        ROOT_BASE_DIR_PATH / "Maven" / "mvn-3.9.9" / "bin"
+        / ("mvn.cmd" if os.name == "nt" else "mvn")
 )
 is_use_project_mvn = False
 if shutil.which("mvn") is None:
@@ -81,6 +84,63 @@ def _split_command(command: str) -> list[str]:
         tokens.append("".join(current))
 
     return tokens
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _pom_properties(root: ET.Element) -> dict[str, str]:
+    props: dict[str, str] = {}
+    for el in root.iter():
+        if _local_name(el.tag) != "properties":
+            continue
+        for child in el:
+            if child.text and child.text.strip():
+                props[_local_name(child.tag)] = child.text.strip()
+    return props
+
+
+def maven_java_release(project_path: str | Path) -> str | None:
+    """从 pom.xml 读取 Java 编译版本，避免把 --release 写死成 8。
+
+    作用：让 javac 的 --release 跟随 Maven 项目配置（maven.compiler.source/release
+          或 maven-compiler-plugin 的 source/release）。
+    参数：
+        project_path：项目根目录（包含 pom.xml）。
+    返回：
+        版本字符串（如 "8"、"17"）；读不到返回 None。
+    """
+    try:
+        root = ET.parse(Path(project_path) / "pom.xml").getroot()
+    except Exception:
+        return None
+    props = _pom_properties(root)
+    candidates: list[str] = []
+    for key in ("maven.compiler.release", "maven.compiler.source", "java.version"):
+        if value := props.get(key):
+            candidates.append(value)
+    for plugin in root.iter():
+        if _local_name(plugin.tag) != "plugin":
+            continue
+        artifact = next((_local_name(c.tag) for c in plugin
+                         if _local_name(c.tag) == "artifactId"), "")
+        if artifact != "maven-compiler-plugin":
+            continue
+        for conf in plugin:
+            if _local_name(conf.tag) != "configuration":
+                continue
+            for child in conf:
+                if _local_name(child.tag) in ("release", "source") and child.text:
+                    candidates.append(child.text.strip())
+    for raw in candidates:
+        match = re.fullmatch(r"\$\{([^}]+)}", raw.strip())
+        value = (props.get(match.group(1), "") if match else raw).strip()
+        if value.startswith("1."):
+            value = value[2:]
+        if value.isdigit():
+            return value
+    return None
 
 
 def run_mvn_command(command: str, path: str) -> tuple[int, str]:

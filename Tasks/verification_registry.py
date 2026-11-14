@@ -212,6 +212,9 @@ class VerificationReporter:
     def result(self, item: dict[str, Any]) -> None:
         """_run_*_test_command 每个 command/用例完成的回调。"""
         self.completed += 1
+        # 初始化时 total 可能是命令数，而 result 是按用例回调的；至少保证分母不落后
+        if self.completed > self.total:
+            self.total = self.completed
         status = item.get("status")
         if status == "passed":
             self.passed += 1

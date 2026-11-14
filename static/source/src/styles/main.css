@@ -1,6 +1,6 @@
 :root {
   --bg: #ffffff;
-  --bg-soft: #f6f7f9;
+  --bg-soft: #f6f8fA;
   --bg-elevated: #ffffff;
   --border: #e3e5e8;
   --text: #1f2329;
@@ -12,8 +12,8 @@
 }
 
 html[data-theme='dark'] {
-  --bg: #16181d;
-  --bg-soft: #1b1e24;
+  --bg: #0e1319;
+  --bg-soft: #1b222e;
   --bg-elevated: #21252d;
   --border: #2c313a;
   --text: #e6e8eb;

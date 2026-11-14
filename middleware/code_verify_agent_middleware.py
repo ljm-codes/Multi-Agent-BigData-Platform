@@ -3,7 +3,7 @@ from typing import Callable, Awaitable
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse, ExtendedModelResponse
 from langchain.agents.middleware.types import ResponseT
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 from langgraph.typing import ContextT
 from typing_extensions import override
@@ -18,9 +18,20 @@ from Tasks.background_broker import (
 from Tasks.verification_registry import publish_outcome
 
 
+def _dispatcher_notice(notice: AIMessage) -> HumanMessage:
+    """后台结果必须以调度 Agent 身份回流，避免模型把它当成自己上一轮的话去续写。"""
+    content = notice.content if isinstance(notice.content, str) else str(notice.content)
+    return HumanMessage(
+        content=(f"[调度Agent → 验证Agent] {content}\n"
+                 "请按当前状态继续：需要等待时调用 check_background_progress；"
+                 "有结论就如实收尾。"),
+        name="dispatcher",
+    )
+
+
 def _with_notices(
         response: ModelResponse | AIMessage | ExtendedModelResponse,
-        notices: list[AIMessage],
+        notices: list[HumanMessage],
 ) -> ModelResponse | AIMessage | ExtendedModelResponse:
     """通知放在模型输出之前，保证 state 里最后一条 AIMessage 仍是模型输出"""
     if isinstance(response, ExtendedModelResponse):
@@ -69,7 +80,7 @@ class PerceptionBackground(AgentMiddleware):
         for outcome in outcomes:
             publish_outcome(outcome)
 
-        notices = [outcome_notice(outcome) for outcome in outcomes]
+        notices = [_dispatcher_notice(outcome_notice(outcome)) for outcome in outcomes]
         try:
             # override(state=...) 不会改 request.messages，结果要直接拼进 messages
             response = await handler(request.override(messages=[*request.messages, *notices]))

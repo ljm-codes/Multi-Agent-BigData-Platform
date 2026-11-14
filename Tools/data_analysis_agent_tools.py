@@ -17,8 +17,10 @@ from uuid import uuid4
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
+from SPO.main_agent_state_model import NeedAddInfo
+from Tasks.project_registry import admin_id_of, project_registry
 from Tools.app_name import validate_app_name
 from Tools.log_settings import LogSetting
 from Tools.code_analysis import PyAnalyzer, find_definition, find_module_path
@@ -27,6 +29,17 @@ from Tools.share_check_tool import redis_con
 from load_config.config import config, ROOT_BASE_DIR_PATH
 
 AGENT_NAME = "DAA"
+
+
+async def _register_project_coords(runtime: ToolRuntime, project_date: str, project_name: str) -> None:
+    """initialize_project 成功后把真实坐标回填到项目登记表；失败不影响建项目。"""
+    project_id = runtime.state.get("project_id")
+    admin_id = admin_id_of(getattr(runtime.context, "user_id", None))
+    if project_id and admin_id:
+        await project_registry.set_coordinates(
+            str(project_id), admin_id=admin_id, app_type=APP_TYPE,
+            project_date=str(project_date or ""), project_name=str(project_name or ""),
+        )
 # 数据分析只跑 spark/python，项目固定落在 spark 下，不跟随 context.app_type
 APP_TYPE = "spark"
 # 单次查看的行数上限：超了截断并说明，免得一次调用把上下文撑爆
@@ -223,7 +236,7 @@ def analysis_business_files(project_path: Path) -> tuple[list[Path], list[Path]]
 
 @register_tool(AGENT_NAME)
 @tool
-def initialize_project(runtime: ToolRuntime, project_name: str | None = None) -> Command | str:
+async def initialize_project(runtime: ToolRuntime, project_name: str | None = None) -> Command | str:
     """
     初始化数据分析项目（只需调用一次，之后的写代码/改代码都靠它写回的项目名来定位）
     参数：
@@ -252,6 +265,7 @@ def initialize_project(runtime: ToolRuntime, project_name: str | None = None) ->
         logger.error(f"初始化项目失败{type(e).__name__}: {e}")
         shutil.rmtree(app_path, ignore_errors=True)
         return f"初始化项目失败(已清除项目目录){type(e).__name__}: {e}"
+    await _register_project_coords(runtime, date, p_name)
     return Command(
         update={
             "messages": [
@@ -793,6 +807,61 @@ def find_python_api_definition(module: str, name: str) -> str:
                 f"用 view_python_module_info(module={found['module']!r}) 查看其中内容")
     return (f"{nm} 定义在模块 {found['module']}（文件：{found['file']}，第 {found['lineno']} 行）：\n"
             f"{found['text']}")
+
+
+@register_tool(AGENT_NAME)
+@tool
+def info_inquiry(need_add_info: NeedAddInfo) -> str:
+    """
+    该工具是为了防止上游Agent分布的任务还是含糊不清或者相关信息不详细而设计的。
+    通过该工具，你可以直接向用户追问，无需向上游进行询问。
+    参数：
+        need_add_info: 需要追问的信息
+    参数详解：
+        - title：整体追问的标题（可选）比如说：追问一些详细的数据
+        - description：整体追问的描述，比如说：相关的kafka、流程不详细，现在需要进行追问
+        - info_inquiry：详细需要追加的信息(一个列表，可以一次询问一个或多个问题，每个元素是一个InfoInquiry对象，包含question、suggestion、suggestion_index)
+            - question：需要向用户追问的问题，比如说：kafka的topic名称
+            - suggestion：该问题的建议（可选，可以提出多个建议，但是不得超过3个建议），比如说：整体采用滚动窗口，整个窗口7天，每次滚动3天
+            - suggestion_index：你建议采用哪个建议（可选），比如说：0，1，2，不建议采用其他索引
+    注意：
+        - 该工具是为了让用户的体验感更好，且更加直观，而不是一堆问题直接“甩”到用户上
+        - 该工具允许用户自主提出做法，所以建议不用太多
+    原理： 通过`中断`，将信息传给用户进行处理
+    返回： 对应问题的答复
+    """
+    out_dict = {"title": need_add_info.title, "description": need_add_info.description}
+    inquiry = need_add_info.info_inquiry
+    inquiry_list = []
+    for info in inquiry:
+        len_suggestion = len(info.suggestion)
+        if len_suggestion > 3:
+            suggestion = info.suggestion[:3]
+        else:
+            suggestion = info.suggestion
+        idx = info.suggestion_index
+        if idx not in (0, 1, 2):
+            idx = None
+        inquiry_list.append(
+            {
+                "question": info.question,
+                "suggestion": suggestion,
+                "suggestion_index": idx
+            }
+        )
+    out_dict["info_inquiry"] = inquiry_list
+    answer = interrupt(out_dict)  # 用户将会返回 list({"question", "reply"})
+    if not isinstance(answer, list):
+        return "用户返回了错误的信息，请再次调用该工具，或者直接调用`DevelopAgentOutState`工具进行询问"
+
+    human_answer = []
+    for an in answer:
+        question = an.get("question")
+        reply = an.get("reply")
+        if not question or not reply:
+            continue
+        human_answer.append(f"问题：{question}，对应的人工答复为：{reply}")
+    return "\n".join(human_answer)
 
 
 @register_tool(AGENT_NAME)

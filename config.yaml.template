@@ -7,6 +7,7 @@ app:
   # 设置一个是否连接集群的选项 -> 取消重依赖
   # 启动这个之后，将无法启动运行Agent，以及部分工具将无法使用
   connect_to_cluster: false
+  align_maven_jdk: true  # javac 是否按 Maven 的 Java 8 对齐
 
 logging:
   level: 'DEBUG'

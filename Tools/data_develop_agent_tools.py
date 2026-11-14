@@ -7,6 +7,7 @@
 4. 简单的语法验证
 ...
 """
+import asyncio
 import json
 import os
 import re
@@ -18,20 +19,35 @@ from uuid import uuid4
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 from langgraph.prebuilt import ToolRuntime
 from lxml import etree
 
+from SPO.main_agent_state_model import NeedAddInfo
+from Tasks.project_registry import admin_id_of, project_registry
 from Tools.app_name import validate_app_name
 from Tools.jar.parse_jar import check_jar_class, check_java_api_roughly_info, check_java_code
 from Tools.log_settings import LogSetting
 from Tools.registry import register_tool
-from Tools.run_command import run_mvn_command, run_java_command
+from Tools.run_command import run_mvn_command, run_java_command, maven_java_release
 from Tools.share_check_tool import redis_con
 from load_config.config import config, ROOT_BASE_DIR_PATH
 
 AGENT_NAME = "DDA"
+_ALIGN_MAVEN_JDK = bool((config.get("app") or {}).get("align_maven_jdk", True))
 dda_config = config.get("agent", {}).get(AGENT_NAME, {})
+
+
+async def _register_project_coords(
+        runtime: ToolRuntime, app_type: str, project_date: str, project_name: str) -> None:
+    """initialize_project 成功后把真实坐标回填到项目登记表；失败不影响建项目。"""
+    project_id = runtime.state.get("project_id")
+    admin_id = admin_id_of(getattr(runtime.context, "user_id", None))
+    if project_id and admin_id:
+        await project_registry.set_coordinates(
+            str(project_id), admin_id=admin_id, app_type=app_type,
+            project_date=str(project_date or ""), project_name=str(project_name or ""),
+        )
 java_maven_dir = dda_config.get("java_maven_lib_dir", "~/.m2/repository")
 logger = LogSetting.create(__name__)
 
@@ -66,6 +82,7 @@ _POM_TEXT = """
         <maven.compiler.source>8</maven.compiler.source>
         <maven.compiler.target>8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <Flink.version>1.18.1</Flink.version>
         <lombok.version>1.18.34</lombok.version>
     </properties>
@@ -96,6 +113,12 @@ _POM_TEXT = """
             <artifactId>flink-streaming-java</artifactId>
             <version>${Flink.version}</version>
         </dependency>
+        <!--rocksDB-->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-statebackend-rocksdb</artifactId>
+            <version>1.18.1</version>
+        </dependency>
 
         <!-- CVA 写 JUnit 4 测试所需 -->
         <dependency>
@@ -122,6 +145,11 @@ _POM_TEXT = """
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <version>${lombok.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-datagen</artifactId>
+            <version>${Flink.version}</version>
         </dependency>
     </dependencies>
     
@@ -161,9 +189,21 @@ _CODE_DIRS = {
     "flink": ("src", "main", "java", "com", "fm"),
     "spark": ("src", "main", "python"),
 }
+root = etree.fromstring(_POM_TEXT.strip().encode("utf-8"))
+_REMOVE_BLACKLIST = set()
+dependencies = root.find(_qn("dependencies"))
+for dependency in dependencies or []:
+    group_id = dependency.findtext(_qn("groupId"))
+    artifact_id = dependency.findtext(_qn("artifactId"))
+    if not group_id or not artifact_id:
+        continue
+    _REMOVE_BLACKLIST.add(f"{group_id}:{artifact_id}")
 
 
-def _code_file_path(app_path: Path, file_path: str, app_type: str) -> Path | str:
+def _verify_file_path(
+        app_path: Path, file_path: str,
+        app_type: str, file_type: Literal["code", "md"] = "code"
+) -> Path | str:
     """
     拼出代码文件的绝对路径
     路径不是相对项目 / 落到代码目录外（resources、target、其它模块）时，返回错误说明
@@ -173,6 +213,8 @@ def _code_file_path(app_path: Path, file_path: str, app_type: str) -> Path | str
         return f"未知的应用类型: {app_type}"
     rel = Path(file_path.strip())
     if not file_path.strip() or rel.is_absolute() or rel.root or rel.drive:
+        if file_type == "md":
+            return f"file_path 只能是相对项目的路径，如：{'/'.join(code_dir)}/README.md"
         return f"file_path 只能是相对项目的路径，如：{'/'.join(code_dir)}/MyApp.java"
     target = (app_path / rel).resolve()
     if not target.is_relative_to((app_path / Path(*code_dir)).resolve()):
@@ -183,11 +225,66 @@ def _code_file_path(app_path: Path, file_path: str, app_type: str) -> Path | str
 # javac 报错行长这样："MyApp.java:12: 错误: 找不到符号"（英文环境是 "error:"）
 _JAVAC_ERROR_LINE = re.compile(r":\d+:\s*(?:错误|error)", re.IGNORECASE)
 
+# javac 报"程序包 xxx 不存在"时（中文"程序包com.fm.common不存在"，英文"package com.fm.common does not exist"）
+_JAVAC_MISSING_PACKAGE = re.compile(
+    r"程序包\s*([\w.]+)\s*不存在|package\s+([\w.]+)\s+does\s+not\s+exist",
+    re.IGNORECASE,
+)
 
-def _pick_javac_errors(out: str, keep_after: int = 4, max_chars: int = 2000) -> str:
+
+def _is_missing_package_filtered(line: str, filter_items: list[str] | None) -> bool:
+    """
+    判断某行 javac 报错是否为需要被过滤的「程序包 xxx 不存在」类噪声。
+    约定：只能过滤 com.fm 前缀下的包缺失，外部依赖（如 org.apache.flink）的缺失一律不过滤。
+    filter_items 为 None 时默认过滤所有 com.fm 下的类；否则在 com.fm 范围内只过滤列出的包（含其子包）。
+    """
+    m = _JAVAC_MISSING_PACKAGE.search(line)
+    if not m:
+        return False
+    pkg = m.group(1) or m.group(2)
+    # 非 com.fm 的包缺失（外部依赖）不属于本工具可过滤范围，即使被写进 filter_items 也不过滤
+    if not pkg.startswith("com.fm"):
+        return False
+    if filter_items:
+        return any(pkg == item or pkg.startswith(item + ".") for item in filter_items)
+    return True
+
+
+# mvn 构建错误行长这样："[ERROR] Failed to execute goal ..."
+_MAVEN_ERROR_LINE = re.compile(r"^\[ERROR]", re.IGNORECASE)
+
+
+def _pick_maven_errors(out: str, keep_after: int = 4, max_chars: int = 2000) -> str:
+    """
+    只挑 mvn 输出里带 [ERROR] 前缀的行（错误行 + 紧随其后的几行详情），
+    把 Maven 结尾的 BUILD FAILURE 提示和无关噪音去掉 —— 只给模型看关键的地方
+    """
+    lines = out.splitlines()
+    heads = [i for i, line in enumerate(lines) if _MAVEN_ERROR_LINE.search(line)]
+    if not heads:  # 没匹配到就整段给出，宁可多给也别把真正的原因吞掉
+        return out.strip()[:max_chars]
+    kept, covered = [], -1
+    for i in heads:
+        if i <= covered:
+            continue
+        kept.extend(lines[i:i + keep_after])
+        covered = i + keep_after - 1
+    return "\n".join(kept).strip()[:max_chars]
+
+
+def _pick_javac_errors(
+        out: str,
+        keep_after: int = 4,
+        max_chars: int = 2000,
+        enable_filter: bool = False,
+        filter_items: list[str] | None = None,
+) -> str:
     """
     只挑 javac 的报错段落（报错行 + 紧随其后的源码、^、符号/位置），
     把批注处理的「注:」和结尾统计这些噪音去掉 —— 只给模型看关键的地方
+
+    enable_filter 开启后，额外过滤「程序包 xxx 不存在」这类噪声段：
+      filter_items 为 None 时默认过滤所有 com.fm 下的类，否则只过滤列出的包（含其子包）
     """
     lines = out.splitlines()
     heads = [i for i, line in enumerate(lines) if _JAVAC_ERROR_LINE.search(line)]
@@ -197,8 +294,14 @@ def _pick_javac_errors(out: str, keep_after: int = 4, max_chars: int = 2000) -> 
     for i in heads:
         if i <= covered:
             continue
+        if enable_filter and _is_missing_package_filtered(lines[i], filter_items):
+            # 该段只是"程序包不存在"噪声，忽略整段，避免 Agent 误改 import
+            covered = i + keep_after - 1
+            continue
         kept.extend(lines[i:i + keep_after])
         covered = i + keep_after - 1
+    if not kept:  # 全部报错都被过滤掉时，给个明确提示而不是空串
+        return "[已过滤全部\"程序包不存在\"类错误，本次报错可能都是依赖/包缺失导致]"
     return "\n".join(kept).strip()[:max_chars]
 
 
@@ -228,7 +331,7 @@ def _remove_dir_error_handler(_, path, exc):
 
 @register_tool(AGENT_NAME)
 @tool
-def initialize_project(runtime: ToolRuntime, project_name: str | None = None) -> Command | str:
+async def initialize_project(runtime: ToolRuntime, project_name: str | None = None) -> Command | str:
     """
     初始化项目
     参数： project_name: 项目名称(可选, 若不填，则系统自动处理)
@@ -265,12 +368,15 @@ def initialize_project(runtime: ToolRuntime, project_name: str | None = None) ->
             (app_path / "src" / "main" / "resources").mkdir(parents=True, exist_ok=True)
             # 构建对应的测试目录
             (app_path / "src" / "test" / "java").mkdir(parents=True, exist_ok=True)
-            return_code, stderr = run_mvn_command("mvn clean install", path=str(app_path))
+            return_code, stderr = await asyncio.to_thread(
+                run_mvn_command, "mvn clean install", path=str(app_path)
+            )
             if return_code != 0:
                 logger.error(f"项目构建失败，错误信息: {stderr}")
                 # 清空项目
                 app_path.rmdir()
                 return f"项目构建失败(已自动清除项目目录)，错误信息: {stderr}"
+            await _register_project_coords(runtime, app_type, date, p_name)
             return Command(
                 update={
                     "messages": [
@@ -288,6 +394,7 @@ def initialize_project(runtime: ToolRuntime, project_name: str | None = None) ->
             (app_path / "src" / "main" / "python").mkdir(parents=True, exist_ok=True)
             (app_path / "src" / "main" / "resources").mkdir(parents=True, exist_ok=True)
             (app_path / "src" / "tests").mkdir(parents=True, exist_ok=True)
+            await _register_project_coords(runtime, app_type, date, p_name)
             return Command(
                 update={
                     "messages": [
@@ -519,10 +626,14 @@ def remove_maven_dependence(runtime: ToolRuntime, maven_list: MavenList) -> str:
     back_pom_file_path = project_path / "pom.xml.bak"
     shutil.copy2(pom_file_path, back_pom_file_path)
     maven_delete_version_set = set()
+    rejected_maven_set = set()
     try:
         for maven_info in maven_infos:
             group_id = maven_info.get("group_id")
             artifact_id = maven_info.get("artifact_id")
+            if f"{group_id}:{artifact_id}" in _REMOVE_BLACKLIST:
+                rejected_maven_set.add(f"{group_id}:{artifact_id}")
+                continue
             maven_delete_version_set.add(f"{group_id}:{artifact_id}")
         # 读取 pom.xml 文件
         tree = etree.parse(pom_file_path)
@@ -550,10 +661,11 @@ def remove_maven_dependence(runtime: ToolRuntime, maven_list: MavenList) -> str:
         return f"项目构建失败(已经自动回滚)，错误信息: {stderr}"
     # 恢复 pom.xml 文件 -> 直接删除 pom.xml.bak 文件
     os.remove(back_pom_file_path)
-    return f"依赖移除成功"
+    return f"依赖移除成功{f'被系统强制保留的依赖:{'\n'.join(rejected_maven_set)}' if rejected_maven_set else ''}"
 
 
 @register_tool(AGENT_NAME)
+@register_tool("CVA", priority=1)
 @tool
 def view_java_api_code(
         jar_path: str, class_name: str,
@@ -583,6 +695,7 @@ def view_java_api_code(
 
 
 @register_tool(AGENT_NAME)
+@register_tool("CVA", priority=1)
 @tool
 def view_java_api_roughly_info(
         jar_path: str, class_name: str,
@@ -619,6 +732,7 @@ def view_java_api_roughly_info(
 
 
 @register_tool(AGENT_NAME)
+@register_tool("CVA", priority=1)
 @tool
 def view_java_class_by_jar(
         jar_path: str, keyword: str | None = None,
@@ -647,6 +761,7 @@ def view_java_class_by_jar(
 
 
 @register_tool(AGENT_NAME)
+@register_tool("CVA", priority=1)
 @tool
 def get_jar_by_maven(runtime: ToolRuntime, maven_list: MavenList | None = None) -> str:
     """
@@ -665,9 +780,12 @@ def get_jar_by_maven(runtime: ToolRuntime, maven_list: MavenList | None = None) 
     """
     maven_list = maven_list or {"maven_infos": []}
     maven_infos = maven_list.get("maven_infos", [])
-    app_type = runtime.context.app_type
+    ctx = runtime.context
+    app_type = (ctx.get("app_type") if isinstance(ctx, dict)
+                else getattr(ctx, "app_type", None)) or runtime.state.get("app_type")
+    date = (ctx.get("date") if isinstance(ctx, dict)
+            else getattr(ctx, "date", None)) or runtime.state.get("date")
     p_name = runtime.state.get("project_name")
-    date = runtime.context.date
     project_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
     group_ids = set(maven_info.get("group_id") for maven_info in maven_infos)
     artifact_ids = set(maven_info.get("artifact_id") for maven_info in maven_infos)
@@ -729,7 +847,7 @@ def write_big_data_app_code(runtime: ToolRuntime, code: str, file_path: str) -> 
         # 先进行主存放目录的创建，再进行文件的写入
         if not os.path.exists(app_path):
             return "项目未初始化，请先调用工具 initialize_project 进行初始化"
-        app_file_path = _code_file_path(app_path, file_path, app_type)
+        app_file_path = _verify_file_path(app_path, file_path, app_type)
         if isinstance(app_file_path, str):
             return app_file_path
         app_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -738,6 +856,48 @@ def write_big_data_app_code(runtime: ToolRuntime, code: str, file_path: str) -> 
     except Exception as e:
         logger.error(f"创建目录或者写入文件失败{type(e).__name__}: {e}")
         return f"创建目录或者写入文件失败{type(e).__name__}: {e}"
+
+
+def _change_interval_content(
+        app_file_path: Path, new_content: str | list,
+        file_path: str,
+        start_idx: int, end_idx: int | None = None,
+) -> str:
+    if start_idx <= 0:
+        logger.warning(f"Agent填入了无效的起始索引 start_idx: {start_idx}，已经自动调整为1")
+        start_idx = 1
+    if (end_idx is None) or (start_idx == end_idx):
+        end_idx = start_idx + 1
+    if start_idx > end_idx:
+        logger.error("不允许出现 start_idx 大于 end_idx 的情况")
+        return f"不允许出现 start_idx 大于 end_idx 的情况. start_idx: {start_idx}, end_idx: {end_idx}"
+    # 进行备份修改
+    back_file_path = app_file_path.with_suffix(".bak")
+    shutil.copy2(app_file_path, back_file_path)
+    try:
+        with open(app_file_path, "r", encoding='utf-8', newline='') as f:
+            old_code = f.readlines()
+        # 替换代码进行转换为列表
+        if isinstance(new_content, str):
+            new_lines = new_content.splitlines()
+        else:
+            new_lines = list(new_content)
+
+        old_code[start_idx - 1:end_idx - 1] = new_lines
+        for i, line in enumerate(old_code[:-1]):  # 只有文件最后一行可以不带换行
+            if not line.endswith(("\n", "\r")):
+                old_code[i] = line + "\n"
+
+        with open(app_file_path, "w", encoding='utf-8', newline='') as f:
+            f.writelines(old_code)
+        # 清除备份文件
+        os.remove(back_file_path)
+        return f"文件 {file_path} 修改成功"
+    except Exception as e:
+        logger.error(f"修改文件 {file_path} 失败{type(e).__name__}: {e}")
+        # 回滚
+        os.replace(back_file_path, app_file_path)
+        return f"修改文件 {file_path} 失败{type(e).__name__}: {e}"
 
 
 @register_tool(AGENT_NAME)
@@ -769,7 +929,7 @@ def change_big_data_app_code(
 
     # 构建应用的主目录
     app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
-    app_file_path = _code_file_path(app_path, file_path, app_type)
+    app_file_path = _verify_file_path(app_path, file_path, app_type)
     if isinstance(app_file_path, str):
         return app_file_path
     if not app_file_path.exists():
@@ -779,41 +939,7 @@ def change_big_data_app_code(
         return "flink应用只能用java代码来写"
     if app_type == "spark" and not file_path.endswith(".py"):
         return "spark应用只能用python代码来写"
-    if start_idx <= 0:
-        logger.warning(f"Agent填入了无效的起始索引 start_idx: {start_idx}，已经自动调整为1")
-        start_idx = 1
-    if (end_idx is None) or (start_idx == end_idx):
-        end_idx = start_idx + 1
-    if start_idx > end_idx:
-        logger.error("不允许出现 start_idx 大于 end_idx 的情况")
-        return f"不允许出现 start_idx 大于 end_idx 的情况. start_idx: {start_idx}, end_idx: {end_idx}"
-    # 进行备份修改
-    back_file_path = app_file_path.with_suffix(".bak")
-    shutil.copy2(app_file_path, back_file_path)
-    try:
-        with open(app_file_path, "r", encoding='utf-8', newline='') as f:
-            old_code = f.readlines()
-        # 替换代码进行转换为列表
-        if isinstance(new_code, str):
-            new_lines = new_code.splitlines()
-        else:
-            new_lines = list(new_code)
-
-        old_code[start_idx - 1:end_idx - 1] = new_lines
-        for i, line in enumerate(old_code[:-1]):  # 只有文件最后一行可以不带换行
-            if not line.endswith(("\n", "\r")):
-                old_code[i] = line + "\n"
-
-        with open(app_file_path, "w", encoding='utf-8', newline='') as f:
-            f.writelines(old_code)
-        # 清除备份文件
-        os.remove(back_file_path)
-        return f"文件 {file_path} 修改成功"
-    except Exception as e:
-        logger.error(f"修改文件 {file_path} 失败{type(e).__name__}: {e}")
-        # 回滚
-        os.replace(back_file_path, app_file_path)
-        return f"修改文件 {file_path} 失败{type(e).__name__}: {e}"
+    return _change_interval_content(app_file_path, new_code, file_path, start_idx, end_idx)
 
 
 @register_tool(AGENT_NAME)
@@ -826,7 +952,7 @@ def add_big_data_app_code(runtime: ToolRuntime, new_code: str, file_path: str, a
         - file_path： 文件路径，如：src/main/com/example/MyApp.java
         - auto_wrap： 是否自动添加换行符（默认值为True）（这里是指在 new_code 前面加上 \n 换行符）
     注意：
-        - 系统会自动处理首行的换行符(防止出现首行在尾行开始)，无需手动添加。即：会在 new_code 前面加上 \n 换行符 -> \n{new_code}
+        - 系统会默认自动处理首行的换行符(防止出现首行在尾行开始)，无需手动添加。即：会在 new_code 前面加上 \n 换行符 -> \n{new_code}
         - 若 auto_wrap 为 False，则不会在 new_code 前面加上 \n 换行符
     返回：
         追加是否成功的结果
@@ -837,7 +963,7 @@ def add_big_data_app_code(runtime: ToolRuntime, new_code: str, file_path: str, a
 
     # 构建应用的主目录
     app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
-    app_file_path = _code_file_path(app_path, file_path, app_type)
+    app_file_path = _verify_file_path(app_path, file_path, app_type)
     if isinstance(app_file_path, str):
         return app_file_path
     if not app_file_path.exists():
@@ -906,17 +1032,25 @@ def view_app_interval_code(runtime: ToolRuntime, file_path: str, start_idx: int,
 
 @register_tool(AGENT_NAME)
 @tool
-def verify_big_data_app_code(runtime: ToolRuntime, file_path: str) -> str:
+def verify_big_data_app_code(
+        runtime: ToolRuntime, file_path: str,
+        enable_filter: bool = False, filter_items: list[str] | None = None,
+) -> str:
     """
     验证单个大数据应用代码能否编译（java 代码专用）
     参数:
         file_path: 文件路径，如：src/main/java/com/fm/MyApp.java
+        enable_filter: 是否开启筛选，默认值为False  -> 改选项时专门筛选类似`程序包com.fm.common不存在`的噪声
+        filter_items: 筛选的项，默认值为None  -> 改选项时筛选的项，如：["com.fm.common", "com.fm.deserialization", ...]
     返回:
         验证结果
     注意:
         - 依赖清单第一次验证时用 mvn 生成一次，存在 target/classpath.txt，之后直接复用
         - target/ 会被 mvn clean 删掉，所以改过依赖之后会自动重建
         - 拿不到清单时不带依赖编译，返回值会明确说明"程序包不存在"这类错误不算代码问题
+        - 本工具的原理在于使用 javac 进行验证，所以可能会出现无法检验到自定义类的语法错误，如：程序包com.fm.common不存在
+        - 关于参数 `filter_items` 若为 None，则会默认过滤所有 com.fm 下的类，当 enable_filter 为 True 时，才会生效
+        - 参数 `filter_items`只能过滤 com.fm 下的类，不能过滤其他类的错误
     """
     # 拼接路径
     app_type = runtime.context.app_type
@@ -924,7 +1058,7 @@ def verify_big_data_app_code(runtime: ToolRuntime, file_path: str) -> str:
     date = runtime.context.date
 
     app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
-    app_file_path = _code_file_path(app_path, file_path, app_type)
+    app_file_path = _verify_file_path(app_path, file_path, app_type)
     if isinstance(app_file_path, str):
         return app_file_path
     if not app_file_path.exists():
@@ -932,19 +1066,278 @@ def verify_big_data_app_code(runtime: ToolRuntime, file_path: str) -> str:
     classpath, why = _javac_classpath(app_path)
     classes_path = app_path / "target" / "classes"
     cp = f"{classes_path}{os.pathsep}{classpath}" if classpath else f"{classes_path}"
+    base_cmd = (f'-encoding UTF-8 -d "{classes_path}" -sourcepath src/main/java '
+                f'-cp "{cp}" {app_file_path.name}')
+    release_version = maven_java_release(app_path) if _ALIGN_MAVEN_JDK else None
+    release = f"--release {release_version} " if release_version else ""
     res_code, res_out = run_java_command(
-        f'javac -encoding UTF-8 -d "{classes_path}" -sourcepath src/main/java -cp "{cp}" {app_file_path.name}',
-        path=f"{app_file_path.parent}"
-    )
+        f'javac {release}{base_cmd}', path=f"{app_file_path.parent}")
+    if (_ALIGN_MAVEN_JDK and release_version == "8" and res_code != 0
+            and "release" in res_out
+            and ("invalid" in res_out.lower() or "无效" in res_out)):
+        # 本机 javac 是 JDK 8 时不支持 --release
+        res_code, res_out = run_java_command(
+            f'javac -source 8 -target 8 {base_cmd}', path=f"{app_file_path.parent}")
     if res_code != 0:
         if not classpath:
             # 没有依赖清单时，"程序包 xxx 不存在"是工具的盲区，不是代码的问题，别让 Agent 去改 import
             return (f"编译未通过，但本次没有加载依赖（{why}），"
-                    f"像'程序包 xxx 不存在'这类错误不算代码问题：\n{_pick_javac_errors(res_out)}")
-        return f"语法错误: {_pick_javac_errors(res_out)}"
+                    f"像'程序包 xxx 不存在'这类错误不算代码问题：\n"
+                    f"{_pick_javac_errors(res_out, enable_filter=enable_filter, filter_items=filter_items)}")
+        return f"语法错误: {_pick_javac_errors(res_out, enable_filter=enable_filter, filter_items=filter_items)}"
     if not classpath:
         return f"语法正确（本次未加载依赖，只确认了语法层面）"
     return f"语法正确"
+
+
+@register_tool(AGENT_NAME)
+@tool
+def mvn_verify_project(runtime: ToolRuntime) -> str:
+    """
+    整体验证对应的项目（会自动锁定项目目录）
+    参数：无
+    返回：验证结果
+    注意：
+        - 本工具的原理将会直接运行 mvn verify -Dmaven.test.skip=true 命令，与 `verify_big_data_app_code` 工具项目更完善，但也更慢
+        - 该工具不会编译并验证测试代码
+        - 本工具建议在差不多完成项目时进行调用，而不要写完一个文件就调用一次
+    """
+    app_type = runtime.context.app_type
+    p_name = runtime.state.get("project_name")
+    date = runtime.context.date
+
+    app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+    if not os.path.exists(app_path):
+        return "项目未初始化，请先调用工具 initialize_project 进行初始化"
+    res_code, res_out = run_mvn_command(
+        f"mvn verify -Dmaven.test.skip=true",
+        path=f"{app_path}"
+    )
+    if res_code != 0:
+        return f"验证失败: {_pick_maven_errors(res_out) or res_out}"
+    return f"验证成功"
+
+
+@register_tool(AGENT_NAME)
+@tool
+def write_md_document(runtime: ToolRuntime, md_path: str, content: str) -> str:
+    """
+    为这个项目写专门的md文档
+    参数:
+        md_path: 相对项目文档路径，如：src/main/com/docs/README.md
+        content: 文档内容
+    注意：
+        - 参数 file_path 只能落在 项目目录内，且不能写其他后缀的文件，否则均会被拒绝
+        - 参数 content 不能为空字符串
+    返回:
+        写入结果
+    """
+    app_type = runtime.context.app_type
+    p_name = runtime.state.get("project_name")
+    date = runtime.context.date
+    tmp_content = content.strip()
+    if not tmp_content:
+        return "文档内容不能为空"
+    app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+    if not md_path.endswith(".md"):
+        return "文档路径必须以 .md 结尾"
+    try:
+        # 先进行主存放目录的创建，再进行文件的写入
+        if not os.path.exists(app_path):
+            return "项目未初始化，请先调用工具 initialize_project 进行初始化"
+        app_file_path = _verify_file_path(app_path, md_path, app_type, "md")
+        if isinstance(app_file_path, str):
+            return app_file_path
+        app_file_path.parent.mkdir(parents=True, exist_ok=True)
+        app_file_path.write_text(content, encoding='utf-8')
+        return f"文件 {md_path} 写入成功"
+    except Exception as e:
+        logger.error(f"写入文件 {md_path} 失败{type(e).__name__}: {e}")
+        return f"写入文件 {md_path} 失败{type(e).__name__}: {e}"
+
+
+@register_tool(AGENT_NAME)
+@tool
+def change_md_document(
+        runtime: ToolRuntime, md_path: str, new_content: str,
+        start_idx: int, end_idx: int | None = None
+) -> str:
+    """
+    修改指定区间的大数据应用代码
+    参数:
+        new_content: 新的文档内容
+        md_path: markdown文档路径，如：src/main/com/docs/README.md
+        start_idx: 起始索引（从1开始计数，1 表示首行）
+        end_idx: 结束索引（从1开始计数，1 表示首行）（默认值为None）
+        注意：
+            - 文档路径不能是绝对路径（因为系统会自动管理文件路径），只能是相对于 项目的路径，如：src/main/com/docs/README.md
+            - 其中的起始索引与结束索引表示一个区间，起始索引是闭区间, 结束索引是开区间。即：[start_idx, end_idx)
+            - 同时，允许出现 new_content 的行数不等于原始代码的行数的情况。即，可比原始区间更长或更短。
+            - 若 end_idx 为 None，则默认只替换 start_idx 行的文档
+            - 若你不知道对应的区间的文档是怎么样的，你可以先尝试使用 view_app_interval_document 查看对应的文档
+    返回:
+        修改结果
+    """
+    app_type = runtime.context.app_type
+    p_name = runtime.state.get("project_name")
+    date = runtime.context.date
+
+    # 构建应用的主目录
+    app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+    app_file_path = _verify_file_path(app_path, md_path, app_type, "md")
+    if isinstance(app_file_path, str):
+        return app_file_path
+    if not app_file_path.exists():
+        return f"文件 {md_path} 不存在, 请尝试相对项目的路径写法，如：src/main/com/docs/README.md"
+    # 进行限制判断
+    if not md_path.endswith(".md"):
+        return "只能修改markdown文档文件"
+    return _change_interval_content(
+        app_file_path, new_content, md_path, start_idx, end_idx
+    )
+
+
+@register_tool(AGENT_NAME)
+@tool
+def add_md_document(runtime: ToolRuntime, new_content: str, md_path: str, auto_wrap: bool = True) -> str:
+    """
+    追加 文档内容 到 指定markdown文件的 末尾
+    参数：
+        - new_content： 需要添加的代码文本
+        - md_path： 文件路径，如：src/main/com/docs/README.md
+        - auto_wrap： 是否自动添加换行符（默认值为True）（这里是指在 new_content 前面加上 \n 换行符）
+    注意：
+        - 系统会默认自动处理首行的换行符(防止出现首行在尾行开始)，无需手动添加。即：会在 new_content 前面加上 \n 换行符 -> \n{new_content}
+        - 若 auto_wrap 为 False，则不会在 new_content 前面加上 \n 换行符
+    返回：
+        追加是否成功的结果
+    """
+    app_type = runtime.context.app_type
+    p_name = runtime.state.get("project_name")
+    date = runtime.context.date
+
+    # 构建应用的主目录
+    app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+    app_file_path = _verify_file_path(app_path, md_path, app_type, "md")
+    if isinstance(app_file_path, str):
+        return app_file_path
+    if not app_file_path.exists():
+        return f"文件 {md_path} 不存在, 请尝试相对项目的路径写法，如：src/main/com/example/MyApp.java"
+    # 进行限制判断
+    if not md_path.endswith(".md"):
+        return "只能修改markdown文档文件"
+    # 进行备份
+    back_file_path = app_file_path.with_suffix(".bak")
+    shutil.copy2(app_file_path, back_file_path)
+    try:
+        with open(app_file_path, "a+", encoding='utf-8', newline='') as f:
+            f.write(f"{'\n' if auto_wrap else ''}{new_content}")
+        # 清除备份文件
+        os.remove(back_file_path)
+        return f"文件追加成功"
+    except Exception as e:
+        logger.error(f"追加文件失败{type(e).__name__}: {e}")
+        # 回滚
+        os.replace(back_file_path, app_file_path)
+        return f"追加文件失败{type(e).__name__}: {e}"
+
+
+@register_tool(AGENT_NAME)
+@tool
+def view_md_document(runtime: ToolRuntime, md_path: str, start_idx: int, end_idx: int | None = None) -> str:
+    """
+        查看指定区间的markdown文档内容
+        参数:
+            md_path: markdown文档路径，如：src/main/com/docs/README.md
+            start_idx: 起始索引（从1开始计数，1 表示首行）
+            end_idx: 结束索引（从1开始计数，1 表示首行）（默认值为None）
+        返回:
+            查看结果
+        """
+    app_type = runtime.context.app_type
+    p_name = runtime.state.get("project_name")
+    date = runtime.context.date
+    # 构建应用的主目录
+    app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+    if not (app_path / md_path).exists():
+        return f"文件 {md_path} 不存在, 请尝试相对项目的路径写法，如：src/main/com/docs/README.md"
+    if not md_path.endswith(".md"):
+        return "只能查看markdown文档文件"
+    if start_idx <= 0:
+        logger.warning(f"Agent填入了无效的起始索引 start_idx: {start_idx}，已经自动调整为1")
+        start_idx = 1
+    try:
+        print_list = []
+        with open((app_path / md_path), "r", encoding='utf-8', newline='') as f:
+            code = f.readlines()
+        if end_idx is None:
+            end_idx = len(code) + 1
+        if start_idx > end_idx:
+            logger.error("不允许出现 start_idx 大于 end_idx 的情况")
+            return f"不允许出现 start_idx 大于 end_idx 的情况. start_idx: {start_idx}, end_idx: {end_idx}"
+        for i, line in enumerate(code, start=1):
+            # 筛选出 [start_idx - 1:end_idx - 1] 区间的行
+            if start_idx <= i < end_idx:
+                print_list.append(f"{i}\t{line}")
+        return f"区间[{start_idx}, {end_idx})的代码如下：\n{'\r'.join(print_list)}"
+    except Exception as e:
+        logger.error(f"查看文件 {md_path} 失败{type(e).__name__}: {e}")
+        return f"查看文件 {md_path} 失败{type(e).__name__}: {e}"
+
+
+@register_tool(AGENT_NAME)
+@tool
+def info_inquiry(need_add_info: NeedAddInfo) -> str:
+    """
+    该工具是为了防止上游Agent分布的任务还是含糊不清或者相关信息不详细而设计的。
+    通过该工具，你可以直接向用户追问，无需向上游进行询问。
+    参数：
+        need_add_info: 需要追问的信息
+    参数详解：
+        - title：整体追问的标题（可选）比如说：追问一些详细的数据
+        - description：整体追问的描述，比如说：相关的kafka、流程不详细，现在需要进行追问
+        - info_inquiry：详细需要追加的信息(一个列表，可以一次询问一个或多个问题，每个元素是一个InfoInquiry对象，包含question、suggestion、suggestion_index)
+            - question：需要向用户追问的问题，比如说：kafka的topic名称
+            - suggestion：该问题的建议（可选，可以提出多个建议，但是不得超过3个建议），比如说：整体采用滚动窗口，整个窗口7天，每次滚动3天
+            - suggestion_index：你建议采用哪个建议（可选），比如说：0，1，2，不建议采用其他索引
+    注意：
+        - 该工具是为了让用户的体验感更好，且更加直观，而不是一堆问题直接“甩”到用户上
+        - 该工具允许用户自主提出做法，所以建议不用太多
+    原理： 通过`中断`，将信息传给用户进行处理
+    返回： 对应问题的答复
+    """
+    out_dict = {"title": need_add_info.title, "description": need_add_info.description}
+    inquiry = need_add_info.info_inquiry
+    inquiry_list = []
+    for info in inquiry:
+        len_suggestion = len(info.suggestion)
+        if len_suggestion > 3:
+            suggestion = info.suggestion[:3]
+        else:
+            suggestion = info.suggestion
+        idx = info.suggestion_index
+        if idx not in (0, 1, 2):
+            idx = None
+        inquiry_list.append(
+            {
+                "question": info.question,
+                "suggestion": suggestion,
+                "suggestion_index": idx
+            }
+        )
+    out_dict["info_inquiry"] = inquiry_list
+    answer = interrupt(out_dict)  # 用户将会返回 list({"question", "reply"})
+    if not isinstance(answer, list):
+        return "用户返回了错误的信息，请再次调用该工具，或者直接调用`DevelopAgentOutState`工具进行询问"
+
+    human_answer = []
+    for an in answer:
+        question = an.get("question")
+        reply = an.get("reply")
+        if not question or not reply:
+            continue
+        human_answer.append(f"问题：{question}，对应的人工答复为：{reply}")
+    return "\n".join(human_answer)
 
 
 @register_tool(AGENT_NAME)

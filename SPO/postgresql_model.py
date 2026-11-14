@@ -290,3 +290,71 @@ class ToolTraceInfo(Base):
         nullable=False,
         server_default=text("now()"),
     )
+
+
+class AdminProject(Base):
+    """用户历史项目/任务登记；模型只接触 project_id，真实目录由 app_type/date/project_name 解析。"""
+
+    __tablename__ = "admin_project"
+    __table_args__ = (
+        CheckConstraint("app_type in ('spark', 'flink')", name="admin_project_app_type_check"),
+        CheckConstraint(
+            "status in ('active', 'completed', 'failed', 'missing', 'archived')",
+            name="admin_project_status_check",
+        ),
+        CheckConstraint(
+            "verify_status in ('unknown', 'passed', 'failed', 'error')",
+            name="admin_project_verify_status_check",
+        ),
+        UniqueConstraint(
+            "admin_id", "app_type", "project_date", "project_name",
+            name="uk_admin_project_coords",
+        ),
+        {"schema": "public"},
+    )
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    admin_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str] = mapped_column(TEXT, nullable=False, server_default=text("''"))
+    summary: Mapped[str] = mapped_column(TEXT, nullable=False, server_default=text("''"))
+    app_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    project_date: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    project_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    start_message_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    end_message_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'active'"))
+    verify_status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'unknown'"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+
+class AdminProjectConversation(Base):
+    """项目在某一个会话里的对话区间；跨会话续聊会新增一条。"""
+
+    __tablename__ = "admin_project_conversation"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "thread_id", "start_message_id",
+            name="uk_project_conversation_segment",
+        ),
+        {"schema": "public"},
+    )
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    start_message_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    end_message_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )

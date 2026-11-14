@@ -34,6 +34,9 @@ function dispatch({ event, data }, handlers) {
     case 'verification':
       handlers.onVerification?.(data)
       break
+    case 'usage':
+      handlers.onUsage?.(data)
+      break
     case 'token':
       handlers.onToken?.(data)
       break
@@ -65,6 +68,48 @@ export async function streamChat({ userId, message, threadId, signal }, handlers
       Authorization: AUTH_PREFIX + getToken(),
     },
     body: JSON.stringify({ user_id: userId, message, thread_id: threadId || null }),
+    signal,
+  })
+
+  if (!resp.ok || !resp.body) {
+    let detail = `请求失败（HTTP ${resp.status}）`
+    try {
+      const body = await resp.json()
+      detail = body?.detail || body?.msg || detail
+    } catch {
+      /* 忽略非 JSON 响应 */
+    }
+    if (resp.status === 401) handleUnauthorized()
+    throw new ApiError(detail, resp.status)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    let index
+    while ((index = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, index)
+      buffer = buffer.slice(index + 2)
+      const evt = parseEvent(raw)
+      if (evt) dispatch(evt, handlers)
+    }
+  }
+}
+
+export async function streamResume({ userId, threadId, answer, signal }, handlers = {}) {
+  const resp = await fetch('/ai/resume/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: AUTH_PREFIX + getToken(),
+    },
+    body: JSON.stringify({ user_id: userId, thread_id: threadId, answer }),
     signal,
   })
 
