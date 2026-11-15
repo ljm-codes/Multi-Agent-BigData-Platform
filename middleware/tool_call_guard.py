@@ -82,7 +82,7 @@ class ToolCallHistoryGuard(AgentMiddleware):
         super().__init__()
         self.agent = agent
 
-    async def abefore_model(self, state: Any, runtime: Any):
+    def _repair(self, state: Any, runtime: Any):
         messages = (state or {}).get("messages") or []
         repairs = repair_missing_tool_messages(messages)
         if not repairs:
@@ -95,3 +95,9 @@ class ToolCallHistoryGuard(AgentMiddleware):
         )
         _record_missing(self.agent, thread_id, missing_tool_calls(messages))
         return {"messages": repairs}
+
+    def before_model(self, state: Any, runtime: Any):
+        return self._repair(state, runtime)
+
+    async def abefore_model(self, state: Any, runtime: Any):
+        return self._repair(state, runtime)

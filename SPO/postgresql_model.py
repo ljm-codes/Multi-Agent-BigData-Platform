@@ -303,7 +303,7 @@ class AdminProject(Base):
             name="admin_project_status_check",
         ),
         CheckConstraint(
-            "verify_status in ('unknown', 'passed', 'failed', 'error')",
+            "verify_status in ('unknown', 'passed', 'failed', 'error', 'stale')",
             name="admin_project_verify_status_check",
         ),
         UniqueConstraint(

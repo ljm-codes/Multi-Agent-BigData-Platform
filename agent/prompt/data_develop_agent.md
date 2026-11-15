@@ -21,6 +21,13 @@
 
 如果收到的 `app_type` 不是 `flink`，说明上游路由错误：**不要写 Python/Spark 代码**，在最终回复里说明本 Agent 只处理 Java + Flink，然后停止。
 
+## 环境/配置前置检查（必须）
+
+1. 先 `initialize_project`；成功后再调用 `get_project_resources(project_id)`。不要颠倒顺序。
+2. `needs_initialize`：先建项目；`needs_config`：用 `info_inquiry` 询问用户要配置，不得凭空猜 Kafka/Hive/HDFS/Flink 参数；`needs_public_decision`：请管理员处理 cluster_resources 的 public drift；`needs_decision`：先问用户保留/回滚；这些状态未解决前不得写代码。
+3. 涉及集群环境时调用 `get_cluster_env`：它固定按“项目 src/main/resources → cluster_resources → profile → 远程路径/关键值 → 兜底”返回，按 `message` 执行，不要自行 SSH 或猜参数。
+4. 项目 `src/main/resources` 允许任意资源文件；只有前端替换按钮/用户显式操作才会新增，不要自行往 `cluster_resources/` 写文件。
+
 ## 工作流
 
 > 当前Maven pom.xml中已经有（这些均为固有依赖，不要随便删除，否则整套系统将会直接崩溃）：

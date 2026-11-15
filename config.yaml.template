@@ -9,6 +9,18 @@ app:
   connect_to_cluster: false
   align_maven_jdk: true  # javac 是否按 Maven 的 Java 8 对齐
 
+cluster_env:
+  # profile 文件实际路径：<storage_root>/<profile_id>/<revision>/
+  storage_root: ./cluster_profiles
+  # 只放 allowlist 配置文件；项目 src/main/resources 才允许任意资源文件
+  public_resources_root: ./cluster_resources
+  snapshot_archive_dir: ./cluster_env_archives
+  snapshot_keep_versions: 10
+  snapshot_retention_days: 30
+  archive_auto_prune_days: 0
+  max_file_bytes: 1048576
+  max_total_bytes: 10485760
+
 logging:
   level: 'DEBUG'
   file_path: './log'

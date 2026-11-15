@@ -65,7 +65,7 @@ SPARK = (
 FLINK = (
     "flink run-application -t yarn-application -d -c com.fm.WordCountApp -p 1 "
     "-D jobmanager.memory.process.size=1024m -D taskmanager.memory.process.size=1024m "
-    "-D taskmanager.numberOfTaskSlots=1 -D yarn.provided.lib.dir=hdfs:///app/flink/jar "
+    "-D taskmanager.numberOfTaskSlots=1 "
     "hdfs:///app/flink/jar/wordcount-flink-0.1.0.jar"
 )
 

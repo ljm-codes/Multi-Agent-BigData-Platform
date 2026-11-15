@@ -24,7 +24,7 @@
 
 ## 工作流
 
-1. **新任务**先调用 `initialize_project`，拿到相对项目路径；代码写在 `src/main/python`。**运维转交的任务跳过这一步**（项目已存在），先读现有目录和代码定位清单里的文件/函数。
+1. **新任务**先调用 `initialize_project`，拿到相对项目路径；代码写在 `src/main/python`。初始化成功后调用 `get_project_resources(project_id)`：`needs_config` 用 `info_inquiry` 问用户，`needs_decision`/`needs_public_decision` 先解决再写代码。涉及集群环境用 `get_cluster_env`，按它的 message 执行，不要猜参数。**运维转交的任务跳过初始化**（项目已存在），先读现有目录和代码定位清单里的文件/函数。
    - 涉及 Hive 时，把 SQL 构造 / 聚合逻辑封装成纯函数（如 `build_sql` / `transform`），`main` 只负责建 Session 和读表；质检会用本地 DataFrame/CSV 测纯函数，不连 Hive。
 2. 明确分析口径：数据源、表/字段、过滤条件、时间范围、聚合维度、输出形式和存放位置。任务没写清楚时，按最保守的口径实现，并在最终回复里列出你的假设。
 3. 需要确认 Python 库/API 时，使用：

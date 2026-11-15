@@ -39,6 +39,12 @@ from routers.ai_chat import route as ai_chat_route
 from routers.manager import route as login_route
 from routers.open_app import route as open_app_route
 from routers.start_file import route as start_file_route
+from routers.cluster_env import route as cluster_env_route
+from routers.cluster_profile_edit import route as cluster_profile_edit_route
+from routers.cluster_profile_upload import route as cluster_profile_upload_route
+from routers.cluster_public import route as cluster_public_route
+from routers.cluster_archive import route as cluster_archive_route
+from routers.cluster_project import route as cluster_project_route
 
 main_graph = None
 checker_task = None
@@ -56,7 +62,7 @@ whitelist = {"/auth/admin/recommend/register", "/auth/admin/login", "/open/app/g
              "/favicon.ico"}
 # 只保护这三组接口；其余路径（静态资源、/admin 这种 SPA 路由）一律放行 ——
 # 浏览器直接访问页面时不会带 Authorization 头，拦了就打不开
-_PROTECTED_PREFIXES = ("/ai/", "/auth/admin/", "/open/app/", "/ops/")
+_PROTECTED_PREFIXES = ("/ai/", "/auth/admin/", "/open/app/", "/ops/", "/cluster/")
 
 if not os.path.isdir(ROOT_BASE_DIR_PATH / 'cache'):
     os.makedirs(ROOT_BASE_DIR_PATH / 'cache')
@@ -243,6 +249,16 @@ async def lifespan(api: FastAPI):
             from Tasks.dev_handover import set_dev_runner, set_dev_state_getter
             set_dev_runner(_dev_handover_runner)
             set_dev_state_getter(_dev_handover_state)
+        # 启动时校验 cluster_resources；DB 为空才初始导入，不覆盖已有公有快照
+        try:
+            from services.cluster_materialize import bootstrap_cluster_env
+            bootstrap = await asyncio.to_thread(bootstrap_cluster_env)
+            if bootstrap.get("ok"):
+                logger.info("cluster_resources 启动校验通过：%s", bootstrap)
+            else:
+                logger.error("cluster_resources 启动校验失败：%s", bootstrap)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("cluster_resources 启动校验异常：%s: %s", type(exc).__name__, exc)
         key_manage = KeyManage()
         key_manage.start()
         # 启动整个运维流程
@@ -345,12 +361,25 @@ def start_app():
         app.include_router(ops_control_route, prefix="/ops", tags=["运维操作"])
     app.include_router(login_route, prefix="/auth/admin", tags=["账号管理"])
     app.include_router(open_app_route, prefix="/open/app", tags=["打开应用操作"])
-    app.include_router(start_file_route, tags=["启动文件"])
+    app.include_router(cluster_env_route, prefix="/cluster", tags=["集群环境"])
+    app.include_router(cluster_profile_upload_route, prefix="/cluster", tags=["集群环境-上传"])
+    app.include_router(cluster_profile_edit_route, prefix="/cluster", tags=["集群环境-编辑"])
+    app.include_router(cluster_public_route, prefix="/cluster", tags=["集群环境-公有资源"])
+    app.include_router(cluster_archive_route, prefix="/cluster", tags=["集群环境-归档"])
+    app.include_router(cluster_project_route, prefix="/cluster", tags=["集群环境-项目资源"])
 
     @app.get("/ops", include_in_schema=False)
     async def ops_page():
         # 前端是 history 路由；直接刷新 /ops 不能落到 StaticFiles（它不认识这个路径）
         return FileResponse(ROOT_BASE_DIR_PATH / "static" / "dist" / "index.html")
 
+    @app.get("/cluster", include_in_schema=False)
+    async def cluster_page():
+        # 同上：/cluster 是前端页面，/cluster/... 才是 API
+        return FileResponse(ROOT_BASE_DIR_PATH / "static" / "dist" / "index.html")
+
+    # 这个 router 是 SPA 兜底（/{full_path:path}），必须放在所有 API/页面路由之后，
+    # 否则 /cluster/profiles 这类后注册的接口会被它当成前端路由返回 index.html。
+    app.include_router(start_file_route, tags=["启动文件"])
     app.mount("/", StaticFiles(directory=ROOT_BASE_DIR_PATH / "static" / "dist"), name="static")
     return app

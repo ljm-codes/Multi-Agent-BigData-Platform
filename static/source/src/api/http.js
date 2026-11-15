@@ -78,3 +78,38 @@ export async function request(path, { method = 'GET', body, auth = true, raw = f
   // raw: 有些接口直接返回裸数组（比如 /ai/background），不解信封
   return raw ? payload : payload?.data ?? null
 }
+
+/** multipart 上传：不要手动设 Content-Type，浏览器会带 boundary */
+export async function postForm(path, formData) {
+  const headers = {}
+  if (getToken()) headers.Authorization = AUTH_PREFIX + getToken()
+  const resp = await fetch(path, { method: 'POST', headers, body: formData })
+  const payload = await toJson(resp)
+  if (resp.status === 401) {
+    handleUnauthorized()
+    throw new ApiError(payload?.msg || '登录已失效，请重新登录', 401)
+  }
+  if (!resp.ok) {
+    throw new ApiError(payload?.msg || `请求失败（HTTP ${resp.status}）`,
+      payload?.code ?? resp.status)
+  }
+  if (payload && typeof payload === 'object' && 'code' in payload && payload.code !== 0) {
+    throw new ApiError(payload.msg || '请求失败', payload.code)
+  }
+  return payload?.data ?? null
+}
+
+/** 下载二进制文件（归档 tar.gz）；返回 { blob, filename } */
+export async function downloadBlob(path) {
+  const headers = {}
+  if (getToken()) headers.Authorization = AUTH_PREFIX + getToken()
+  const resp = await fetch(path, { method: 'GET', headers })
+  if (resp.status === 401) {
+    handleUnauthorized()
+    throw new ApiError('登录已失效，请重新登录', 401)
+  }
+  if (!resp.ok) throw new ApiError(`下载失败（HTTP ${resp.status}）`, resp.status)
+  const disposition = resp.headers.get('content-disposition') || ''
+  const matched = /filename="?([^";]+)"?/i.exec(disposition)
+  return { blob: await resp.blob(), filename: matched?.[1] || 'archive.tar.gz' }
+}

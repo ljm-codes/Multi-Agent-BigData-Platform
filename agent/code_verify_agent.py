@@ -22,6 +22,7 @@ from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
 from hdfs import InsecureClient
+from sqlalchemy import and_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.chat_models import init_chat_model
@@ -51,11 +52,13 @@ from Tools.data_develop_agent_tools import (  # noqa: F401  # 把 jar 签名查�
 )
 from Tools.db import AsyncSessionLocal
 from Tools.registry import get_tools, get_priority_tools
+from services.cluster_materialize import check_project
 from Tools.run_command import arun_mvn_command, arun_python_command, run_mvn_command
 from Tools.share_check_tool import redis_con, manager
 from Tools.struct_analy import extract_text_content, repair_invalid_tool_calls
 from Tools.usage_metrics import merge_raw_usage, usage_ledger_message
 from Tools.mermaid_check import check_and_repair_mermaid
+import Tools.cluster_env_tools  # noqa: F401
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
 from middleware.code_verify_agent_middleware import PerceptionBackground
 from middleware.compose import chain_model_call_wrappers, ComposedModelResult, run_before_model, \
@@ -713,23 +716,154 @@ def _schedule_submit_target_code(*args, **kwargs) -> None:
     task.add_done_callback(_done)
 
 
-def _package_submit_f_command(app_path: str | Path, project_name: str, app_type: str = "flink") -> dict:
+_SHADE_PLUGIN_XML = """
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <!-- Flink/Hadoop/log 由集群提供，不打进 jar；只带项目真正缺的依赖 -->
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>org.apache.flink:flink-clients</exclude>
+                                    <exclude>org.apache.flink:flink-core</exclude>
+                                    <exclude>org.apache.flink:flink-java</exclude>
+                                    <exclude>org.apache.flink:flink-runtime</exclude>
+                                    <exclude>org.apache.flink:flink-streaming-java</exclude>
+                                    <exclude>org.apache.flink:flink-optimizer</exclude>
+                                    <exclude>org.apache.flink:flink-annotations</exclude>
+                                    <exclude>org.apache.flink:flink-metrics-core</exclude>
+                                    <exclude>org.apache.flink:flink-json</exclude>
+                                    <exclude>org.apache.flink:flink-runtime-web</exclude>
+                                    <exclude>org.apache.flink:flink-connector-files</exclude>
+                                    <exclude>org.apache.flink:flink-table-*</exclude>
+                                    <exclude>org.apache.flink:flink-dist</exclude>
+                                    <exclude>org.apache.flink:flink-scala*</exclude>
+                                    <exclude>org.apache.flink:flink-rpc-*</exclude>
+                                    <exclude>org.apache.flink:flink-shaded-*</exclude>
+                                    <exclude>org.apache.hadoop:*</exclude>
+                                    <exclude>org.apache.hadoop.thirdparty:*</exclude>
+                                    <exclude>log4j:*</exclude>
+                                    <exclude>org.slf4j:*</exclude>
+                                </excludes>
+                            </artifactSet>
+                            <filters>
+                                <!-- 只保留集群实际平台（Linux x86_64）的原生库，避免把 win/mac/arm 全打进去 -->
+                                <filter>
+                                    <artifact>com.ververica:frocksdbjni</artifact>
+                                    <includes>
+                                        <include>org/rocksdb/**</include>
+                                        <include>librocksdbjni-linux64.so</include>
+                                        <include>META-INF/**</include>
+                                    </includes>
+                                </filter>
+                                <filter>
+                                    <artifact>com.github.luben:zstd-jni</artifact>
+                                    <includes>
+                                        <include>com/github/luben/zstd/**</include>
+                                        <include>linux/amd64/**</include>
+                                        <include>META-INF/**</include>
+                                    </includes>
+                                </filter>
+                                <filter>
+                                    <artifact>org.xerial.snappy:snappy-java</artifact>
+                                    <includes>
+                                        <include>org/xerial/snappy/*.class</include>
+                                        <include>org/xerial/snappy/**/*.class</include>
+                                        <include>org/xerial/snappy/native/Linux/x86_64/**</include>
+                                        <include>META-INF/**</include>
+                                    </includes>
+                                </filter>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+"""
+
+
+def _ensure_flink_shade_plugin(app_path: str | Path) -> None:
+    """老项目 POM 没有 shade 时补上：提交只上传一个 fat jar。"""
+    pom = Path(app_path) / "pom.xml"
+    if not pom.is_file():
+        raise ValueError(f"pom.xml 不存在: {pom}")
+    text = pom.read_text(encoding="utf-8")
+    if "maven-shade-plugin" in text:
+        return
+    if "</plugins>" in text:
+        text = text.replace("</plugins>", _SHADE_PLUGIN_XML + "        </plugins>", 1)
+    elif "</build>" in text:
+        text = text.replace(
+            "</build>",
+            "        <plugins>" + _SHADE_PLUGIN_XML + "        </plugins>\n    </build>",
+            1,
+        )
+    else:
+        raise ValueError(f"pom.xml 没有 build/plugins，无法注入 shade: {pom}")
+    tmp = pom.with_name(".pom.xml.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(pom)
+
+
+def _package_submit_f_command(app_path: str | Path, project_name: str, app_type: str = "flink",
+                              project_id: str | None = None) -> dict:
+    if project_id:
+        from sqlalchemy import select as _select
+        from SPO.cluster_env_model import ConfigDrift
+        from Tools.db import SessionLocal as _SessionLocal
+        with _SessionLocal() as session:
+            drift = session.execute(_select(ConfigDrift).where(
+                and_(
+                    ConfigDrift.project_id == project_id,
+                    ConfigDrift.status == "pending",
+                )
+            )).scalar_one_or_none()
+        if drift is not None:
+            return {"type": "error",
+                    "msg": f"项目配置存在待处理的 drift（config_drift id={drift.id}）。"
+                           f"请先在页面选择保留或回滚后再提交。",
+                    "app_type": app_type}
     # 打包：CVA 已经跑过测试；提交阶段跳过测试，避免测试代码问题阻塞应用打包
+    if app_type == "flink":
+        try:
+            _ensure_flink_shade_plugin(app_path)
+        except Exception as exc:  # noqa: BLE001
+            return {"type": "error", "msg": f"注入 shade 插件失败：{exc}",
+                    "app_type": app_type}
     rc, out = run_mvn_command("mvn clean package -Dmaven.test.skip=true", path=app_path)
     if rc != 0:
         return {"type": "error", "msg": f"mvn clean package 失败(rc={rc})：{out[:2000]}",
                 "app_type": app_type}
-    # 查找关于 jar 包的位置
+    # 查找关于 jar 包的位置：排除 original-/sources/javadoc，多个时取最大的主 jar
     target_path = Path(app_path) / "target"
-    jar_file = None
-    for f in target_path.glob("*.jar"):
-        if f.is_file():
-            jar_file = f
-            break
+    candidates = [
+        f for f in target_path.glob("*.jar")
+        if f.is_file()
+        and not f.name.startswith("original-")
+        and not re.search(r"-(sources|javadoc|tests?|shaded-classes)\.jar$", f.name,
+                          re.IGNORECASE)
+    ]
+    jar_file = max(candidates, key=lambda p: p.stat().st_size) if candidates else None
     if not jar_file:
         return {"type": "error", "msg": f"未找到 {target_path} 下的 jar 包", "app_type": app_type}
 
-    # 提交 jar 包到指定的hdfs:///app/{app_type}/jar
+    # 只上传一个 fat jar；Flink 依赖已在 jar 内，不再走 usrlib 的多文件上传
     target_dir = f"/app/{app_type}/jar"
     cmd_dir = f"/app/{app_type}/cmd"
     prefix = "DDA" if app_type == "flink" else "DAA"
@@ -774,7 +908,6 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     if not submit_command.get("ynm"):
         # 固定 YARN 应用名，保证 code.app_file_idx 的 app_name 与 RM 里的 name 一致
         command_list += ["-D", f"yarn.application.name={yarn_app_name}"]
-    command_list += ["-D", f"yarn.provided.lib.dir=hdfs://{target_dir}"]
     command_list.append(f"hdfs://{target_dir}/{jar_file.name}")
     command_list += app_args
     complete_command = shlex.join(command_list)
@@ -1142,6 +1275,22 @@ async def _verify_agent_chat(state: CodeVerifyAgentMainState, runtime: Runtime) 
     )
 
     async def verify_execute(ver_request: ModelRequest) -> ModelResponse:
+        project_id = state.get("project_id")
+        admin_id = admin_id_of(runtime.context.user_id)
+        if project_id and admin_id:
+            try:
+                drift = await asyncio.to_thread(check_project, admin_id, project_id)
+            except Exception:
+                drift = {"clean": True}
+            if not drift.get("clean"):
+                if drift.get("public_drift") and not drift.get("drift_id"):
+                    content = ("cluster_resources 与项目记录的公有快照不一致。"
+                               "请先让管理员处理 public drift（保留/回滚），决策前不继续验证。")
+                else:
+                    content = (f"项目资源配置与记录不一致"
+                               f"（config_drift id={drift.get('drift_id')}）。"
+                               "请先让用户选择保留修改或回滚；决策前不继续验证。")
+                return ModelResponse(result=[AIMessage(content=content)])
         logger.debug("埋点：CVA 本轮可用工具：%s",
                      [getattr(tool, "name", str(tool)) for tool in (ver_request.tools or [])])
         mags = ([ver_request.system_message]
@@ -1982,7 +2131,8 @@ async def _verify_submit(state: dict, runtime: Runtime) -> Command:
             # 当前 flink 为 java代码进行编写，因此上传 jar 包到对应的集群即可
             # 当前未对 flink 进行打包，因此需要先打包
             # 打包完后，通过redis注册表注册的命令参数上传jar包，并运行对应的命令
-            res = _package_submit_f_command(app_path, p_name, app_type)
+            res = _package_submit_f_command(app_path, p_name, app_type,
+                                            project_id=state.get("project_id"))
         elif app_type == "spark":
             # spark 侧代码在 src/main/python，辅助文件由提交端自动发现/打包
             res = _package_submit_s_command(app_path, p_name, app_type)

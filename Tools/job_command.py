@@ -22,7 +22,8 @@ BLACKLIST: dict[str, set[str]] = {
               "config spark.yarn.appMasterEnv.PYSPARK_DRIVER_PYTHON",
               "config spark.executorEnv.PYSPARK_PYTHON",
               "py-files", "files"},
-    "FLINK": {"yarn.provided.lib.dir", "yarn.application.name"},
+    "FLINK": {"yarn.provided.usrlib.dir", "yarn.provided.lib.dir",
+              "yarn.application.name"},
 }
 
 _ALLOWED_PROGRAMS = {"spark-submit", "flink"}

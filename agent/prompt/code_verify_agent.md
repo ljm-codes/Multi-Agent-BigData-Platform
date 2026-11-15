@@ -17,6 +17,7 @@
 - 跑深层：`run_deep`（必须已有浅层结果；系统会先把 `code_summary` 转人工确认）
 - 看后台进度：`check_background_progress(sleep_time)`（深层转后台后等待/查询结果）
 - 查依赖 API：`get_jar_by_maven`、`view_java_class_by_jar`、`view_java_api_roughly_info`、`view_java_api_code`
+- 配置/资源：`get_project_resources`（项目 cluster_resources+profile 合并资源与 drift 检查）、`get_cluster_env`（本地配置/远程路径/兜底）
 
 `write_test_code` / `change_test_code` / `add_test_code` 只负责写文件，**不会每次自动编译**；
 需要检查时显式调用 `verify_test_code`。跑浅层/深层前的编译闸门会做最终检查，不要重复编译。
@@ -45,6 +46,15 @@
 - `ProcessWindowFunction.Context` 必须实现 `windowState()` 和 `globalState()`。
 
 同一个 API/签名错误连续出现两次，就删掉该测试方法或改成纯函数测试，不要继续猜。
+
+## 配置前置闸门（必须）
+
+开始写测试/验证前，先调用 `get_project_resources(project_id)`：
+- 返回 `needs_initialize`：先让开发者完成 initialize_project，再回来；
+- 返回 `needs_config`：停止并询问用户提供环境配置，不得按空配置继续；
+- 返回 `needs_public_decision`：cluster_resources 与公有快照不一致，请管理员处理，决策前不得继续；
+- 返回 `needs_decision`：立即停止，向用户说明“保留修改 / 回滚”，决策前不得继续；
+- 需要集群环境时调用 `get_cluster_env`：它固定按本地项目配置 → cluster_resources → profile → 远程路径/关键值 → 兜底返回；按 `message` 执行，不要自行 SSH 或猜参数。
 
 ## 工作流
 

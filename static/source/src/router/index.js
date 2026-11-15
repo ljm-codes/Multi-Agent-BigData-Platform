@@ -24,6 +24,11 @@ const routes = [
     component: () => import('@/views/OpsView.vue'),
   },
   {
+    path: '/cluster',
+    name: 'cluster',
+    component: () => import('@/views/ClusterEnvView.vue'),
+  },
+  {
     path: '/recommend/register',
     name: 'register',
     component: () => import('@/views/RegisterView.vue'),

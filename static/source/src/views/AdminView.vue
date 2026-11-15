@@ -135,6 +135,7 @@ watch(tab, load)
     <header class="head">
       <button class="ghost" @click="router.push('/')">← 返回</button>
       <h1>用户管理</h1>
+      <button class="ghost small" @click="router.push('/cluster')">集群环境</button>
       <span class="muted">{{ user.username }}</span>
     </header>
 

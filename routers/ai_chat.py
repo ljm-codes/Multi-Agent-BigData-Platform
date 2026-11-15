@@ -19,7 +19,7 @@ from sqlalchemy import select, and_, false, true, delete, update, func
 from sqlalchemy.dialects.postgresql import insert
 
 from SPO.main_agent_state_model import MainStateContext, content_text
-from SPO.postgresql_model import AdminThread
+from SPO.postgresql_model import AdminProject, AdminThread
 from SPO.route_results import RouteResponse, ResultCode
 from Tasks.background_broker import background_broker, background_registry
 from Tasks.project_registry import admin_id_of, project_registry
@@ -973,11 +973,46 @@ async def project_path(
                 if name:
                     project_name = str(name)
                     break
-            project_dir = _find_project_dir(project_name, values)
+                project_dir = _find_project_dir(project_name, values)
+        project = None
+        try:
+            async with AsyncSessionLocal() as session:
+                app_type = values.get("app_type") or metadata.get("app_type")
+                date = values.get("date") or metadata.get("date")
+                p_name = values.get("project_name") or project_name
+                if app_type and date and p_name:
+                    project = await session.scalar(
+                        select(AdminProject).where(
+                            AdminProject.admin_id == admin_id,
+                            AdminProject.app_type == str(app_type),
+                            AdminProject.project_date == str(date),
+                            AdminProject.project_name == str(p_name),
+                        ).limit(1)
+                    )
+                if project is None:
+                    project = await session.scalar(
+                        select(AdminProject).where(
+                            AdminProject.admin_id == admin_id,
+                            AdminProject.thread_id == thread_id,
+                        ).order_by(AdminProject.updated_at.desc()).limit(1)
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("解析项目登记信息失败：%s: %s", type(exc).__name__, exc)
+        project_rel = None
+        if project is not None and project.project_date and project.project_name:
+            project_rel = str(
+                (ROOT_BASE_DIR_PATH / "tmp_code" / project.app_type /
+                 project.project_date / project.project_name).relative_to(ROOT_BASE_DIR_PATH)
+            )
         return RouteResponse.ok(data={
             "thread_id": thread_id,
-            "project_name": project_name or None,
+            "project_id": project.project_id if project is not None else None,
+            "project_name": (project.project_name if project is not None and project.project_name
+                             else (project_name or None)),
+            "project_status": project.status if project is not None else None,
+            "project_verify_status": project.verify_status if project is not None else None,
             "project_dir": project_dir,
+            "project_dir_rel": project_rel,
         })
     except Exception as exc:  # noqa: BLE001
         logger.error(f"解析项目目录失败：{exc}")
@@ -1272,6 +1307,14 @@ async def delete_thread(request: Request, thread_id: str = Query(..., descriptio
     # 2. 清内存里的后台任务记录，否则已删会话还会继续往 WebSocket 推
     background_registry.remove_thread(thread_id)
 
+    # 2.1 删该会话的项目区间；最后一段会话则归档项目（保留目录，用户自己删/移动）
+    project_result = {}
+    try:
+        from Tasks.project_registry import project_registry
+        project_result = await project_registry.handle_thread_delete(thread_id, admin_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"删除会话 {thread_id} 时处理项目失败：{exc}")
+
     # 3. 删 admin_thread 记录（放最后：checkpoint 删失败时记录还在，可以重试）
     try:
         async with AsyncSessionLocal() as session:
@@ -1282,8 +1325,8 @@ async def delete_thread(request: Request, thread_id: str = Query(..., descriptio
         return RouteResponse.error(msg=f"会话状态已删除，但记录删除失败：{exc}", code=ResultCode.DB_ERROR)
 
     _thread_locks.pop(thread_id, None)
-    logger.info(f"会话已删除：thread_id={thread_id}, operator={admin_id}")
-    return RouteResponse.ok(msg="会话已删除")
+    logger.info(f"会话已删除：thread_id={thread_id}, operator={admin_id}, project={project_result}")
+    return RouteResponse.ok(msg="会话已删除", data=project_result)
 
 
 @route.delete("/thread/deletes")
@@ -1341,6 +1384,17 @@ async def delete_threads(
     for thread_id in filtered_threads:
         background_registry.remove_thread(thread_id)
 
+    # 2.1 删项目区间；最后一段会话则归档项目（保留目录）
+    project_results = {}
+    try:
+        from Tasks.project_registry import project_registry
+        for thread_id in filtered_threads:
+            project_results[thread_id] = await project_registry.handle_thread_delete(
+                thread_id, admin_id
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"删除会话时处理项目失败：{exc}")
+
     # 3. 删 admin_thread 记录（放最后：checkpoint 删失败时记录还在，可以重试）
     try:
         async with AsyncSessionLocal() as session:
@@ -1351,8 +1405,9 @@ async def delete_threads(
         return RouteResponse.error(msg=f"会话状态已删除，但记录删除失败：{exc}", code=ResultCode.DB_ERROR)
     for thread_id in filtered_threads:
         _thread_locks.pop(thread_id, None)
-    logger.info(f"会话已删除：thread_id={filtered_threads}, operator={admin_id}")
-    return RouteResponse.ok(msg="会话已删除")
+    logger.info(f"会话已删除：thread_id={filtered_threads}, operator={admin_id}, "
+                f"project={project_results}")
+    return RouteResponse.ok(msg="会话已删除", data=project_results)
 
 
 @route.get("/background")

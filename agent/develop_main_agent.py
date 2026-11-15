@@ -27,6 +27,7 @@ from Tools.struct_analy import (
     repair_invalid_tool_calls, strip_tool_call,
 )
 from Tools.usage_metrics import merge_raw_usage
+import Tools.cluster_env_tools  # noqa: F401
 from agent.code_verify_agent import verify_agent
 from agent.data_analysis_agent import big_data_analysis_code_agent, preliminary_verify as preliminary_analysis_verify
 from agent.data_develop_agent import big_data_develop_code_agent, preliminary_verify
@@ -405,6 +406,13 @@ async def dispatch_chat(state: DevelopAgentMainState, runtime: Runtime) -> List[
         logger.debug("埋点：调度本轮可用工具：%s",
                      [getattr(tool, "name", str(tool)) for tool in (dis_req.tools or [])])
         mags: list[BaseMessage] = ([dis_req.system_message] if dis_req.system_message else []) + dis_req.messages
+        # 父图是手写模型调用，没有 create_agent 的 middleware；中断/取消过的
+        # tool_call 必须在这里补 ToolMessage，否则 DeepSeek 兼容接口会直接 400。
+        from middleware.tool_call_guard import repair_missing_tool_messages
+        repairs = repair_missing_tool_messages(mags)
+        if repairs:
+            logger.warning("调度模型调用前补齐 %d 条缺失 ToolMessage", len(repairs))
+            mags.extend(repairs)
 
         # 结构化 schema 与业务工具一起绑定；any 保证模型不会回自由文本
         bound_model = dis_req.model.bind_tools(

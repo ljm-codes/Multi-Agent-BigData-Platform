@@ -6,6 +6,7 @@
 项目目录与数据开发侧同构 -> tmp_code/spark/{date}/{project_name}
 """
 import ast
+import asyncio
 import json
 import os
 import shutil
@@ -40,6 +41,32 @@ async def _register_project_coords(runtime: ToolRuntime, project_date: str, proj
             str(project_id), admin_id=admin_id, app_type=APP_TYPE,
             project_date=str(project_date or ""), project_name=str(project_name or ""),
         )
+
+
+async def _materialize_after_init(runtime: ToolRuntime) -> str:
+    """项目目录建好后立即把 cluster_resources/profile 配置拷进 resources。"""
+    project_id = runtime.state.get("project_id")
+    admin_id = admin_id_of(getattr(runtime.context, "user_id", None))
+    if not project_id or not admin_id:
+        return "未登记项目，跳过环境配置拷贝"
+    from services.cluster_profile_store import ProfileStoreError
+    try:
+        from services.cluster_materialize import materialize_project
+        result = await asyncio.to_thread(
+            materialize_project, admin_id, str(project_id), reason="initialize_project",
+        )
+        return f"已拷贝环境配置：{len(result.get('files') or [])} 个文件"
+    except ProfileStoreError as exc:
+        if exc.code == "invalid":
+            return ("项目已创建，但 cluster_resources 和 profile 都没有可用配置；"
+                    "请先向用户询问环境配置，不要凭空猜参数")
+        if exc.code == "conflict":
+            return ("cluster_resources 与公有快照不一致，需要管理员先处理 public drift；"
+                    "请向用户说明并暂停写代码")
+        return f"项目已创建，但环境配置拷贝失败：{exc}"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("初始化项目时拷贝环境配置失败：%s: %s", type(exc).__name__, exc)
+        return f"项目已创建，但环境配置拷贝失败：{type(exc).__name__}: {exc}"
 # 数据分析只跑 spark/python，项目固定落在 spark 下，不跟随 context.app_type
 APP_TYPE = "spark"
 # 单次查看的行数上限：超了截断并说明，免得一次调用把上下文撑爆
@@ -266,11 +293,13 @@ async def initialize_project(runtime: ToolRuntime, project_name: str | None = No
         shutil.rmtree(app_path, ignore_errors=True)
         return f"初始化项目失败(已清除项目目录){type(e).__name__}: {e}"
     await _register_project_coords(runtime, date, p_name)
+    config_msg = await _materialize_after_init(runtime)
     return Command(
         update={
             "messages": [
                 ToolMessage(
-                    content="项目初始化完成，相对项目路径为：src/main/python，之后的代码请在这里进行编写",
+                    content=("项目初始化完成，相对项目路径为：src/main/python，"
+                             f"之后的代码请在这里进行编写；{config_msg}"),
                     tool_call_id=runtime.tool_call_id,
                     id=f"tool-{uuid4()}",
                 )

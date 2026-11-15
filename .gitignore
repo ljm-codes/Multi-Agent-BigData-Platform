@@ -33,6 +33,9 @@ database/
 log/
 tmp/
 tmp_code/
+cluster_profiles/
+cluster_resources/
+cluster_env_archives/
 huggingface_cache/
 static/source/node_modules/
 static/dist/

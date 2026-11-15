@@ -26,6 +26,11 @@ export default defineConfig({
       '/ops/ws': { target: backend, changeOrigin: true, ws: true },
       '/auth/admin': backend,
       '/open/app': backend,
+      // /cluster 是前端页面路由，只代理 API 子路径，避免刷新页面被代理成后端 404
+      '/cluster/profiles': backend,
+      '/cluster/public': backend,
+      '/cluster/archives': backend,
+      '/cluster/projects': backend,
     },
   },
 })

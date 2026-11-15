@@ -48,6 +48,32 @@ async def _register_project_coords(
             str(project_id), admin_id=admin_id, app_type=app_type,
             project_date=str(project_date or ""), project_name=str(project_name or ""),
         )
+
+
+async def _materialize_after_init(runtime: ToolRuntime) -> str:
+    """项目目录成功建立后立即把 cluster_resources/profile 配置拷进 resources。"""
+    project_id = runtime.state.get("project_id")
+    admin_id = admin_id_of(getattr(runtime.context, "user_id", None))
+    if not project_id or not admin_id:
+        return "未登记项目，跳过环境配置拷贝"
+    from services.cluster_profile_store import ProfileStoreError
+    try:
+        from services.cluster_materialize import materialize_project
+        result = await asyncio.to_thread(
+            materialize_project, admin_id, str(project_id), reason="initialize_project",
+        )
+        return f"已拷贝环境配置：{len(result.get('files') or [])} 个文件"
+    except ProfileStoreError as exc:
+        if exc.code == "invalid":
+            return ("项目已创建，但 cluster_resources 和 profile 都没有可用配置；"
+                    "请先向用户询问环境配置，不要凭空猜 Kafka/Hive/HDFS 参数")
+        if exc.code == "conflict":
+            return ("cluster_resources 与公有快照不一致，需要管理员先处理 public drift；"
+                    "请向用户说明并暂停写代码")
+        return f"项目已创建，但环境配置拷贝失败：{exc}"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("初始化项目时拷贝环境配置失败：%s: %s", type(exc).__name__, exc)
+        return f"项目已创建，但环境配置拷贝失败：{type(exc).__name__}: {exc}"
 java_maven_dir = dda_config.get("java_maven_lib_dir", "~/.m2/repository")
 logger = LogSetting.create(__name__)
 
@@ -159,6 +185,85 @@ _POM_TEXT = """
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-dependency-plugin</artifactId>
                 <version>3.9.0</version>
+            </plugin>
+            <!-- 单 jar 提交：把运行时依赖全部打进主 artifact，避免上传 usrlib 的一堆小文件 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <!-- Flink/Hadoop/log 由集群提供，不打进 jar；只带项目真正缺的依赖 -->
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>org.apache.flink:flink-clients</exclude>
+                                    <exclude>org.apache.flink:flink-core</exclude>
+                                    <exclude>org.apache.flink:flink-java</exclude>
+                                    <exclude>org.apache.flink:flink-runtime</exclude>
+                                    <exclude>org.apache.flink:flink-streaming-java</exclude>
+                                    <exclude>org.apache.flink:flink-optimizer</exclude>
+                                    <exclude>org.apache.flink:flink-annotations</exclude>
+                                    <exclude>org.apache.flink:flink-metrics-core</exclude>
+                                    <exclude>org.apache.flink:flink-json</exclude>
+                                    <exclude>org.apache.flink:flink-runtime-web</exclude>
+                                    <exclude>org.apache.flink:flink-connector-files</exclude>
+                                    <exclude>org.apache.flink:flink-table-*</exclude>
+                                    <exclude>org.apache.flink:flink-dist</exclude>
+                                    <exclude>org.apache.flink:flink-scala*</exclude>
+                                    <exclude>org.apache.flink:flink-rpc-*</exclude>
+                                    <exclude>org.apache.flink:flink-shaded-*</exclude>
+                                    <exclude>org.apache.hadoop:*</exclude>
+                                    <exclude>org.apache.hadoop.thirdparty:*</exclude>
+                                    <exclude>log4j:*</exclude>
+                                    <exclude>org.slf4j:*</exclude>
+                                </excludes>
+                            </artifactSet>
+                            <filters>
+                                <!-- 只保留集群实际平台（Linux x86_64）的原生库，避免把 win/mac/arm 全打进去 -->
+                                <filter>
+                                    <artifact>com.ververica:frocksdbjni</artifact>
+                                    <includes>
+                                        <include>org/rocksdb/**</include>
+                                        <include>librocksdbjni-linux64.so</include>
+                                        <include>META-INF/**</include>
+                                    </includes>
+                                </filter>
+                                <filter>
+                                    <artifact>com.github.luben:zstd-jni</artifact>
+                                    <includes>
+                                        <include>com/github/luben/zstd/**</include>
+                                        <include>linux/amd64/**</include>
+                                        <include>META-INF/**</include>
+                                    </includes>
+                                </filter>
+                                <filter>
+                                    <artifact>org.xerial.snappy:snappy-java</artifact>
+                                    <includes>
+                                        <include>org/xerial/snappy/*.class</include>
+                                        <include>org/xerial/snappy/**/*.class</include>
+                                        <include>org/xerial/snappy/native/Linux/x86_64/**</include>
+                                        <include>META-INF/**</include>
+                                    </includes>
+                                </filter>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
@@ -377,11 +482,13 @@ async def initialize_project(runtime: ToolRuntime, project_name: str | None = No
                 app_path.rmdir()
                 return f"项目构建失败(已自动清除项目目录)，错误信息: {stderr}"
             await _register_project_coords(runtime, app_type, date, p_name)
+            config_msg = await _materialize_after_init(runtime)
             return Command(
                 update={
                     "messages": [
                         ToolMessage(
-                            content="项目构建完成，相对项目路径为：src/main/java/com/fm, 之后的代码请在这里进行编写",
+                            content=("项目构建完成，相对项目路径为：src/main/java/com/fm, "
+                                     "之后的代码请在这里进行编写；" + config_msg),
                             tool_call_id=runtime.tool_call_id,
                             id=f"tool-{uuid4()}"
                         )
@@ -395,11 +502,13 @@ async def initialize_project(runtime: ToolRuntime, project_name: str | None = No
             (app_path / "src" / "main" / "resources").mkdir(parents=True, exist_ok=True)
             (app_path / "src" / "tests").mkdir(parents=True, exist_ok=True)
             await _register_project_coords(runtime, app_type, date, p_name)
+            config_msg = await _materialize_after_init(runtime)
             return Command(
                 update={
                     "messages": [
                         ToolMessage(
-                            content=f"项目构建完成，相对项目路径为：src/main/python，之后的代码请在这里进行编写",
+                            content=(f"项目构建完成，相对项目路径为：src/main/python，"
+                                     f"之后的代码请在这里进行编写；{config_msg}"),
                             tool_call_id=runtime.tool_call_id,
                             id=f"tool-{uuid4()}"
                         )

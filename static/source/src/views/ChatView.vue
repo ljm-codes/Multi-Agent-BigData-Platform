@@ -12,6 +12,7 @@ import ThreadItem from '@/components/ThreadItem.vue'
 import UsageChip from '@/components/UsageChip.vue'
 import VerificationCard from '@/components/VerificationCard.vue'
 import InquiryPanel from '@/components/InquiryPanel.vue'
+import ProjectResourcesPanel from '@/components/ProjectResourcesPanel.vue'
 import ToolTracePanel from '@/components/ToolTracePanel.vue'
 import {createTicket, openBackgroundSocket} from '@/api/background'
 
@@ -33,6 +34,8 @@ const sendingSeconds = computed(() => session.value?.seconds || 0)
 const interrupt = computed(() => session.value?.interrupt || null)
 const paused = computed(() => Boolean(session.value?.paused))
 const projectDir = computed(() => session.value?.projectDir || '')
+const projectId = ref('')
+const showResources = ref(false)
 const verification = computed(() => session.value?.verification || null)
 const usageTotal = computed(() => session.value?.usageTotal || null)
 const toolTraces = computed(() => session.value?.toolTraces || [])
@@ -188,6 +191,8 @@ watch(currentIde, (value) => value && localStorage.setItem('ide', value))
 
 watch(currentThreadId, () => {
   showTraces.value = false
+  projectId.value = ''
+  showResources.value = false
 })
 watch(
     () => sending.value || resuming.value || trackedRunning.value,
@@ -562,6 +567,25 @@ async function openProject() {
   }
 }
 
+async function openResources() {
+  if (!currentThreadId.value) return
+  if (!projectId.value) {
+    try {
+      const resolved = await resolveProjectDir(currentThreadId.value)
+      projectId.value = resolved?.project_id || ''
+      if (resolved?.project_dir) chat.setProjectDir(currentThreadId.value, resolved.project_dir)
+    } catch (e) {
+      uiError.value = e?.message || '读取项目登记失败'
+      return
+    }
+  }
+  if (!projectId.value) {
+    uiError.value = '项目还没有登记（可能尚未 initialize_project 成功）'
+    return
+  }
+  showResources.value = true
+}
+
 async function onRename(threadId, nextTitle) {
   if (!nextTitle) return
   try {
@@ -744,6 +768,9 @@ function logout() {
       </div>
 
       <div v-else class="sidebar-foot">
+        <button class="ghost" :title="collapsed ? '集群环境' : ''" @click="router.push('/cluster')">
+          {{ collapsed ? '🌐' : '集群环境' }}
+        </button>
         <button
             v-if="Number(user.permission ?? 0) >= 1"
             class="ghost"
@@ -777,6 +804,15 @@ function logout() {
             @click="openProject"
         >
           打开项目
+        </button>
+
+        <button
+            class="ghost small"
+            :disabled="!projectName && !projectDir"
+            title="查看/替换项目 src/main/resources 配置"
+            @click="openResources"
+        >
+          项目配置
         </button>
 
         <select v-if="Object.keys(ides).length" v-model="currentIde" class="select" title="打开方式">
@@ -912,6 +948,14 @@ function logout() {
         </div>
 
         <BackgroundPanel v-if="showBackground" :thread-id="currentThreadId"/>
+        <ProjectResourcesPanel
+            v-if="showResources && projectId"
+            :project-id="projectId"
+            :project-name="projectName"
+            :project-dir="projectDir"
+            @close="showResources = false"
+            @open-project="openProject"
+        />
       </div>
     </main>
   </div>

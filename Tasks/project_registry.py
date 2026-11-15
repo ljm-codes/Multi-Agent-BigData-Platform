@@ -9,12 +9,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from SPO.postgresql_model import AdminProject, AdminProjectConversation
@@ -79,6 +80,9 @@ def _row_dict(row: AdminProject, *, with_check: bool = True) -> dict[str, Any]:
         "end_message_id": row.end_message_id,
         "status": row.status,
         "verify_status": row.verify_status,
+        "project_dir": (str(Path("tmp_code") / row.app_type / row.project_date /
+                            row.project_name)
+                        if row.project_date and row.project_name else None),
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
     if with_check:
@@ -151,6 +155,8 @@ class ProjectRegistry:
                 row.project_name = str(project_name or "")
                 row.updated_at = datetime.now(timezone.utc)
                 await session.commit()
+                # 配置拷贝由 initialize_project / get_project_resources 显式执行，
+                # 这里只回填坐标，避免隐藏副作用和重复 materialize。
                 return True
         except IntegrityError:
             # 同一用户下相同坐标已有一条记录：保留原行，不覆盖
@@ -356,6 +362,65 @@ class ProjectRegistry:
         except Exception as exc:  # noqa: BLE001
             logger.warning("查询项目失败：%s: %s", type(exc).__name__, exc)
             return None
+
+    @staticmethod
+    async def handle_thread_delete(thread_id: str, admin_id: int) -> dict:
+        """删会话时同步处理项目：有别的会话段就保留，最后一段就归档（不删目录）。"""
+        if not thread_id or not admin_id:
+            return {"archived": [], "kept": [], "segments": 0}
+        to_archive: list[str] = []
+        kept: list[str] = []
+        segments = 0
+        try:
+            async with AsyncSessionLocal() as session:
+                rows = (await session.scalars(
+                    select(AdminProjectConversation).where(
+                        AdminProjectConversation.thread_id == thread_id
+                    )
+                )).all()
+                segments = len(rows)
+                project_ids = {row.project_id for row in rows}
+                legacy = (await session.scalars(
+                    select(AdminProject).where(
+                        AdminProject.thread_id == thread_id,
+                        AdminProject.admin_id == int(admin_id),
+                    )
+                )).all()
+                project_ids.update(row.project_id for row in legacy)
+                for row in rows:
+                    await session.delete(row)
+                await session.flush()
+                for project_id in sorted(project_ids):
+                    project = await session.scalar(select(AdminProject).where(
+                        AdminProject.project_id == project_id
+                    ))
+                    if project is None or int(project.admin_id) != int(admin_id):
+                        continue
+                    remaining = await session.scalar(
+                        select(func.count()).select_from(AdminProjectConversation).where(
+                            AdminProjectConversation.project_id == project_id
+                        )
+                    ) or 0
+                    if remaining:
+                        kept.append(project_id)
+                    else:
+                        to_archive.append(project_id)
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除会话时处理项目失败：%s: %s", type(exc).__name__, exc)
+            return {"archived": [], "kept": [], "segments": segments,
+                    "error": f"{type(exc).__name__}: {exc}"}
+        archived = []
+        from services.cluster_materialize import archive_project
+        for project_id in to_archive:
+            try:
+                archived.append(await asyncio.to_thread(
+                    archive_project, int(admin_id), project_id, f"delete thread {thread_id}"
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("归档项目 %s 失败：%s: %s", project_id,
+                               type(exc).__name__, exc)
+        return {"archived": archived, "kept": kept, "segments": segments}
 
     @staticmethod
     async def list_projects(

@@ -26,6 +26,7 @@ from Tools.registry import get_tools
 from Tools.share_check_tool import redis_con
 from Tools.usage_metrics import last_response_metadata, merged_raw_usage_of_messages, usage_ledger_message
 from load_config.config import config, ROOT_BASE_DIR_PATH, get_model_params
+from middleware.resource_guard import ProjectResourceGuard
 from middleware.tool_call_guard import ToolCallHistoryGuard
 from middleware.tool_trace_middleware import ToolTraceMiddleware
 
@@ -125,6 +126,7 @@ async def big_data_analysis_code_agent(
         middleware=cast("AgentMiddleware", [
             ToolTraceMiddleware("data_analysis"),
             ToolCallHistoryGuard("data_analysis"),
+            ProjectResourceGuard("data_analysis"),
         ]),
         system_prompt=_analysis_system_prompt,
         context_schema=cast("ContextT", MainStateContext),
