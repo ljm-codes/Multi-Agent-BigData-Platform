@@ -1,3 +1,5 @@
+begin;
+
 create database MultiAgentBigDataPlatform;
 
 create schema log;
@@ -127,6 +129,34 @@ create table log.recommend_approval_log
     update_time       timestamptz      default now()                                     -- 更新这个记录的时间
 );
 
+-- 项目/任务登记：模型只接触 project_id，真实目录由 app_type/project_date/project_name 解析
+create table if not exists admin_project
+(
+    id               bigserial primary key,
+    project_id       varchar(36)  not null unique,
+    admin_id         bigint       not null,
+    thread_id        varchar(255) not null,
+    title            varchar(128) not null,
+    description      text         not null default '',
+    summary          text         not null default '',
+    app_type         varchar(16)  not null
+        check (app_type in ('spark', 'flink')),
+    project_date     varchar(10),
+    project_name     varchar(255),
+    start_message_id varchar(64),
+    end_message_id   varchar(64),
+    status           varchar(16)  not null default 'active'
+        check (status in ('active', 'completed', 'failed', 'missing', 'archived')),
+    verify_status    varchar(16)  not null default 'unknown'
+        check (verify_status in ('unknown', 'passed', 'failed', 'error')),
+    created_at       timestamptz  not null default now(),
+    updated_at       timestamptz  not null default now(),
+    constraint uk_admin_project_coords unique (admin_id, app_type, project_date, project_name)
+);
+
+create index if not exists idx_admin_project_owner_time
+    on admin_project (admin_id, updated_at desc);
+
 create table code.app_file_idx
 (
     id          bigserial primary key,
@@ -140,6 +170,19 @@ create table code.app_file_idx
 ); -- 提交作业时，指向 源码 映射表 -> 用于 快速定位到应用文件路径（ops-Agent用）
 
 create unique index uk_app_file_app on code.app_file_idx (app_type, app_name);
+
+alter table code.app_file_idx
+    add column project_id varchar(36);
+alter table code.app_file_idx
+    add constraint uk_app_file_project foreign key (project_id) references admin_project (project_id) on delete set null;
+alter table code.app_file_idx
+    add column idx_type varchar(20) check ( idx_type in ('tmp', 'brief') ) not null default 'tmp';
+
+create index if not exists idx_app_file_project
+    on code.app_file_idx (project_id, update_time desc);
+
+-- 命令改存 code.app_file_idx，旧表不再使用
+drop table if exists admin_project_command;
 
 
 -- 工具调用轨迹：只存 UI 投影，完整审计仍在 LangGraph messages
@@ -177,35 +220,9 @@ create index if not exists idx_tool_trace_running
 create index if not exists idx_tool_trace_cleanup
     on log.tool_trace (started_at);
 
--- 项目/任务登记：模型只接触 project_id，真实目录由 app_type/project_date/project_name 解析
-create table if not exists admin_project
-(
-    id               bigserial primary key,
-    project_id       varchar(36)  not null unique,
-    admin_id         bigint       not null,
-    thread_id        varchar(255) not null,
-    title            varchar(128) not null,
-    description      text         not null default '',
-    summary          text         not null default '',
-    app_type         varchar(16)  not null
-        check (app_type in ('spark', 'flink')),
-    project_date     varchar(10),
-    project_name     varchar(255),
-    start_message_id varchar(64),
-    end_message_id   varchar(64),
-    status           varchar(16)  not null default 'active'
-        check (status in ('active', 'completed', 'failed', 'missing', 'archived')),
-    verify_status    varchar(16)  not null default 'unknown'
-        check (verify_status in ('unknown', 'passed', 'failed', 'error')),
-    created_at       timestamptz  not null default now(),
-    updated_at       timestamptz  not null default now(),
-    constraint uk_admin_project_coords unique (admin_id, app_type, project_date, project_name)
-);
-
-create index if not exists idx_admin_project_owner_time
-    on admin_project (admin_id, updated_at desc);
 
 -- 项目在某个会话里的对话区间；跨会话续聊新增一条
+drop table if exists admin_project_conversation;
 create table if not exists admin_project_conversation
 (
     id               bigserial primary key,
@@ -221,13 +238,14 @@ create table if not exists admin_project_conversation
 create index if not exists idx_admin_project_conversation_project
     on admin_project_conversation (project_id, updated_at desc);
 
+
 -- 以下 SQL 均为 未开发 完整
-create table log.AIOps_log
-(
-    id       bigserial primary key,
-    app_type varchar(20) check ( app_type in ('SPARK', 'FLINK'))            not null,
-    status   varchar(16) check ( status in ('running', 'success', 'error')) not null,
-)
+-- create table log.AIOps_log
+-- (
+--     id       bigserial primary key,
+--     app_type varchar(20) check ( app_type in ('SPARK', 'FLINK'))            not null,
+--     status   varchar(16) check ( status in ('running', 'success', 'error')) not null,
+-- );
 
 
-
+commit;

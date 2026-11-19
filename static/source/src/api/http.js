@@ -3,10 +3,11 @@
 export const AUTH_PREFIX = 'Bearer token '
 
 export class ApiError extends Error {
-  constructor(message, code = -1) {
+  constructor(message, code = -1, data = null) {
     super(message)
     this.name = 'ApiError'
     this.code = code
+    this.data = data
   }
 }
 
@@ -60,7 +61,8 @@ export async function request(path, { method = 'GET', body, auth = true, raw = f
     throw new ApiError(payload?.msg || '登录已失效，请重新登录', 401)
   }
   if (!resp.ok) {
-    throw new ApiError(payload?.msg || `请求失败（HTTP ${resp.status}）`, payload?.code ?? resp.status)
+    throw new ApiError(payload?.msg || `请求失败（HTTP ${resp.status}）`,
+      payload?.code ?? resp.status, payload?.data ?? null)
   }
   if (expectJson && (!payload || typeof payload !== 'object')) {
     const contentType = resp.headers.get('content-type') || ''
@@ -73,7 +75,7 @@ export async function request(path, { method = 'GET', body, auth = true, raw = f
   }
   // 业务信封：code 为 0 才算成功
   if (payload && typeof payload === 'object' && 'code' in payload && payload.code !== 0) {
-    throw new ApiError(payload.msg || '请求失败', payload.code)
+    throw new ApiError(payload.msg || '请求失败', payload.code, payload.data ?? null)
   }
   // raw: 有些接口直接返回裸数组（比如 /ai/background），不解信封
   return raw ? payload : payload?.data ?? null
@@ -94,7 +96,7 @@ export async function postForm(path, formData) {
       payload?.code ?? resp.status)
   }
   if (payload && typeof payload === 'object' && 'code' in payload && payload.code !== 0) {
-    throw new ApiError(payload.msg || '请求失败', payload.code)
+    throw new ApiError(payload.msg || '请求失败', payload.code, payload.data ?? null)
   }
   return payload?.data ?? null
 }

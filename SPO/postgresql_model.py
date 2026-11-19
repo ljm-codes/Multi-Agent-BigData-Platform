@@ -197,7 +197,7 @@ class AdminThread(Base):
     __table_args__ = (
         {"schema": "public"},
     )
-    id: Mapped[int] = mapped_column(BIGINT, primary_key=True,)
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, )
     thread_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     thread_name: Mapped[str] = mapped_column(String(20), nullable=False)
     admin_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
@@ -230,12 +230,14 @@ class AppFileIndex(Base):
         ),
         {"schema": "code"},
     )
-    id: Mapped[int] = mapped_column(BIGINT, primary_key=True,)
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, )
+    project_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     app_type: Mapped[str] = mapped_column(String(20), nullable=False)
     app_name: Mapped[str] = mapped_column(String(255), nullable=False)
     source_type: Mapped[str] = mapped_column(String(10), nullable=False)
     source_dir: Mapped[str] = mapped_column(TEXT, nullable=False)
     commit_cmd: Mapped[str] = mapped_column(TEXT, nullable=False)
+    idx_type: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'tmp'"))
     create_time: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=text("now()"),

@@ -30,6 +30,15 @@ _ALLOWED_PROGRAMS = {"spark-submit", "flink"}
 _CONF_FLAGS = {"-D", "--conf", "--config"}
 _SHELL_OPERATORS = {"|", "||", "&", "&&", ";", ">", ">>", "<", "<<",
                     "2>", "2>&1", "&>", "1>", "1>>"}
+_SHELL_META_RE = re.compile(r"[;&|<>`$(){}\n\r]")
+
+
+def _shell_operator_error(tokens: list[str]) -> str | None:
+    """token 里直接出现 shell 控制符就拒绝，防止粘在参数里绕过"""
+    for tok in tokens:
+        if tok in _SHELL_OPERATORS or _SHELL_META_RE.search(tok):
+            return f"命令里不允许 shell 控制符: {tok}"
+    return None
 _COUNT_KEYS = {"p", "parallelism", "ys", "yn", "num-executors", "executor-cores",
                "driver-cores", "parallelism.default", "taskmanager.numberoftaskslots"}
 _MEMORY_KEYS = {"yjm", "ytm", "driver-memory", "executor-memory",
@@ -114,6 +123,17 @@ def validate_param(key: str, value) -> str | None:
         if text.strip().lower() not in ("true", "false"):
             return "只能是 true/false"
     return None
+
+
+def validate_structure(tokens: list[str], *, allow_placeholder: bool = False) -> str | None:
+    """只校验程序名和 shell 控制符；手动改整条命令用，不套参数替换黑名单"""
+    if not tokens:
+        return "命令不能为空"
+    if posixpath.basename(tokens[0]) not in _ALLOWED_PROGRAMS:
+        return f"不允许的程序: {tokens[0]}"
+    if allow_placeholder:
+        tokens = [tok.replace("<jar>", "") for tok in tokens]
+    return _shell_operator_error(tokens)
 
 
 def rows(tokens: list[str]) -> list[dict]:
@@ -229,9 +249,9 @@ def validate_command(
     if original_tokens and new_program != original_tokens[0]:
         return new_tokens, [], "不允许修改提交程序"
 
-    for tok in new_tokens:
-        if tok in _SHELL_OPERATORS or "`" in tok or "$(" in tok:
-            return new_tokens, [], f"命令里不允许 shell 控制符: {tok}"
+    op_error = _shell_operator_error(new_tokens)
+    if op_error:
+        return new_tokens, [], op_error
 
     banned = {norm_banned(b) for b in (BLACKLIST.get(str(app_type).upper()) or set())}
     old_banned = _banned_values(original_tokens, banned)

@@ -31,6 +31,8 @@ export default defineConfig({
       '/cluster/public': backend,
       '/cluster/archives': backend,
       '/cluster/projects': backend,
+      // /project 是前端页面路由，只代理带子路径的接口
+      '/project/': backend,
     },
   },
 })

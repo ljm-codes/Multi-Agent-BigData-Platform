@@ -7,13 +7,12 @@ from __future__ import annotations
 import io
 import json
 import os
-import shutil
 import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import func, select, and_
+from sqlalchemy import func, select, and_, or_
 
 from SPO.cluster_env_model import (
     ClusterProfile,
@@ -25,7 +24,6 @@ from SPO.cluster_env_model import (
     ProjectEnv,
     ProjectResource,
     PublicConfig,
-    ProfileFile,
 )
 from Tools.db import SessionLocal
 from Tools.log_settings import LogSetting
@@ -584,22 +582,28 @@ class ClusterSnapshotStore:
         ).scalar_one_or_none()
         project = session.execute(
             select(ProjectEnv).where(
-                (ProjectEnv.public_snapshot_id == snapshot.id) |
-                (ProjectEnv.profile_snapshot_id == snapshot.id) |
-                (ProjectEnv.materialized_snapshot_id == snapshot.id)
+                or_(
+                    ProjectEnv.public_snapshot_id == snapshot.id,
+                    ProjectEnv.profile_snapshot_id == snapshot.id,
+                    ProjectEnv.materialized_snapshot_id == snapshot.id,
+                )
             )
         ).scalar_one_or_none()
         resource = session.execute(
             select(ProjectResource).where(
-                (ProjectResource.public_snapshot_id == snapshot.id) |
-                (ProjectResource.profile_snapshot_id == snapshot.id) |
-                (ProjectResource.materialized_snapshot_id == snapshot.id)
+                or_(
+                    ProjectResource.public_snapshot_id == snapshot.id,
+                    ProjectResource.profile_snapshot_id == snapshot.id,
+                    ProjectResource.materialized_snapshot_id == snapshot.id,
+                )
             )
         ).scalar_one_or_none()
         drift = session.execute(
             select(ConfigDrift).where(
-                ConfigDrift.expected_snapshot_id == snapshot.id,
-                ConfigDrift.status == "pending",
+                and_(
+                    ConfigDrift.expected_snapshot_id == snapshot.id,
+                    ConfigDrift.status == "pending",
+                )
             )
         ).scalar_one_or_none()
         if public or profile or project or resource or drift:

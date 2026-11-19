@@ -22,7 +22,7 @@ from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
 from hdfs import InsecureClient
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.chat_models import init_chat_model
@@ -41,12 +41,13 @@ from Tasks.project_registry import admin_id_of, project_registry
 from Tasks.verification_registry import VerificationReporter, verification_registry
 from Tasks.build_run_custom_tasks import TaskSupervisor
 from Tools import code_commit, node_ssh
+from Tools.alarm_sender import send_feishu_text
 from Tools.log_settings import LogSetting
 from Tools.code_verify_agent_tools import (
     AGENT_NAME as CVA, _parse_command, _parse_spark_command,
     _count_test_cases, _count_spark_test_cases,
 )
-from Tools.data_analysis_agent_tools import analysis_business_files, submit_redis_key
+from Tools.data_analysis_agent_tools import analysis_business_files
 from Tools.data_develop_agent_tools import (  # noqa: F401  # 把 jar 签名查询工具注册给 CVA
     get_jar_by_maven, view_java_api_code, view_java_api_roughly_info, view_java_class_by_jar,
 )
@@ -587,29 +588,41 @@ def _upload_commit_git(root: str, rel: str, files: list[tuple[Path, str]]) -> st
 async def _save_app_file_idx(
         *, app_name: str, app_type: Literal["spark", "flink"],
         source_type: str, source_dir: str, commit_cmd: str,
-) -> None:
+        project_id: str | None = None, idx_type: str = "tmp",
+) -> bool:
     """upsert code.app_file_idx；更新时刷新 update_time"""
     now = datetime.now(timezone.utc)
-    async with AsyncSessionLocal() as session:
-        stmt = pg_insert(AppFileIndex).values(
+    try:
+        base = pg_insert(AppFileIndex).values(
+            project_id=project_id,
             app_type=app_type.upper(),
             app_name=app_name,
             source_type=source_type,
             source_dir=source_dir,
             commit_cmd=commit_cmd,
+            idx_type=idx_type,
             create_time=now,
             update_time=now,
-        ).on_conflict_do_update(
+        )
+        stmt = base.on_conflict_do_update(
             index_elements=["app_type", "app_name"],
             set_={
+                # 本次没有带 project_id 时保留原绑定
+                "project_id": func.coalesce(base.excluded.project_id, AppFileIndex.project_id),
                 "source_type": source_type,
                 "source_dir": source_dir,
                 "commit_cmd": commit_cmd,
+                "idx_type": idx_type,
                 "update_time": now,
             },
         )
-        await session.execute(stmt)
-        await session.commit()
+        async with AsyncSessionLocal() as session:
+            await session.execute(stmt)
+            await session.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"写入 code.app_file_idx 失败: {type(exc).__name__}: {exc}")
+        return False
 
 
 # 源码目录不传打包/编译产物：运维侧读的、改的都是源码
@@ -639,13 +652,13 @@ def _source_manifest(project_dir: Path) -> list[tuple[Path, str]]:
 async def _submit_target_code(
         app_name: str, app_type: Literal["spark", "flink"],
         commit_cmd: str, project_dir: Path,
+        *, project_id: str | None = None,
 ) -> None:
     """
     将项目源码传到 code.commit.path/{app_type}/{date}/{app_name}，
-    并把定位信息 upsert 到 code.app_file_idx。
+    并把定位信息 upsert 到 code.app_file_idx（idx_type='brief'）。
 
-    上传和落库互不影响：上传失败也落库；落库失败不影响已经上传的文件。
-    但 CONNECT_TO_CLUSTER=false 时不落库 —— 运维 Agent 不会启动，这条记录没有消费者。
+    先落命令再传源码：上传失败也保留命令；集群关闭时也登记。
     """
     create_time = datetime.now(timezone.utc)
     date = create_time.date().isoformat()
@@ -658,33 +671,28 @@ async def _submit_target_code(
     rel = _commit_rel_dir(app_type, date, app_name)
     source_dir = _commit_public_dir(source_type, root, rel)
 
+    if not await _save_app_file_idx(
+        app_name=app_name, app_type=app_type, commit_cmd=commit_cmd,
+        source_type=source_type, source_dir=source_dir,
+        project_id=project_id, idx_type="brief",
+    ):
+        logger.error("写入 code.app_file_idx 失败（不影响后续上传）")
+
     try:
         manifest = _source_manifest(Path(project_dir))
         if not manifest:
             logger.error(f"{project_dir} 里没有可上传的源码文件，跳过代码提交")
             return
         if source_type == "hdfs":
-            source_dir = await asyncio.to_thread(_upload_commit_hdfs, root, rel, manifest)
+            await asyncio.to_thread(_upload_commit_hdfs, root, rel, manifest)
         elif source_type == "local":
-            source_dir = await asyncio.to_thread(_upload_commit_local, root, rel, manifest)
+            await asyncio.to_thread(_upload_commit_local, root, rel, manifest)
         elif source_type == "ssh":
-            source_dir = await asyncio.to_thread(_upload_commit_ssh, root, rel, manifest)
+            await asyncio.to_thread(_upload_commit_ssh, root, rel, manifest)
         else:
-            source_dir = await asyncio.to_thread(_upload_commit_git, root, rel, manifest)
+            await asyncio.to_thread(_upload_commit_git, root, rel, manifest)
     except Exception as exc:
         logger.error(f"提交源码到 {source_type} 失败（不影响落库）: {type(exc).__name__}: {exc}")
-
-    if not CONNECT_TO_CLUSTER:
-        logger.info("CONNECT_TO_CLUSTER=false，运维 Agent 不会运行，跳过 code.app_file_idx 落库")
-        return
-
-    try:
-        await _save_app_file_idx(
-            app_name=app_name, app_type=app_type,
-            source_type=source_type, source_dir=source_dir, commit_cmd=commit_cmd,
-        )
-    except Exception as exc:
-        logger.error(f"写入 code.app_file_idx 失败（不影响上传）: {type(exc).__name__}: {exc}")
 
 
 def _schedule_submit_target_code(*args, **kwargs) -> None:
@@ -821,8 +829,101 @@ def _ensure_flink_shade_plugin(app_path: str | Path) -> None:
     tmp.replace(pom)
 
 
-def _package_submit_f_command(app_path: str | Path, project_name: str, app_type: str = "flink",
-                              project_id: str | None = None) -> dict:
+def _handler_redis_key(app_type: Literal["flink", "spark"], project_name: str) -> str:
+    prefix = "DDA" if app_type == "flink" else "DAA"
+    return f"{prefix}:{project_name}"
+
+
+def _pick_flink_jar(target_path: Path) -> Path | None:
+    """排除 original-/sources/javadoc，多个时取最大的主 jar"""
+    candidates = [
+        f for f in target_path.glob("*.jar")
+        if f.is_file()
+        and not f.name.startswith("original-")
+        and not re.search(r"-(sources|javadoc|tests?|shaded-classes)\.jar$", f.name,
+                          re.IGNORECASE)
+    ]
+    return max(candidates, key=lambda p: p.stat().st_size) if candidates else None
+
+
+def _flink_jar_hint(app_path: str | Path) -> str:
+    """中断前还没打包：先用 target 里已有的 jar，再按 pom 坐标预测，最后给占位符"""
+    jar = _pick_flink_jar(Path(app_path) / "target")
+    if jar is not None:
+        return jar.name
+    pom = Path(app_path) / "pom.xml"
+    try:
+        root = ET.parse(pom).getroot()
+    except Exception:  # noqa: BLE001
+        return "<jar>"
+
+    def child(parent, name: str):
+        if parent is None:
+            return None
+        for item in parent:
+            if item.tag.rsplit("}", 1)[-1] == name:
+                return item
+        return None
+
+    def child_text(parent, name: str) -> str:
+        node = child(parent, name)
+        return (node.text or "").strip() if node is not None else ""
+
+    artifact_id = child_text(root, "artifactId")
+    version = child_text(root, "version") or child_text(child(root, "parent"), "version")
+    final_name = child_text(child(root, "build"), "finalName")
+    name = final_name or (f"{artifact_id}-{version}" if artifact_id and version else "")
+    if not name or "${" in name:
+        return "<jar>"
+    return name if name.endswith(".jar") else f"{name}.jar"
+
+
+def _yarn_dir_name_error(name: str) -> str | None:
+    if name in (".", "..") or "/" in name or "\\" in name:
+        return f"应用名不能作为目录名: {name!r}"
+    return None
+
+
+def _compose_flink_command(
+        submit_command: dict, yarn_app_name: str, jar_name: str,
+        app_type: str = "flink",
+) -> str:
+    """Flink 1.18 run-application 只认 generic 选项 + -D；-yjm/-ytm/-yn/-ys 等短选项不适用"""
+    command_list: list[str] = ["flink", "run-application", "-t", "yarn-application", "-d"]
+    app_args: list[str] = []
+    for k, v in submit_command.items():
+        if k == "c":
+            command_list += ["-c", str(v)]
+        elif k == "p":
+            command_list += ["-p", str(v)]
+        elif k == "yjm":
+            command_list += ["-D", f"jobmanager.memory.process.size={v}m"]
+        elif k == "ytm":
+            command_list += ["-D", f"taskmanager.memory.process.size={v}m"]
+        elif k == "ys":
+            command_list += ["-D", f"taskmanager.numberOfTaskSlots={v}"]
+        elif k == "ynm":
+            command_list += ["-D", f"yarn.application.name={v}"]
+        elif k == "yn":
+            # Application Mode 下 TM 数量由 slots/并行度决定，忽略
+            continue
+        elif k == "app_params":
+            for p_k, p_v in (v or {}).items():
+                app_args += [str(p_k), str(p_v)]
+        else:
+            command_list += ["-D", f"{k}={v}"]
+    if not submit_command.get("ynm"):
+        # 固定 YARN 应用名，保证 code.app_file_idx 的 app_name 与 RM 里的 name 一致
+        command_list += ["-D", f"yarn.application.name={yarn_app_name}"]
+    command_list.append(f"hdfs:///app/{app_type}/jar/{jar_name}")
+    command_list += app_args
+    return shlex.join(command_list)
+
+
+def _package_submit_f_command(
+        app_path: str | Path, submit_command_str: str, app_name: str,
+        app_type: str = "flink", project_id: str | None = None,
+) -> dict:
     if project_id:
         from sqlalchemy import select as _select
         from SPO.cluster_env_model import ConfigDrift
@@ -852,65 +953,22 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
                 "app_type": app_type}
     # 查找关于 jar 包的位置：排除 original-/sources/javadoc，多个时取最大的主 jar
     target_path = Path(app_path) / "target"
-    candidates = [
-        f for f in target_path.glob("*.jar")
-        if f.is_file()
-        and not f.name.startswith("original-")
-        and not re.search(r"-(sources|javadoc|tests?|shaded-classes)\.jar$", f.name,
-                          re.IGNORECASE)
-    ]
-    jar_file = max(candidates, key=lambda p: p.stat().st_size) if candidates else None
+    jar_file = _pick_flink_jar(target_path)
     if not jar_file:
         return {"type": "error", "msg": f"未找到 {target_path} 下的 jar 包", "app_type": app_type}
 
     # 只上传一个 fat jar；Flink 依赖已在 jar 内，不再走 usrlib 的多文件上传
     target_dir = f"/app/{app_type}/jar"
     cmd_dir = f"/app/{app_type}/cmd"
-    prefix = "DDA" if app_type == "flink" else "DAA"
-    # 获取注册表信息
-    submit_command_str = redis_con.hget(f"{prefix}:{project_name}", "submit_command")
-    app_name = redis_con.hget(f"{prefix}:{project_name}", "app_name")
-    if isinstance(app_name, bytes):
-        app_name = app_name.decode("utf-8")
-    if not submit_command_str or not app_name:
-        return {"type": "error", "msg": f"{project_name} 未注册提交命令或应用名", "app_type": app_type}
-    if isinstance(submit_command_str, bytes):
-        submit_command_str = submit_command_str.decode("utf-8")
+    # 处理注册表信息
     submit_command = json.loads(submit_command_str)
     # ynm 会覆盖 YARN 应用名；表、cmd 文件名和 job__restart 都按 YARN 名对齐
     yarn_app_name = str(submit_command.get("ynm") or app_name)
-    if yarn_app_name in (".", "..") or "/" in yarn_app_name or "\\" in yarn_app_name:
-        return {"type": "error", "msg": f"应用名不能作为目录名: {yarn_app_name!r}", "app_type": app_type}
-    # Flink 1.18 run-application 只认 generic 选项 + -D；-yjm/-ytm/-yn/-ys 等短选项不适用
-    command_list: list[str] = ["flink", "run-application", "-t", "yarn-application", "-d"]
-    app_args: list[str] = []
-    for k, v in submit_command.items():
-        if k == "c":
-            command_list += ["-c", str(v)]
-        elif k == "p":
-            command_list += ["-p", str(v)]
-        elif k == "yjm":
-            command_list += ["-D", f"jobmanager.memory.process.size={v}m"]
-        elif k == "ytm":
-            command_list += ["-D", f"taskmanager.memory.process.size={v}m"]
-        elif k == "ys":
-            command_list += ["-D", f"taskmanager.numberOfTaskSlots={v}"]
-        elif k == "ynm":
-            command_list += ["-D", f"yarn.application.name={v}"]
-        elif k == "yn":
-            # Application Mode 下 TM 数量由 slots/并行度决定，忽略
-            continue
-        elif k == "app_params":
-            for p_k, p_v in (v or {}).items():
-                app_args += [str(p_k), str(p_v)]
-        else:
-            command_list += ["-D", f"{k}={v}"]
-    if not submit_command.get("ynm"):
-        # 固定 YARN 应用名，保证 code.app_file_idx 的 app_name 与 RM 里的 name 一致
-        command_list += ["-D", f"yarn.application.name={yarn_app_name}"]
-    command_list.append(f"hdfs://{target_dir}/{jar_file.name}")
-    command_list += app_args
-    complete_command = shlex.join(command_list)
+    name_error = _yarn_dir_name_error(yarn_app_name)
+    if name_error:
+        return {"type": "error", "msg": name_error, "app_type": app_type}
+    complete_command = _compose_flink_command(
+        submit_command, yarn_app_name, jar_file.name, app_type)
     # 本地留一份 cmd，再按集群开关决定是否上传
     cmd_local = Path(app_path) / f"{yarn_app_name}.cmd"
     cmd_local.write_text(complete_command, encoding="utf-8")
@@ -918,17 +976,15 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     # 源码登记到 code.commit + code.app_file_idx（与集群提交互不影响）
     _schedule_submit_target_code(
         app_name=yarn_app_name, app_type="flink", commit_cmd=complete_command,
-        project_dir=Path(app_path),
+        project_dir=Path(app_path), project_id=project_id,
     )
-    # 源码登记后，对Redis中的注册信息进行移除
-    redis_con.delete(f"{prefix}:{project_name}")
 
     # 运行
     if not CONNECT_TO_CLUSTER:
         return {"type": "info",
                 "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群并运行，可参考命令：{complete_command}"
                         f"\n项目在于：{app_path}"),
-                "app_type": app_type}
+                "app_type": app_type, "command": complete_command}
 
     _hdfs_ensure_dir(target_dir)
     _hdfs_ensure_dir(cmd_dir)
@@ -939,9 +995,9 @@ def _package_submit_f_command(app_path: str | Path, project_name: str, app_type:
     res = node_ssh.run(host, complete_command, timeout=120)
     if not res.ok or (getattr(res, "rc", 0) or 0) != 0:
         return {"type": "error", "msg": f"执行命令 {complete_command} 失败, 错误信息{res.stderr or res.stdout or ""}",
-                "app_type": app_type}
+                "app_type": app_type, "command": complete_command}
     return {"type": "info", "msg": f"执行命令 {complete_command} 成功, 输出信息{res.stdout or res.stderr or ""}",
-            "app_type": app_type}
+            "app_type": app_type, "command": complete_command}
 
 
 def _hdfs_uri(path: str) -> str:
@@ -983,7 +1039,12 @@ def _spark_archive_conf() -> str | None:
     return None
 
 
-def _package_submit_s_command(app_path: str | Path, project_name: str, app_type: str = "spark") -> dict:
+def _package_submit_s_command(
+        app_path: str | Path, submit_command_str: str,
+        *,
+        app_name: str, app_type: str = "spark",
+        project_id: str | None = None, build_only: bool = False,
+) -> dict:
     """
     打包并提交 python spark 应用
 
@@ -993,16 +1054,6 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
     - 非 .py：上传后走 --files
     """
     try:
-        key = submit_redis_key(project_name)
-        submit_command_str = redis_con.hget(key, "submit_command")
-        app_name = redis_con.hget(key, "app_name")
-        if not submit_command_str or not app_name:
-            return {"type": "error", "msg": f"{project_name} 未注册提交命令（Redis 键 {key}）",
-                    "app_type": app_type}
-        if isinstance(app_name, bytes):
-            app_name = app_name.decode("utf-8")
-        if app_name in (".", "..") or "/" in app_name or "\\" in app_name:
-            return {"type": "error", "msg": f"应用名不能作为目录名: {app_name!r}", "app_type": app_type}
         submit_command = json.loads(submit_command_str)
 
         main_file = submit_command.get("main_file")
@@ -1024,25 +1075,32 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
 
         resource_dir = f"{SPARK_DIR}/{app_name}"
         cmd_dir = f"{SPARK_DIR}/cmd"
-        _hdfs_ensure_dir(resource_dir)
-        _hdfs_ensure_dir(cmd_dir)
+        if not build_only:
+            _hdfs_ensure_dir(resource_dir)
+            _hdfs_ensure_dir(cmd_dir)
 
         # 主文件
-        main_hdfs = _hdfs_upload_file(f"{resource_dir}/{main_path.name}", main_path)
+        main_hdfs = f"{resource_dir}/{main_path.name}"
+        if not build_only:
+            main_hdfs = _hdfs_upload_file(main_hdfs, main_path)
 
         # 辅助 .py：1 个直接传，多个打成一个 zip
         py_files_arg: list[str] = []
         if len(aux_py) == 1:
             rel = aux_py[0].relative_to(python_dir).as_posix()
-            aux_hdfs = _hdfs_upload_file(f"{resource_dir}/{rel}", aux_py[0])
+            aux_hdfs = f"{resource_dir}/{rel}"
+            if not build_only:
+                aux_hdfs = _hdfs_upload_file(aux_hdfs, aux_py[0])
             py_files_arg.append(_hdfs_uri(aux_hdfs))
         elif len(aux_py) > 1:
-            with tempfile.TemporaryDirectory() as tmp:
-                zip_path = Path(tmp) / "aux.zip"
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for f in aux_py:
-                        zf.write(f, f.relative_to(python_dir).as_posix())
-                aux_hdfs = _hdfs_upload_file(f"{resource_dir}/aux.zip", zip_path)
+            aux_hdfs = f"{resource_dir}/aux.zip"
+            if not build_only:
+                with tempfile.TemporaryDirectory() as tmp:
+                    zip_path = Path(tmp) / "aux.zip"
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for f in aux_py:
+                            zf.write(f, f.relative_to(python_dir).as_posix())
+                    aux_hdfs = _hdfs_upload_file(aux_hdfs, zip_path)
             py_files_arg.append(_hdfs_uri(aux_hdfs))
 
         # 非 .py：业务目录里发现的 + 注册时额外指定的 files
@@ -1050,7 +1108,9 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
         uploaded: set[Path] = set()
         for f in other_files:
             rel = f.relative_to(python_dir).as_posix()
-            hdfs_path = _hdfs_upload_file(f"{resource_dir}/files/{rel}", f)
+            hdfs_path = f"{resource_dir}/files/{rel}"
+            if not build_only:
+                hdfs_path = _hdfs_upload_file(hdfs_path, f)
             files_arg.append(_hdfs_uri(hdfs_path))
             uploaded.add(f.resolve())
         for rel in submit_command.get("files") or []:
@@ -1063,7 +1123,9 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
                         "app_type": app_type}
             if extra in uploaded:
                 continue
-            hdfs_path = _hdfs_upload_file(f"{resource_dir}/files/extra/{rel}", extra)
+            hdfs_path = f"{resource_dir}/files/extra/{rel}"
+            if not build_only:
+                hdfs_path = _hdfs_upload_file(hdfs_path, extra)
             files_arg.append(_hdfs_uri(hdfs_path))
             uploaded.add(extra)
 
@@ -1099,6 +1161,9 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
             cmd += [str(k), str(v)]
         complete_command = shlex.join(cmd)
 
+        if build_only:
+            return {"type": "info", "command": complete_command, "app_type": app_type}
+
         # 本地留一份 cmd，再上传到 /app/spark/cmd
         cmd_local = app_path / f"{app_name}.cmd"
         cmd_local.write_text(complete_command, encoding="utf-8")
@@ -1107,16 +1172,14 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
         # 源码登记到 code.commit + code.app_file_idx（与集群提交互不影响）
         _schedule_submit_target_code(
             app_name=app_name, app_type="spark", commit_cmd=complete_command,
-            project_dir=app_path,
+            project_dir=app_path, project_id=project_id,
         )
-        # 源码登记后，对Redis中的注册信息进行移除，避免占用资源
-        redis_con.delete(key)
 
         if not CONNECT_TO_CLUSTER:
             return {"type": "info",
                     "msg": (f"集群被明令禁止启用，请手动将对应文件上传到集群，并运行，可参考命令：{complete_command}"
                             f"\n项目在于：{app_path}"),
-                    "app_type": app_type}
+                    "app_type": app_type, "command": complete_command}
         host = urlparse(manager).hostname or ""
         res = node_ssh.run(host, complete_command, timeout=60)
         # node_ssh 的 ok 只代表 ssh 执行完了；命令本身失败要看 rc
@@ -1125,16 +1188,68 @@ def _package_submit_s_command(app_path: str | Path, project_name: str, app_type:
             return {"type": "error",
                     "msg": (f"执行 spark-submit 失败(ok={res.ok}, rc={res.rc}, {res.error_kind}): "
                             f"{detail}\n命令：{complete_command}"),
-                    "app_type": app_type}
+                    "app_type": app_type, "command": complete_command}
         return {"type": "info",
                 "msg": (f"spark 应用已提交：app_name={app_name}\n"
                         f"资源目录：hdfs://{resource_dir}\n"
                         f"命令文件：hdfs://{cmd_hdfs}\n"
                         f"输出：{res.stdout or res.stderr}"),
-                "app_type": app_type}
+                "app_type": app_type, "command": complete_command}
     except Exception as e:
         logger.error(f"提交 spark 应用失败{type(e).__name__}: {e}")
         return {"type": "error", "msg": f"提交 spark 应用失败{type(e).__name__}: {e}", "app_type": app_type}
+
+
+async def _register_reference_command(
+        *, project_id: str | None, app_name: str,
+        app_type: Literal["spark", "flink"],
+        submit_command_str: str, app_path: Path,
+) -> tuple[bool, bool, str]:
+    """
+    中断前生成参考命令并写 code.app_file_idx（idx_type='tmp'）。
+    返回 (registered, fatal, message)：fatal=True 表示命令本身构建不出来。
+    """
+    if not Path(app_path).is_dir():
+        return False, True, f"项目目录不存在: {app_path}"
+    try:
+        submit_command = json.loads(submit_command_str)
+        if app_type == "flink":
+            row_name = str(submit_command.get("ynm") or app_name)
+            name_error = _yarn_dir_name_error(row_name)
+            if name_error:
+                return False, True, name_error
+            command = _compose_flink_command(
+                submit_command, row_name, _flink_jar_hint(app_path))
+        elif app_type == "spark":
+            row_name = app_name
+            plan = _package_submit_s_command(
+                app_path, submit_command_str, app_name=app_name,
+                app_type=app_type, build_only=True)
+            if plan.get("type") != "info" or not plan.get("command"):
+                return False, True, plan.get("msg") or "无法构建参考命令"
+            command = plan["command"]
+        else:
+            return False, True, f"不支持的应用类型: {app_type}"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("构建参考命令失败")
+        return False, True, f"构建参考命令失败: {type(exc).__name__}: {exc}"
+
+    try:
+        source_type, root = _commit_source_conf()
+        source_dir = _commit_public_dir(
+            source_type, root,
+            _commit_rel_dir(app_type, datetime.now(timezone.utc).date().isoformat(), row_name),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"读取 code.commit 配置失败，跳过参考命令登记: {exc}")
+        return False, False, f"读取 code.commit 配置失败: {exc}"
+
+    ok = await _save_app_file_idx(
+        app_name=row_name, app_type=app_type, commit_cmd=command,
+        source_type=source_type, source_dir=source_dir,
+        project_id=project_id, idx_type="tmp",
+    )
+    return ok, False, "" if ok else "写入 code.app_file_idx 失败"
 
 
 def _splicing_doc(doc_info: dict) -> dict:
@@ -2063,6 +2178,7 @@ def _verify_manual(state: dict, runtime: Runtime) -> Command:
 
 
 async def _verify_submit(state: dict, runtime: Runtime) -> Command:
+    project_id = state.get("project_id")
     verify_end_msg = state.get("verify_end_msg")
     date = state.get("date")
     verify_id = state.get("id")
@@ -2088,9 +2204,86 @@ async def _verify_submit(state: dict, runtime: Runtime) -> Command:
                 "response_metadata": response_metadata,
             }
         )
+    # 在这里提前读取 redis 注册信息，用于中断前登记参考命令
+    redis_key = _handler_redis_key(app_type, p_name)
+    submit_command_str = redis_con.hget(redis_key, "submit_command")
+    app_name = redis_con.hget(redis_key, "app_name")
+    if isinstance(app_name, bytes):
+        app_name = app_name.decode("utf-8")
+    if not submit_command_str or not app_name:
+        return Command(
+            goto="ver_end",
+            update={
+                "type": "error",
+                "submit_desc": f"{p_name} 未注册提交命令或应用名",
+                "from_": "ver_submit",
+                "thread_id": runtime.context.thread_id,
+                "date": date,
+                "project_name": p_name,
+                "app_type": app_type,
+                "verify_end_msg": verify_end_msg,
+                "id": verify_id,
+                "project_id": project_id,
+                "usage_metadata": usage_metadata,
+                "response_metadata": response_metadata,
+            }
+        )
+    if isinstance(submit_command_str, bytes):
+        submit_command_str = submit_command_str.decode("utf-8")
     app_path = ROOT_BASE_DIR_PATH / "tmp_code" / app_type / date / p_name
+    # 中断前生成参考命令并落库；人工确认后再用打包后的真实命令覆盖
+    registered, fatal, reg_msg = await _register_reference_command(
+        project_id=project_id, app_name=app_name, app_type=app_type,
+        submit_command_str=submit_command_str, app_path=app_path,
+    )
+    if fatal:
+        return Command(
+            goto="ver_end",
+            update={
+                "type": "error",
+                "submit_desc": f"无法生成提交命令：{reg_msg}",
+                "from_": "ver_submit",
+                "thread_id": runtime.context.thread_id,
+                "date": date,
+                "project_name": p_name,
+                "app_type": app_type,
+                "verify_end_msg": verify_end_msg,
+                "id": verify_id,
+                "project_id": project_id,
+                "usage_metadata": usage_metadata,
+                "response_metadata": response_metadata,
+            }
+        )
+    if not registered:
+        logger.warning(f"登记提交命令失败：{reg_msg}")
+        ok, msg = send_feishu_text(f"{p_name} 转移命令失败，请进行手动提交，本次任务不因此而终止")
+        if not ok:
+            logger.error(f"发送飞书消息失败，错误：{msg}")
+            return Command(
+                goto="ver_end",
+                update={
+                    "type": "error",
+                    "submit_desc": f"在尝试进行提交时，引发了错误：{msg}",
+                    "from_": "ver_submit",
+                    "thread_id": runtime.context.thread_id,
+                    "date": date,
+                    "project_name": p_name,
+                    "app_type": app_type,
+                    "verify_end_msg": verify_end_msg,
+                    "id": verify_id,
+                    "project_id": project_id,
+                    "usage_metadata": usage_metadata,
+                    "response_metadata": response_metadata,
+                }
+            )
+
     answer = interrupt("请再次确认是否需要自动提交应用到真实环境")  # 人工回传 "yes"/"no" "yes" -> 自动提交 "no" -> 手动提交
     answer_norm = answer.strip().lower() if isinstance(answer, str) else ""
+    try:
+        # 恢复时 LangGraph 会从头重跑本节点，删除必须放在 interrupt 之后
+        redis_con.delete(redis_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"移除 Redis 注册信息失败: {type(exc).__name__}: {exc}")
     if answer_norm in {"no", "n"}:
         return Command(
             goto="ver_end",
@@ -2104,7 +2297,7 @@ async def _verify_submit(state: dict, runtime: Runtime) -> Command:
                 "app_type": app_type,
                 "verify_end_msg": verify_end_msg,
                 "id": verify_id,
-                "project_id": state.get("project_id"),
+                "project_id": project_id,
                 "usage_metadata": usage_metadata,
                 "response_metadata": response_metadata,
             }
@@ -2131,11 +2324,16 @@ async def _verify_submit(state: dict, runtime: Runtime) -> Command:
             # 当前 flink 为 java代码进行编写，因此上传 jar 包到对应的集群即可
             # 当前未对 flink 进行打包，因此需要先打包
             # 打包完后，通过redis注册表注册的命令参数上传jar包，并运行对应的命令
-            res = _package_submit_f_command(app_path, p_name, app_type,
-                                            project_id=state.get("project_id"))
+            res = _package_submit_f_command(
+                app_path, submit_command_str, app_name,
+                app_type, project_id=project_id
+            )
         elif app_type == "spark":
             # spark 侧代码在 src/main/python，辅助文件由提交端自动发现/打包
-            res = _package_submit_s_command(app_path, p_name, app_type)
+            res = _package_submit_s_command(
+                app_path, submit_command_str,
+                app_name=app_name, app_type=app_type, project_id=project_id,
+            )
         else:
             res = {"type": "error", "msg": f"不支持类型：{app_type}", "app_type": app_type}
     except Exception as e:
@@ -2153,7 +2351,7 @@ async def _verify_submit(state: dict, runtime: Runtime) -> Command:
             "app_type": app_type,
             "verify_end_msg": verify_end_msg,
             "id": verify_id,
-            "project_id": state.get("project_id"),
+            "project_id": project_id,
             "usage_metadata": usage_metadata,
             "response_metadata": response_metadata,
         }

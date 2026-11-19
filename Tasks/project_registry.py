@@ -382,8 +382,10 @@ class ProjectRegistry:
                 project_ids = {row.project_id for row in rows}
                 legacy = (await session.scalars(
                     select(AdminProject).where(
-                        AdminProject.thread_id == thread_id,
-                        AdminProject.admin_id == int(admin_id),
+                        and_(
+                            AdminProject.thread_id == thread_id,
+                            AdminProject.admin_id == int(admin_id),
+                        )
                     )
                 )).all()
                 project_ids.update(row.project_id for row in legacy)

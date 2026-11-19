@@ -771,6 +771,9 @@ function logout() {
         <button class="ghost" :title="collapsed ? '集群环境' : ''" @click="router.push('/cluster')">
           {{ collapsed ? '🌐' : '集群环境' }}
         </button>
+        <button class="ghost" :title="collapsed ? '项目' : ''" @click="router.push('/project')">
+          {{ collapsed ? '📁' : '项目' }}
+        </button>
         <button
             v-if="Number(user.permission ?? 0) >= 1"
             class="ghost"

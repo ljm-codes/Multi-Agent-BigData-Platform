@@ -35,6 +35,7 @@ Multi-Agent BigData Platform 是一个以 `Agent` 为主、`大数据` 为背景
 | 分析 | 按任务写 Python + Spark 分析代码，语法检查自动修复                              | 对话                                         |
 | 质检 | 读代码 → 写测试 → 跑浅层 → **人工确认** → 跑深层 → **提交确认**                    | 开发/分析完成后自动进入                               |
 | 运维 | 巡检 Spark/Flink/集群异常 → 只读取证 → 处理或转开发；**代码问题转给开发 Agent 修复并自动验证** | 后台常驻 + 运维看板（`connect_to_cluster=true` 时启用） |
+| 项目 | 项目列表、命令查看 / 修改 / 提交、按会话条件删除                                    | 项目页 `/project`                             |
 
 ## 架构与思想
 
@@ -81,6 +82,8 @@ YARN 运行中的应用
 - **主调度不写代码**：`dis_chat` 只输出「派给谁、任务是什么」，避免上下文膨胀和越权。
 - **强制结构化输出**：调度与质检都绑定 Pydantic 模型，必须调用工具返回结果，不解析自由文本。
 - **人工确认用 LangGraph `interrupt`**：图在节点中间停住，前端拿到 payload 后决定继续、打回或终止。
+- **命令两阶段落库**：CVA 在提交确认前按项目源码生成参考命令，写入 `code.app_file_idx`（`idx_type=tmp`）；
+  自动提交成功后再用实际命令覆盖（`idx_type=brief`）。手动修改 / 提交在项目页完成。
 - **两层测试**：浅层验证业务结果，深层验证抗造；深层超时用 `TaskSupervisor` 移交后台，完成后由感知层把结果送回原会话。
 - **运维转交复用开发链路**：`handover` 不经过 `dis_chat`，按 `app_type` 直接进 `data_develop` / `data_analysis`；开发线程
   id 固定为 `ops:{运维session_id}`，验证结束后回到父图 `work_end`，不回到对话。
@@ -118,6 +121,20 @@ YARN 运行中的应用
 - WebSocket 换票走 `POST /ai/background/verify`，必须带 `source`（`main` / `ops`）：ops 功能未开启时 `source=ops` 会被直接拒绝，避免在
   Redis 里留下永远没人消费的 ticket。
 
+### 项目管理
+
+- 入口 `/project`（登录即可；后端按 `admin_id` 过滤，只能看到自己的项目）。列表支持应用类型、项目状态、验证状态
+  筛选和分页，数据来自 `public.admin_project`。
+- “命令”弹窗读取 `code.app_file_idx` 里该项目最近一条命令：
+    - `idx_type=tmp`：提交确认前生成的参考命令；`idx_type=brief`：打包 / 提交后的实际命令。
+    - 手动修改会存回 `tmp`；提交成功后置为 `brief`。
+    - 提交会直接 SSH 到 `hadoop.yarn.manager` 的主机执行，返回退出码和输出末尾 40 行。
+    - 提交接口只做结构校验（程序名、shell 控制符）；命令引用的 HDFS 文件、Flink jar 是否已上传 / 打包由用户负责。
+- “删除”要求相关会话（`admin_thread`）和会话片段（`admin_project_conversation`）都为空；满足后删除项目、
+  会话片段和命令存档三张表。会话删除仍走聊天页的 `/ai/thread/delete`，项目页只做守卫。
+  绕过接口直接删 `admin_project` 时，`code.app_file_idx` 的外键只会把 `project_id` 置空，命令存档仍保留给运维；
+  接口删除才会显式删命令行。`cluster_env` 挂在 `project_id` 上的资源按已有外键级联 / 置空。
+
 ## 技术栈
 
 | 层     | 选型                                                                     |
@@ -144,11 +161,14 @@ Python 3.12，Node 18+。
 │   ├── _operations_agent.py    运维 Agent
 │   ├── operations_agent_run.py 运维 Worker 主循环
 │   └── prompt/                 各 Agent 的系统提示词（Markdown）
+├── cluster_resources/        公有集群环境资源配置（已.gitignore，建议存放集群中常用的配置文件，如`hdfs-site.xml`, `yarn-site.xml`等）
+├── cluster_env_archives/     集群环境档案，记录已经被归档的配置文件，用于后续的查看与恢复（已.gitignore，并不常用）
+├── cluster_profiles/         私有/特殊集群环境资源配置，用于处理特有场景的配置（已.gitignore，只能通过API进行存放、设置）
 ├── middleware/             模型调用洋葱链、后台结果感知
 ├── Tasks/                  后台任务总线、感知器、JWT 密钥轮换、dev_handover（运维转交运行器）
 ├── Tools/                  工具集：代码读写、命令执行、SSH、各类 checker、飞书告警
 ├── SPO/                    状态模型、数据库模型、统一响应信封
-├── routers/                HTTP 层：ai_chat / ops_control / manager / open_app / start_file
+├── routers/                HTTP 层：ai_chat / ops_control / manager / open_app / summary_project / start_file
 ├── load_config/            config.yaml 解析与占位符替换
 ├── scripts/                init_admin.py、mock_backend.py
 ├── static/source/          前端源码（Vue3 + Vite）
@@ -188,11 +208,12 @@ cp config.yaml.template config.yaml   # 改数据库、集群地址、模型参�
 ### 2. 建库
 
 ```bash
-psql -U postgres -f sql/postgresql.sql
+psql -U postgres -f sql/main_run.sql
 ```
 
-`log.checker_log`、`log.agent_runs`、`public.app_leases`、`code.app_file_idx`、`admin_info`、`admin_thread`、
-`log.recommend_approval_log` 等表都由这个脚本创建；LangGraph 的 `checkpoints` / `store` 表由程序启动时自动建。
+`log.checker_log`、`log.agent_runs`、`public.app_leases`、`code.app_file_idx`（命令 + 源码索引）、
+`admin_project` / `admin_project_conversation`、`admin_info`、`admin_thread`、`log.recommend_approval_log`
+等表都由这个脚本创建；LangGraph 的 `checkpoints` / `store` 表由程序启动时自动建。
 
 ### 3. 安装 Python 依赖
 
@@ -242,6 +263,8 @@ python run.py     # 默认 0.0.0.0:8000
 
 ### 8. Docker 一键部署
 
+** Docker 部署是单节点伪分布式的验证环境，不作为生产大数据集群方案；生产请使用独立虚拟机/物理机集群。**
+
 Hadoop + Spark + Flink 集群、Python 3.8 沙箱、Postgres/Redis 和 API/巡检/运维进程都在
 [docker/README.md](docker/README.md) 里，用 `docker compose` 启动。
 
@@ -258,30 +281,107 @@ python scripts/mock_backend.py   # 假后端，127.0.0.1:8010
 
 ## 接口一览
 
-| 方法       | 路径                               | 说明                                         |
-|----------|----------------------------------|--------------------------------------------|
-| POST     | `/auth/admin/login`              | 登录，返回 JWT                                  |
-| GET/POST | `/auth/admin/recommend/register` | 推荐码校验 / 被推荐人注册                             |
-| POST     | `/auth/admin/build/link`         | 生成邀请链接（一次性短码）                              |
-| GET      | `/auth/admin/admin_info`         | 账号列表（邮箱脱敏）                                 |
-| POST     | `/auth/admin/account/status`     | 启用 / 封禁                                    |
-| POST     | `/auth/admin/account/update`     | 修改用户名 / 邮箱 / 权限（仅 permission=2）            |
-| POST     | `/ai/chat/stream`                | 流式对话（SSE）                                  |
-| POST     | `/ai/chat`                       | 非流式对话                                      |
-| POST     | `/ai/resume`                     | 回复 interrupt                               |
-| POST     | `/ai/resume/stream`              | 流式回复 interrupt（SSE）                        |
-| GET      | `/ai/threads`                    | 会话列表                                       |
-| GET      | `/ai/history`                    | 会话历史                                       |
-| PUT      | `/ai/thread/change`、`/top`       | 重命名 / 置顶                                   |
-| PUT      | `/ai/thread/archive`、`/archives` | 归档（单个 / 批量）                                |
-| DELETE   | `/ai/thread/delete`、`/deletes`   | 删除（必须先归档）                                  |
-| GET      | `/ai/background`                 | 后台任务列表                                     |
-| POST     | `/ai/background/verify`          | 换一次性 WS ticket（body 带 `source`：main / ops） |
-| WS       | `/ai/ws/background?ticket=`      | 后台任务推送                                     |
-| GET      | `/open/app/get_ides`             | 探测本机 IDE                                   |
-| POST     | `/open/app/open_file`            | 用 IDE 打开文件 / 项目目录                          |
+### 账号与管理（前缀 `/auth/admin`）
 
-运维接口（前缀 `/ops`，`connect_to_cluster=true` 时注册，`permission >= 1`）：
+| 方法       | 路径                               | 说明                                      |
+|----------|----------------------------------|-----------------------------------------|
+| POST     | `/auth/admin/login`              | 登录，返回 JWT                               |
+| GET      | `/auth/admin/token`              | 密钥轮换后，用旧 token 换发新 token                |
+| GET/POST | `/auth/admin/recommend/register` | 推荐码校验 / 被推荐人注册                          |
+| POST     | `/auth/admin/build/link`         | 生成邀请链接（一次性短码）                           |
+| GET      | `/auth/admin/admin_info`         | 账号列表（邮箱脱敏）                              |
+| GET      | `/auth/admin/log_info`           | 推荐审批日志，支持按时间 / log_id / recommend_id 筛选 |
+| POST     | `/auth/admin/account/status`     | 启用 / 封禁                                 |
+| POST     | `/auth/admin/account/update`     | 修改用户名 / 邮箱 / 权限（仅 permission=2）         |
+
+### Agent 对话（前缀 `/ai`）
+
+| 方法     | 路径                               | 说明                                         |
+|--------|----------------------------------|--------------------------------------------|
+| POST   | `/ai/chat/stream`                | 流式对话（SSE）                                  |
+| POST   | `/ai/chat`                       | 非流式对话                                      |
+| POST   | `/ai/resume`                     | 回复 interrupt                               |
+| POST   | `/ai/resume/stream`              | 流式回复 interrupt（SSE）                        |
+| GET    | `/ai/threads`                    | 会话列表                                       |
+| GET    | `/ai/history`                    | 会话历史                                       |
+| GET    | `/ai/tool-traces`                | 工具调用轨迹（`log.tool_trace`）                   |
+| GET    | `/ai/verification`               | 当前 thread 的最新验证进度事件（WS 重连兜底）               |
+| GET    | `/ai/project/path`               | 解析会话对应的项目目录 / 登记信息                         |
+| PUT    | `/ai/thread/change`、`/top`       | 重命名 / 置顶                                   |
+| PUT    | `/ai/thread/archive`、`/archives` | 归档（单个 / 批量）                                |
+| DELETE | `/ai/thread/delete`、`/deletes`   | 删除（必须先归档）                                  |
+| GET    | `/ai/background`                 | 后台任务列表                                     |
+| POST   | `/ai/background/verify`          | 换一次性 WS ticket（body 带 `source`：main / ops） |
+| WS     | `/ai/ws/background?ticket=`      | 后台任务推送                                     |
+
+### 打开应用（前缀 `/open/app`）
+
+| 方法   | 路径                    | 说明                |
+|------|-----------------------|-------------------|
+| GET  | `/open/app/get_ides`  | 探测本机 IDE          |
+| POST | `/open/app/open_file` | 用 IDE 打开文件 / 项目目录 |
+
+### 项目与命令（前缀 `/project`）
+
+| 方法     | 路径                                     | 说明                                                   |
+|--------|----------------------------------------|------------------------------------------------------|
+| GET    | `/project/info`                        | 项目列表；`app_type` / `status` / `verify_status` 可选，支持分页 |
+| GET    | `/project/command/{project_id}`        | 最近一条命令（`command`、`idx_type`、`app_name`）              |
+| PUT    | `/project/command/{project_id}/edit`   | 手动修改命令（校验程序名 / shell 控制符）                            |
+| POST   | `/project/command/{project_id}/submit` | 直接执行已保存命令（SSH 到 `hadoop.yarn.manager` 主机）            |
+| DELETE | `/project/{project_id}`                | 删除项目；还有相关会话 / 会话片段时拒绝                                |
+
+### 集群环境（前缀 `/cluster`）
+
+- 私有/特殊集群环境（`cluster_profiles`，仅供本管理员）：
+
+  | 方法     | 路径                                                | 说明                       |
+        |--------|---------------------------------------------------|--------------------------|
+  | POST   | `/cluster/profiles`                               | 新建私有集群环境配置               |
+  | GET    | `/cluster/profiles`                               | 环境列表                     |
+  | GET    | `/cluster/profiles/{profile_id}`                  | 环境详情                     |
+  | DELETE | `/cluster/profiles/{profile_id}`                  | 删除环境（可带 reason）          |
+  | GET    | `/cluster/profiles/{profile_id}/files`            | 文件列表（可按 revision 查）      |
+  | GET    | `/cluster/profiles/{profile_id}/files/{filename}` | 读取文件内容                   |
+  | PUT    | `/cluster/profiles/{profile_id}/files/{filename}` | 编辑文件（可带 expected_sha256） |
+  | POST   | `/cluster/profiles/{profile_id}/files/upload`     | 上传文件                     |
+
+- 公有集群资源（`cluster_resources` + 快照，`permission=2` 才可写）：
+
+  | 方法     | 路径                                        | 说明           |
+        |--------|-------------------------------------------|--------------|
+  | GET    | `/cluster/public`                         | 当前生效的公有资源配置  |
+  | GET    | `/cluster/public/snapshots`               | 公有快照列表       |
+  | PUT    | `/cluster/public/files/{filename}`        | 修改公有配置文件     |
+  | POST   | `/cluster/public/files/upload`            | 上传公有配置文件     |
+  | DELETE | `/cluster/public/snapshots/{snapshot_id}` | 删除公有快照       |
+  | POST   | `/cluster/public/scan`                    | 扫描当前配置并生成新快照 |
+  | POST   | `/cluster/public/rollback`                | 回滚公有资源到指定快照  |
+  | GET    | `/cluster/public/config-drift`            | 检查公有资源配置漂移   |
+  | POST   | `/cluster/public/config-drift/resolve`    | 处理公有资源配置漂移项  |
+
+- 环境归档（`cluster_env_archives`，`permission=2`）：
+
+  | 方法     | 路径                                        | 说明                      |
+        |--------|-------------------------------------------|-------------------------|
+  | GET    | `/cluster/archives`                       | 归档列表                    |
+  | GET    | `/cluster/archives/{archive_id}/download` | 下载归档（gzip）              |
+  | DELETE | `/cluster/archives/{archive_id}`          | 删除归档                    |
+  | POST   | `/cluster/archives/{archive_id}/restore`  | 恢复归档（生成新的环境/快照）         |
+  | POST   | `/cluster/archives/prune`                 | 按时间批量清理过期归档（支持 dry_run） |
+  | POST   | `/cluster/archives/gc`                    | 快照垃圾回收（支持 dry_run）      |
+
+- 项目资源（把 profile / 公有配置物化到具体项目目录）：
+
+  | 方法   | 路径                                                    | 说明                         |
+        |------|-------------------------------------------------------|----------------------------|
+  | POST | `/cluster/projects/{project_id}/materialize`          | 物化项目资源配置（选 profile / 公有快照） |
+  | GET  | `/cluster/projects/{project_id}/resources`            | 查看项目已物化资源                  |
+  | POST | `/cluster/projects/{project_id}/resources/replace`    | 替换 / 删除项目资源文件              |
+  | GET  | `/cluster/projects/{project_id}/config-drift`         | 检查项目资源漂移                   |
+  | POST | `/cluster/projects/{project_id}/config-drift/resolve` | 处理项目资源漂移项                  |
+
+### 运维接口（前缀 `/ops`，`connect_to_cluster=true` 时注册，`permission >= 1`）
 
 | 方法   | 路径                                        | 说明                                    |
 |------|-------------------------------------------|---------------------------------------|
@@ -292,6 +392,8 @@ python scripts/mock_backend.py   # 假后端，127.0.0.1:8010
 | GET  | `/ops/agent/handover/history?session_id=` | 转交出去的开发会话（线程 `ops:{session_id}`）历史与中断 |
 | POST | `/ops/agent/handover/resume`              | 恢复开发会话的人工确认 / 提交确认                    |
 | WS   | `/ops/ws/perception/error?ticket=`        | 巡检事件 + `kind=handover` 转交事件推送         |
+
+### 事件说明
 
 SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_switch`、`done`、`error`。
 `/ai/history` 返回 `messages`、`output_msg`、`interrupted`、`interrupt`、`metadata` 与 `project_dir`。
@@ -307,9 +409,11 @@ SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_swit
 4. 开发视图靠 WS 事件触发刷新 + 历史接口拉取，没有 token 级流式输出。
 5. 取码已支持 `hdfs / local / ssh / git`，但相同代码每次都要重新做 AST 解析（未落缓存）。
 6. MCP 目前只用于 Maven 依赖查询，还没做通用 MCP / Skill 接入。
-7. LangGraph 的 `cache_policy` 已挂在主要节点上，但缓存命中/失效策略还没有评估。
-8. Mermaid 的后端校验只覆盖 CVA 产出的 `mermaid_flowgraph`；聊天中模型自发写的其它 Mermaid 图仍只靠前端修复，复杂/非法图可能显示源码和错误。
-9. Docker 部署是单节点伪分布式的验证环境，不作为生产大数据集群方案；生产请使用独立虚拟机/物理机集群。
+7. Mermaid 的后端校验只覆盖 CVA 产出的 `mermaid_flowgraph`；聊天中模型自发写的其它 Mermaid 图仍只靠前端修复，复杂/非法图可能显示源码和错误。
+8. 项目命令只保留最近一次覆盖（按 `app_type + app_name` upsert），没有版本历史；需要回滚只能重新登记或手动改。
+9. 项目命令的“提交”只校验程序名和 shell 控制符，参数值是否合理由运行时决定；Spark 依赖的 HDFS 文件、Flink 的 jar
+   需要已经上传 / 打包，`<jar>` 占位命令会被拒绝。
+10. 项目删除要求先删完相关会话；会话删除入口在聊天页，项目页只返回剩余的 `thread_ids` / 片段数，不做级联删会话。
 
 ## 项目的未来方向
 
@@ -317,6 +421,7 @@ SSE 事件：`meta`、`update`、`status`、`token`、`interrupt`、`thread_swit
    GitHub 私有仓库。
 2. 运维/转交会话的生命周期管理：清理入口、按时间归档 checkpoint、转交超时策略。
 3. 扩充评测集，把「能跑通」变成「可衡量」。
+4. 项目命令版本化：保留 `tmp` / `brief` 历史，支持回滚到上一次可提交命令。
 
 ## License
 

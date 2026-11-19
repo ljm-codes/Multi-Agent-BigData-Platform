@@ -45,6 +45,8 @@ from routers.cluster_profile_upload import route as cluster_profile_upload_route
 from routers.cluster_public import route as cluster_public_route
 from routers.cluster_archive import route as cluster_archive_route
 from routers.cluster_project import route as cluster_project_route
+from routers.summary_project import route as summary_project_route
+
 
 main_graph = None
 checker_task = None
@@ -62,7 +64,7 @@ whitelist = {"/auth/admin/recommend/register", "/auth/admin/login", "/open/app/g
              "/favicon.ico"}
 # 只保护这三组接口；其余路径（静态资源、/admin 这种 SPA 路由）一律放行 ——
 # 浏览器直接访问页面时不会带 Authorization 头，拦了就打不开
-_PROTECTED_PREFIXES = ("/ai/", "/auth/admin/", "/open/app/", "/ops/", "/cluster/")
+_PROTECTED_PREFIXES = ("/ai/", "/auth/admin/", "/open/app/", "/ops/", "/cluster/", "/project/")
 
 if not os.path.isdir(ROOT_BASE_DIR_PATH / 'cache'):
     os.makedirs(ROOT_BASE_DIR_PATH / 'cache')
@@ -367,6 +369,7 @@ def start_app():
     app.include_router(cluster_public_route, prefix="/cluster", tags=["集群环境-公有资源"])
     app.include_router(cluster_archive_route, prefix="/cluster", tags=["集群环境-归档"])
     app.include_router(cluster_project_route, prefix="/cluster", tags=["集群环境-项目资源"])
+    app.include_router(summary_project_route, prefix="/project", tags=["项目情况"])
 
     @app.get("/ops", include_in_schema=False)
     async def ops_page():
